@@ -1,0 +1,36 @@
+# Multi-Agent System Configuration
+
+# Ollama Settings
+ollama:
+  model: "llama3.1:70b"
+  base_url: "http://localhost:11434"
+  
+# Agent Settings
+agents:
+  max_retries: 3
+  timeout_seconds: 300
+  enable_dynamic_tools: true
+  
+# Logging
+logging:
+  level: "INFO"
+  json_format: true
+  console_output: true
+  
+# Git Integration
+git:
+  auto_commit: true
+  commit_on_success: true
+  tag_failures: true
+  
+# Documentation
+documentation:
+  auto_generate_readme: true
+  update_frequency: "on_completion"
+  include_code_samples: true
+
+# Workflow
+workflow:
+  enable_checkpointing: true
+  checkpoint_frequency: "per_subtask"
+  max_execution_time_minutes: 60

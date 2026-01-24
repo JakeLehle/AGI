@@ -1,0 +1,10 @@
+langchain==0.1.0
+langchain-community==0.0.10
+langgraph==0.0.20
+ollama==0.1.0
+loguru==0.7.2
+gitpython==3.1.40
+pyyaml==6.0.1
+requests==2.31.0
+beautifulsoup4==4.12.2
+pandas==2.1.4
