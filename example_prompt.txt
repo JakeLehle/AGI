@@ -1,0 +1,38 @@
+# Task Description
+
+Analyze the biotech research landscape in San Antonio, Texas. 
+Research the major biotech companies, research institutions, and universities 
+conducting biotech-related research. Create a comprehensive report that identifies 
+potential partnership opportunities and gaps in the current ecosystem.
+
+# Input Files
+
+- data/inputs/initial_companies.csv
+- data/inputs/research_centers.json
+
+# Expected Outputs
+
+- data/outputs/biotech_landscape.json
+- data/outputs/partnership_opportunities.csv
+- reports/biotech_analysis_report.md
+- reports/executive_summary.md
+
+# Context
+
+Focus areas:
+- Pharmaceutical research
+- Agricultural biotech
+- Medical devices
+- Gene therapy
+
+Constraints:
+- Only include organizations with active research programs
+- Prioritize organizations with published research in the last 3 years
+- Include funding information where available
+
+Timeline: This analysis should be completable within a single session.
+
+Notes:
+- Web search may be needed to gather current information
+- The initial CSV file contains a starter list that should be expanded
+- Final report should be suitable for executive presentation
