@@ -186,11 +186,11 @@ conda activate AGI
 conda create -n AGI python=3.10 -y
 conda activate AGI
 
-# Install conda packages
-conda install -c conda-forge pandas numpy requests beautifulsoup4 lxml pyyaml gitpython -y
-
-# Install pip packages
-pip install langchain langchain-community langgraph ollama loguru duckduckgo-search jsonschema
+# Install all packages from conda-forge
+conda install -c conda-forge \
+    langchain langchain-community langgraph ollama \
+    pandas numpy requests beautifulsoup4 lxml \
+    pyyaml gitpython loguru duckduckgo-search jsonschema -y
 ```
 
 ### Step 3: Install Ollama
