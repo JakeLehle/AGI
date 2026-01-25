@@ -189,8 +189,8 @@ echo "This script will:"
 echo "  1. Create conda environment '${ENV_NAME}'"
 echo "  2. Install all Python dependencies"
 if [ "$SKIP_OLLAMA" = false ]; then
-    echo "  3. Check/install Ollama"
-    echo "  4. Pull the LLM model (${OLLAMA_MODEL})"
+    echo "  3. Check for Ollama (must be installed by HPC admins)"
+    echo "  4. Pull the LLM model if Ollama is available (${OLLAMA_MODEL})"
 fi
 echo "  5. Create project directory structure"
 echo "  6. Initialize Git repository"
@@ -254,14 +254,11 @@ else
         echo "environment.yml not found, creating manually..."
         conda create -n ${ENV_NAME} python=${PYTHON_VERSION} -y
         
-        echo "Installing conda packages..."
+        echo "Installing all packages from conda-forge..."
         conda install -n ${ENV_NAME} -c conda-forge \
-            pandas numpy requests beautifulsoup4 lxml pyyaml gitpython -y
-        
-        echo "Installing pip packages..."
-        conda run -n ${ENV_NAME} pip install \
-            langchain langchain-community langgraph ollama loguru \
-            duckduckgo-search jsonschema
+            langchain langchain-community langgraph ollama \
+            pandas numpy requests beautifulsoup4 lxml \
+            pyyaml gitpython loguru duckduckgo-search jsonschema -y
     fi
 fi
 
@@ -275,78 +272,77 @@ if [ "$ENV_ONLY" = true ]; then
 fi
 
 # -----------------------------------------------------------------------------
-# Step 3: Install Ollama
+# Step 3: Check Ollama (HPC systems require admin installation)
 # -----------------------------------------------------------------------------
 
 if [ "$SKIP_OLLAMA" = false ]; then
-    print_header "Step 3: Setting Up Ollama"
+    print_header "Step 3: Checking Ollama"
     
     if check_command ollama; then
-        print_success "Ollama is already installed"
-    else
-        echo "Installing Ollama..."
+        print_success "Ollama is installed"
         
-        if [[ "$OSTYPE" == "linux-gnu"* ]]; then
-            curl -fsSL https://ollama.com/install.sh | sh
-        elif [[ "$OSTYPE" == "darwin"* ]]; then
-            print_warning "On macOS, please install Ollama manually from:"
-            echo "  https://ollama.com/download"
-            echo ""
-            read -p "Press Enter after installing Ollama..." 
-        else
-            print_error "Unsupported OS for automatic Ollama installation"
-            echo "Please install Ollama manually from: https://ollama.com/download"
-        fi
-    fi
-    
-    # Check if Ollama server is running
-    echo ""
-    echo "Checking Ollama server..."
-    if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
-        print_success "Ollama server is running"
-    else
-        print_warning "Ollama server is not running"
-        echo "Starting Ollama server..."
-        
-        # Start in background
-        nohup ollama serve > /dev/null 2>&1 &
-        sleep 3
-        
+        # Check if Ollama server is running
+        echo ""
+        echo "Checking Ollama server..."
         if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
-            print_success "Ollama server started"
+            print_success "Ollama server is running"
         else
-            print_warning "Could not start Ollama server automatically"
-            echo "Please start manually with: ollama serve"
+            print_warning "Ollama server is not running"
+            echo ""
+            echo "To start the server (on a compute/GPU node):"
+            echo "  ollama serve > /dev/null 2>&1 &"
+            echo ""
+            echo "For GPU nodes, first unset SLURM variables:"
+            echo "  unset CUDA_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES GPU_DEVICE_ORDINAL"
         fi
+    else
+        print_warning "Ollama is not installed"
+        echo ""
+        echo "On HPC systems, Ollama must be installed by administrators."
+        echo "The conda 'ollama' package provides only the Python API client,"
+        echo "not the server/inference engine needed for GPU support."
+        echo ""
+        echo "Please submit a ticket to your HPC admins requesting Ollama installation:"
+        echo "  curl -fsSL https://ollama.com/install.sh | sh"
+        echo ""
+        echo "Once installed, you can continue with model setup."
     fi
     
     # -----------------------------------------------------------------------------
-    # Step 4: Pull Model
+    # Step 4: Pull Model (if Ollama is available and server running)
     # -----------------------------------------------------------------------------
     
-    print_header "Step 4: Pulling LLM Model"
-    
-    echo "Model: ${OLLAMA_MODEL}"
-    if [ "$USE_SMALL_MODEL" = true ]; then
-        echo "(Using smaller model for testing - ~4GB download)"
-    else
-        echo "(This may take a while - ~40GB download for 70b model)"
-    fi
-    echo ""
-    
-    # Check if model already exists
-    if ollama list 2>/dev/null | grep -q "${OLLAMA_MODEL}"; then
-        print_success "Model '${OLLAMA_MODEL}' is already downloaded"
-    else
-        read -p "Download model now? [Y/n] " -n 1 -r
-        echo
-        if [[ $REPLY =~ ^[Yy]?$ ]]; then
-            ollama pull ${OLLAMA_MODEL}
-            print_success "Model downloaded"
+    if check_command ollama && curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
+        print_header "Step 4: Pulling LLM Model"
+        
+        echo "Model: ${OLLAMA_MODEL}"
+        if [ "$USE_SMALL_MODEL" = true ]; then
+            echo "(Using smaller model for testing - ~4GB download)"
         else
-            print_warning "Model download skipped"
-            echo "Download later with: ollama pull ${OLLAMA_MODEL}"
+            echo "(This may take a while - ~40GB download for 70b model)"
         fi
+        echo ""
+        
+        # Check if model already exists
+        if ollama list 2>/dev/null | grep -q "${OLLAMA_MODEL}"; then
+            print_success "Model '${OLLAMA_MODEL}' is already downloaded"
+        else
+            read -p "Download model now? [Y/n] " -n 1 -r
+            echo
+            if [[ $REPLY =~ ^[Yy]?$ ]]; then
+                ollama pull ${OLLAMA_MODEL}
+                print_success "Model downloaded"
+            else
+                print_warning "Model download skipped"
+                echo "Download later with: ollama pull ${OLLAMA_MODEL}"
+            fi
+        fi
+    else
+        print_header "Step 4: Model Setup (Skipped)"
+        print_warning "Ollama server not available - skipping model download"
+        echo "Once Ollama is installed and running, pull a model with:"
+        echo "  ollama pull llama3.1:8b     # Smaller model for CPU testing"
+        echo "  ollama pull llama3.1:70b    # Full model (GPU recommended)"
     fi
 fi
 
@@ -469,31 +465,30 @@ print_header "Setup Complete!"
 
 echo "Environment: ${ENV_NAME}"
 echo ""
-echo "To get started:"
+echo "To get started on HPC:"
 echo ""
-echo "  1. Activate the environment:"
+echo "  1. Get a compute node:"
+echo "     ${YELLOW}srun --partition=compute2 -N 1 -n 1 -c 40 --time=08:00:00 --pty bash${NC}"
+echo "     ${YELLOW}# For GPU: srun --partition=gpu1v100 --gres=gpu:1 -N 1 -n 1 -c 10 --time=04:00:00 --pty bash${NC}"
+echo ""
+echo "  2. On the compute node, activate environment:"
+echo "     ${YELLOW}module load anaconda3${NC}"
 echo "     ${YELLOW}conda activate ${ENV_NAME}${NC}"
 echo ""
-if [ "$SKIP_OLLAMA" = false ]; then
-    echo "  2. Make sure Ollama is running:"
-    echo "     ${YELLOW}ollama serve${NC}"
-    echo ""
-    echo "  3. Verify the setup:"
-    echo "     ${YELLOW}./setup.sh --verify${NC}"
-    echo ""
-    echo "  4. Run a test task:"
-    echo "     ${YELLOW}python main.py --task \"Test task\" --project-dir ./test_project --dry-run${NC}"
-else
-    echo "  2. Verify the setup:"
-    echo "     ${YELLOW}./setup.sh --verify${NC}"
-    echo ""
-    echo "  3. Run a test task:"
-    echo "     ${YELLOW}python main.py --task \"Test task\" --project-dir ./test_project --dry-run${NC}"
-fi
+echo "  3. For GPU nodes, unset SLURM variables and load CUDA:"
+echo "     ${YELLOW}module load cudatoolkit${NC}"
+echo "     ${YELLOW}unset CUDA_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES GPU_DEVICE_ORDINAL${NC}"
 echo ""
-echo "For SLURM clusters:"
+echo "  4. Start Ollama and pull model:"
+echo "     ${YELLOW}ollama serve > /dev/null 2>&1 &${NC}"
+echo "     ${YELLOW}ollama pull llama3.1:8b${NC}"
+echo ""
+echo "  5. Run a test task:"
+echo "     ${YELLOW}python main.py --task \"Test task\" --project-dir ./test_project --dry-run${NC}"
+echo ""
+echo "For SLURM job submission:"
 echo "  ${YELLOW}python main.py --prompt-file prompts/example_prompt.txt --project-dir ./my_project --slurm${NC}"
 echo ""
-echo "See README.md for full documentation."
+echo "See README.md and QUICKSTART.md for full documentation."
 echo ""
 print_success "Happy automating!"

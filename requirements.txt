@@ -1,8 +1,11 @@
 # =============================================================================
 # Multi-Agent Automation System - Requirements
 # =============================================================================
-# Install with: pip install -r requirements.txt
-# Or use the conda environment.yml for a complete setup
+# RECOMMENDED: Use environment.yml for conda installation:
+#   conda env create -f environment.yml
+#
+# If using pip only (not recommended for HPC):
+#   pip install -r requirements.txt
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -12,23 +15,20 @@ langchain>=0.1.0
 langchain-community>=0.0.10
 langgraph>=0.0.20
 
-# Ollama Python client (for local LLM inference)
+# Ollama Python client
+# NOTE: For GPU support, Ollama must be installed system-wide by HPC admins
 ollama>=0.1.0
 
 # -----------------------------------------------------------------------------
-# Logging and Monitoring
+# Logging
 # -----------------------------------------------------------------------------
 loguru>=0.7.2
 
 # -----------------------------------------------------------------------------
-# Version Control Integration
+# Data Processing
 # -----------------------------------------------------------------------------
-gitpython>=3.1.40
-
-# -----------------------------------------------------------------------------
-# Configuration Management
-# -----------------------------------------------------------------------------
-pyyaml>=6.0.1
+pandas>=2.1.4
+numpy>=1.24.0
 
 # -----------------------------------------------------------------------------
 # Web Requests and Parsing
@@ -38,32 +38,17 @@ beautifulsoup4>=4.12.2
 lxml>=4.9.0
 
 # -----------------------------------------------------------------------------
-# Web Search (No API key required)
+# Web Search
 # -----------------------------------------------------------------------------
 duckduckgo-search>=4.0.0
 
 # -----------------------------------------------------------------------------
-# Data Processing
+# Configuration and Utilities
 # -----------------------------------------------------------------------------
-pandas>=2.1.4
-numpy>=1.24.0
-
-# -----------------------------------------------------------------------------
-# JSON/Schema Handling
-# -----------------------------------------------------------------------------
+pyyaml>=6.0.1
 jsonschema>=4.0.0
 
 # -----------------------------------------------------------------------------
-# Optional: GPU/ML Support (uncomment if needed)
+# Git Integration
 # -----------------------------------------------------------------------------
-# torch>=2.0.0
-# transformers>=4.30.0
-# accelerate>=0.20.0
-
-# -----------------------------------------------------------------------------
-# Optional: Enhanced Data Processing
-# -----------------------------------------------------------------------------
-# openpyxl>=3.1.0        # Excel file support
-# xlsxwriter>=3.1.0      # Excel writing
-# pyarrow>=12.0.0        # Parquet support
-# scipy>=1.11.0          # Scientific computing
+gitpython>=3.1.40

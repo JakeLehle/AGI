@@ -165,8 +165,8 @@ This system provides a **self-directed automation framework** that:
 ### Step 1: Clone the Repository
 
 ```bash
-git clone https://github.com/yourusername/multi-agent-system.git
-cd multi-agent-system
+git clone https://github.com/JakeLehle/AGI.git
+cd AGI
 ```
 
 ### Step 2: Create Conda Environment
@@ -186,74 +186,74 @@ conda activate AGI
 conda create -n AGI python=3.10 -y
 conda activate AGI
 
-# Install conda packages
-conda install -c conda-forge pandas numpy requests beautifulsoup4 lxml pyyaml gitpython -y
-
-# Install pip packages
-pip install langchain langchain-community langgraph ollama loguru duckduckgo-search jsonschema
+# Install all packages from conda-forge
+conda install -c conda-forge \
+    langchain langchain-community langgraph ollama \
+    pandas numpy requests beautifulsoup4 lxml \
+    pyyaml gitpython loguru duckduckgo-search jsonschema -y
 ```
 
-### Step 3: Install Ollama
+### Step 3: Ollama Setup (HPC Systems)
 
-Ollama runs the LLM locally. Install it separately (not a Python package):
+Ollama runs the LLM locally. On HPC systems, Ollama must be installed **system-wide by administrators** for GPU support.
 
-**Linux:**
+> **Important**: The conda-installed `ollama` Python package provides the API client but cannot detect CUDA/GPU drivers. For GPU inference, request your HPC admins install Ollama system-wide via:
+> ```bash
+> curl -fsSL https://ollama.com/install.sh | sh
+> ```
+
+**Request a GPU or compute node:**
+
 ```bash
-curl -fsSL https://ollama.com/install.sh | sh
+# GPU node (V100) - do NOT specify --mem (causes errors on some clusters)
+srun --partition=gpu1v100 --gres=gpu:1 -N 1 -n 1 -c 10 --time=04:00:00 --pty bash
+
+# GPU node (A100)
+srun --partition=gpu1a100 --gres=gpu:1 -N 1 -n 1 -c 16 --time=04:00:00 --pty bash
+
+# CPU node (for testing with smaller models)
+srun --partition=compute2 -N 1 -n 1 -c 40 --time=08:00:00 --pty bash
 ```
 
-**macOS:**
-```bash
-# Download from https://ollama.com/download
-# Or use Homebrew:
-brew install ollama
-```
+**On the compute/GPU node:**
 
-**Verify installation:**
 ```bash
-ollama --version
+# Load modules and activate environment
+module load anaconda3
+module load cudatoolkit  # For GPU nodes
+conda activate AGI
+
+# IMPORTANT: Unset SLURM GPU variables (Ollama has issues with them)
+unset CUDA_VISIBLE_DEVICES
+unset ROCR_VISIBLE_DEVICES  
+unset GPU_DEVICE_ORDINAL
+
+# Start Ollama server in background
+ollama serve > /dev/null 2>&1 &
+sleep 5
+
+# Verify server is running
+curl http://localhost:11434/api/tags
 ```
 
 ### Step 4: Pull the LLM Model
 
 ```bash
-# Pull the recommended model (requires ~40GB disk space, ~64GB RAM to run)
+# Pull the recommended model (requires ~40GB disk space, GPU with 32GB+ VRAM)
 ollama pull llama3.1:70b
 
-# Or use a smaller model for testing (requires ~4GB disk, ~8GB RAM)
+# Or use a smaller model for CPU testing (~4GB disk, works on CPU)
 ollama pull llama3.1:8b
 ```
 
-### Step 5: Start Ollama Server
+### Step 5: Verify Installation
 
 ```bash
-# Start the Ollama server (runs on port 11434 by default)
-ollama serve
-
-# Or run in background
-nohup ollama serve > /dev/null 2>&1 &
-```
-
-**For HPC systems**, you may want to run Ollama on a dedicated node:
-```bash
-# On the Ollama server node
-ollama serve --host 0.0.0.0
-
-# Then set the URL in config/config.yaml:
-# ollama:
-#   base_url: "http://ollama-node:11434"
-```
-
-### Step 6: Verify Installation
-
-```bash
-# Activate environment
-conda activate AGI
-
 # Test Ollama connection
-python -c "import ollama; print(ollama.list())"
+curl http://localhost:11434/api/tags
 
 # Test the system (dry run)
+cd /path/to/AGI
 python main.py --task "Test task" --project-dir ./test_project --dry-run
 ```
 

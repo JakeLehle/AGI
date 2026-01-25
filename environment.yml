@@ -16,55 +16,70 @@ dependencies:
   # Python version
   - python=3.10
   
-  # Core data science stack
+  # -----------------------------------------------------------------------------
+  # Core LLM Framework
+  # -----------------------------------------------------------------------------
+  - langchain>=0.1.0
+  - langchain-community>=0.0.10
+  - langgraph>=0.0.20
+  
+  # Ollama Python client (for local LLM inference)
+  # NOTE: The conda-installed Ollama client works, but for GPU support
+  # Ollama must be installed system-wide by your HPC admins
+  - ollama>=0.1.0
+  
+  # -----------------------------------------------------------------------------
+  # Logging
+  # -----------------------------------------------------------------------------
+  - loguru>=0.7.2
+  
+  # -----------------------------------------------------------------------------
+  # Data Processing
+  # -----------------------------------------------------------------------------
   - pandas>=2.1.4
   - numpy>=1.24.0
   
-  # Web requests
+  # -----------------------------------------------------------------------------
+  # Web Requests and Parsing
+  # -----------------------------------------------------------------------------
   - requests>=2.31.0
   - beautifulsoup4>=4.12.2
   - lxml>=4.9.0
   
-  # Configuration and logging
+  # -----------------------------------------------------------------------------
+  # Configuration and Utilities
+  # -----------------------------------------------------------------------------
   - pyyaml>=6.0.1
+  - jsonschema>=4.0.0
   
-  # Git integration
+  # -----------------------------------------------------------------------------
+  # Git Integration
+  # -----------------------------------------------------------------------------
   - gitpython>=3.1.40
   
-  # Pip-only packages (not available in conda)
+  # -----------------------------------------------------------------------------
+  # Pip-only packages (not available on conda-forge)
+  # -----------------------------------------------------------------------------
   - pip
   - pip:
-    # LangChain ecosystem
-    - langchain>=0.1.0
-    - langchain-community>=0.0.10
-    - langgraph>=0.0.20
-    
-    # Ollama client
-    - ollama>=0.1.0
-    
-    # Logging
-    - loguru>=0.7.2
-    
-    # Web search (no API key needed)
+    # Web search - not available on conda
     - duckduckgo-search>=4.0.0
-    
-    # JSON validation
-    - jsonschema>=4.0.0
 
 # =============================================================================
 # Post-installation notes:
 # =============================================================================
-# 1. Install Ollama separately (not a Python package):
-#    - Linux: curl -fsSL https://ollama.com/install.sh | sh
-#    - macOS: Download from https://ollama.com/download
-#    - Or run on a server and connect via API
+# 1. Ollama must be installed SYSTEM-WIDE by HPC administrators for GPU support.
+#    The conda-installed ollama package cannot detect CUDA/GPU drivers.
+#    Request your HPC admins install Ollama via:
+#      curl -fsSL https://ollama.com/install.sh | sh
 #
-# 2. Pull the required model:
-#    ollama pull llama3.1:70b
+# 2. Once Ollama is installed system-wide, pull the required model:
+#    ollama pull llama3.1:70b    # Full model (GPU recommended)
+#    ollama pull llama3.1:8b     # Smaller model (works on CPU)
 #
-# 3. Start Ollama server (if not running as service):
-#    ollama serve
+# 3. Start Ollama server (on compute/GPU node):
+#    ollama serve &
 #
 # 4. Verify installation:
-#    python -c "import ollama; print(ollama.list())"
+#    curl http://localhost:11434/api/tags
 # =============================================================================

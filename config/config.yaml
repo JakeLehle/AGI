@@ -3,7 +3,7 @@
 
 # Ollama Settings
 ollama:
-  model: "llama3.1:70b"
+  model: "llama3.1:70b"    # Use "llama3.1:8b" for CPU testing
   base_url: "http://127.0.0.1:11434"
   context_length: 4096
 
