@@ -1,0 +1,70 @@
+# =============================================================================
+# Multi-Agent Automation System - Conda Environment
+# =============================================================================
+# Create environment: conda env create -f environment.yml
+# Activate: conda activate AGI
+# Update: conda env update -f environment.yml --prune
+# =============================================================================
+
+name: AGI
+
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  # Python version
+  - python=3.10
+  
+  # Core data science stack
+  - pandas>=2.1.4
+  - numpy>=1.24.0
+  
+  # Web requests
+  - requests>=2.31.0
+  - beautifulsoup4>=4.12.2
+  - lxml>=4.9.0
+  
+  # Configuration and logging
+  - pyyaml>=6.0.1
+  
+  # Git integration
+  - gitpython>=3.1.40
+  
+  # Pip-only packages (not available in conda)
+  - pip
+  - pip:
+    # LangChain ecosystem
+    - langchain>=0.1.0
+    - langchain-community>=0.0.10
+    - langgraph>=0.0.20
+    
+    # Ollama client
+    - ollama>=0.1.0
+    
+    # Logging
+    - loguru>=0.7.2
+    
+    # Web search (no API key needed)
+    - duckduckgo-search>=4.0.0
+    
+    # JSON validation
+    - jsonschema>=4.0.0
+
+# =============================================================================
+# Post-installation notes:
+# =============================================================================
+# 1. Install Ollama separately (not a Python package):
+#    - Linux: curl -fsSL https://ollama.com/install.sh | sh
+#    - macOS: Download from https://ollama.com/download
+#    - Or run on a server and connect via API
+#
+# 2. Pull the required model:
+#    ollama pull llama3.1:70b
+#
+# 3. Start Ollama server (if not running as service):
+#    ollama serve
+#
+# 4. Verify installation:
+#    python -c "import ollama; print(ollama.list())"
+# =============================================================================

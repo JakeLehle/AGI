@@ -1,0 +1,54 @@
+# Task Description
+
+Fine-tune a sentiment classification model on the customer reviews dataset.
+Use a pre-trained transformer model (BERT or similar) and train on the provided
+labeled data. Evaluate the model and generate a comprehensive performance report.
+
+# Input Files
+
+- data/inputs/customer_reviews.csv
+- data/inputs/label_mapping.json
+
+# Expected Outputs
+
+- models/sentiment_classifier/
+- data/outputs/predictions.csv
+- data/outputs/evaluation_metrics.json
+- reports/model_performance.md
+- reports/confusion_matrix.png
+
+# Context
+
+Model requirements:
+- Base model: Use a pre-trained transformer (bert-base-uncased recommended)
+- Input: Customer review text (variable length, max 512 tokens)
+- Output: Sentiment classification (positive, negative, neutral)
+
+Training parameters:
+- Train/validation split: 80/20
+- Batch size: 32 (adjust based on GPU memory)
+- Learning rate: 2e-5
+- Epochs: 3-5 (with early stopping)
+- Optimizer: AdamW
+
+GPU requirements:
+- Minimum: 1x GPU with 16GB VRAM (V100)
+- Recommended: 1x A100 for faster training
+
+Evaluation metrics:
+- Accuracy
+- Precision, Recall, F1 (per class and macro average)
+- Confusion matrix
+- ROC curves (if applicable)
+
+Package requirements:
+- transformers
+- torch
+- scikit-learn
+- matplotlib
+- seaborn
+
+Notes:
+- Save the best model checkpoint based on validation loss
+- Generate training curves (loss and accuracy over epochs)
+- Include sample predictions with confidence scores in the report

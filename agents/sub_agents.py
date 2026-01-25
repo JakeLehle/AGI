@@ -507,6 +507,11 @@ Keep the plan focused and achievable. Prioritize getting working code over perfe
                         cpus=step.get("cpus", self.slurm_config.get("cpus", 4)),
                         memory=step.get("memory", self.slurm_config.get("memory", "16G")),
                         time_limit=step.get("time", self.slurm_config.get("time", "04:00:00")),
+                        partition=step.get("partition", self.slurm_config.get("partition")),
+                        gpus=step.get("gpus", self.slurm_config.get("gpus", 0)),
+                        gpu_type=step.get("gpu_type", self.slurm_config.get("gpu_type")),
+                        nodelist=step.get("nodelist", self.slurm_config.get("nodelist")),
+                        exclude_nodes=step.get("exclude_nodes", self.slurm_config.get("exclude_nodes")),
                         dependencies=dependencies if dependencies else None
                     )
                     
