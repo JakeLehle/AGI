@@ -105,10 +105,19 @@ class MultiAgentWorkflow:
         # Initialize SLURM tools if enabled
         self.slurm_tools = None
         if use_slurm:
-            self.slurm_tools = SlurmTools(self.sandbox)
+            cluster_name = self.slurm_config.get("cluster")
+            self.slurm_tools = SlurmTools(
+                self.sandbox,
+                cluster_name=cluster_name
+            )
             if not self.slurm_tools.slurm_available:
                 print("WARNING: SLURM not available, falling back to interactive mode")
                 self.use_slurm = False
+            else:
+                # Set partition if specified
+                partition = self.slurm_config.get("partition")
+                if partition:
+                    print(f"Using cluster: {self.slurm_tools.cluster_name}, partition: {partition}")
         
         # Initialize master agent
         self.master = MasterAgent(

@@ -1,5 +1,5 @@
 # Multi-Agent System Configuration
-# Configured for zeus cluster with SLURM job scheduling
+# Supports multiple SLURM clusters with different configurations
 
 # Ollama Settings
 ollama:
@@ -9,16 +9,9 @@ ollama:
 
 # Agent Settings
 agents:
-  # Maximum iteration attempts per subtask (10-15 range)
   max_retries: 12
-  
-  # Timeout for individual operations (seconds)
-  timeout_seconds: 3600
-  
-  # Enable dynamic tool creation when existing tools are insufficient
+  timeout_seconds: 300
   enable_dynamic_tools: true
-  
-  # Supported languages for script execution
   supported_languages:
     - python
     - r
@@ -26,61 +19,242 @@ agents:
     - perl
     - java
 
-# SLURM Cluster Settings (zeus cluster)
+# =============================================================================
+# SLURM Configuration
+# =============================================================================
 slurm:
-  # Enable SLURM job submission instead of interactive execution
   enabled: true
   
-  # Default partition
-  partition: "normal"
+  # Default cluster to use (can be overridden with --cluster CLI option)
+  # Options: "zeus" or "gpu_cluster"
+  default_cluster: "zeus"
   
-  # Resource defaults per job (conservative for parallel jobs)
-  default_cpus: 192
-  default_memory: "900G"
-  default_time: "04:00:00"
-  
-  # Maximum time (normal partition limit on zeus)
-  max_time: "7-00:00:00"
-  
-  # Cluster information (zeus)
-  cluster:
-    name: "zeus"
-    nodes: 10
-    cores_per_node: 192
-    memory_per_node: "1000G"  # ~1TB
-    partitions:
-      - name: "normal"
-        max_time: "7-00:00:00"
-        nodes: "n1722-n1733"
-      - name: "interactive"
-        max_time: "3650-00:00:00"
-        nodes: "n1734"
-  
-  # Parallel execution settings
-  max_parallel_jobs: 10  # Max concurrent jobs to submit
-  poll_interval: 10      # Seconds between job status checks
-  max_poll_attempts: 720 # Max attempts (2 hours at 10s intervals)
+  # Polling settings (shared across clusters)
+  poll_interval: 10       # Seconds between job status checks
+  max_poll_attempts: 720  # Max attempts (2 hours at 10s intervals)
   
   # Job naming prefix
   job_prefix: "agi"
 
-# Parallel Execution Settings
-parallel:
-  # Enable parallel execution of independent subtasks
-  enabled: true
+# =============================================================================
+# Cluster Configurations
+# =============================================================================
+clusters:
+  # ---------------------------------------------------------------------------
+  # Zeus cluster - CPU only, high memory (192 cores, ~1TB RAM per node)
+  # ---------------------------------------------------------------------------
+  zeus:
+    name: "zeus"
+    description: "Main CPU cluster with high memory nodes"
+    
+    # Node specifications
+    nodes_total: 10
+    cores_per_node: 192
+    memory_per_node: "1000G"
+    has_gpu: false
+    
+    # Default partition and resources
+    default_partition: "normal"
+    default_cpus: 4
+    default_memory: "16G"
+    default_time: "04:00:00"
+    
+    # Partition configurations
+    partitions:
+      normal:
+        max_time: "7-00:00:00"
+        max_cpus: 192
+        max_memory: "1000G"
+        nodes: "n1722-n1733"
+        description: "Standard compute partition"
+        has_gpu: false
+      interactive:
+        max_time: "3650-00:00:00"
+        max_cpus: 192
+        max_memory: "1000G"
+        nodes: "n1734"
+        description: "Interactive/long-running jobs"
+        has_gpu: false
+    
+    # Extra SBATCH directives for this cluster
+    sbatch_extras: []
   
-  # Maximum concurrent threads (for non-SLURM parallel mode)
-  max_threads: 4
-  
-  # Batch size for parallel task groups
-  max_batch_size: 5
+  # ---------------------------------------------------------------------------
+  # GPU Cluster - Mixed CPU and GPU nodes (80 cores per node)
+  # ---------------------------------------------------------------------------
+  gpu_cluster:
+    name: "gpu_cluster"
+    description: "GPU cluster with V100, A100, and DGX nodes"
+    
+    # Default node specifications (varies by partition)
+    nodes_total: 120
+    cores_per_node: 80
+    memory_per_node: "256G"
+    has_gpu: true
+    
+    # Default partition and resources
+    default_partition: "compute1"
+    default_cpus: 4
+    default_memory: "16G"
+    default_time: "04:00:00"
+    default_gpus: 0  # No GPU by default, must be explicitly requested
+    
+    # Partition configurations
+    partitions:
+      # === CPU Compute Partitions ===
+      compute1:
+        max_time: "3-00:01:00"
+        max_cpus: 80
+        max_memory: "256G"
+        nodes: "c001-c065"
+        description: "Standard CPU compute (3 day limit) - DEFAULT"
+        has_gpu: false
+        default: true
+      
+      compute2:
+        max_time: "10-00:01:00"
+        max_cpus: 80
+        max_memory: "256G"
+        nodes: "c066-c116"
+        description: "Extended CPU compute (10 day limit)"
+        has_gpu: false
+      
+      compute3:
+        max_time: "3-00:01:00"
+        max_cpus: 80
+        max_memory: "256G"
+        nodes: "c120-c127"
+        description: "Additional CPU compute"
+        has_gpu: false
+      
+      # === High Memory Partitions ===
+      bigmem:
+        max_time: "3-00:00:00"
+        max_cpus: 80
+        max_memory: "1000G"
+        nodes: "b001-b002"
+        description: "High memory nodes (~1TB RAM)"
+        has_gpu: false
+      
+      bigmem2:
+        max_time: "3-00:00:00"
+        max_cpus: 80
+        max_memory: "1500G"
+        nodes: "b003"
+        description: "Extra high memory node (~1.5TB RAM)"
+        has_gpu: false
+      
+      # === GPU Partitions - V100 ===
+      gpu1v100:
+        max_time: "3-00:01:00"
+        max_cpus: 40
+        max_memory: "256G"
+        max_gpus: 4
+        gpu_type: "v100"
+        vram_per_gpu: "32G"
+        nodes: "gpu001-gpu022"
+        description: "V100 GPUs (4x 32GB per node)"
+        has_gpu: true
+      
+      gpu2v100:
+        max_time: "3-00:00:00"
+        max_cpus: 40
+        max_memory: "256G"
+        max_gpus: 4
+        gpu_type: "v100"
+        vram_per_gpu: "32G"
+        nodes: "gpu027-gpu035"
+        description: "V100 GPUs (4x 32GB per node)"
+        has_gpu: true
+      
+      gpu4v100:
+        max_time: "3-00:00:00"
+        max_cpus: 40
+        max_memory: "256G"
+        max_gpus: 4
+        gpu_type: "v100"
+        vram_per_gpu: "32G"
+        nodes: "gpu037-gpu038"
+        description: "V100 GPUs (4x 32GB per node)"
+        has_gpu: true
+      
+      # === GPU Partitions - A100 ===
+      gpu1a100:
+        max_time: "3-00:00:00"
+        max_cpus: 64
+        max_memory: "512G"
+        max_gpus: 4
+        gpu_type: "a100"
+        vram_per_gpu: "80G"
+        nodes: "gpu039-gpu040"
+        description: "A100 GPUs (4x 80GB per node) - High performance"
+        has_gpu: true
+      
+      # === DGX A100 Nodes ===
+      dgxa100:
+        max_time: "infinite"
+        max_cpus: 128
+        max_memory: "1000G"
+        max_gpus: 8
+        gpu_type: "a100"
+        vram_per_gpu: "80G"
+        nodes: "dgx001-dgx003"
+        description: "DGX A100 nodes (8x 80GB GPUs each) - Premium"
+        has_gpu: true
+      
+      # === Testing Partition ===
+      testing:
+        max_time: "infinite"
+        max_cpus: 80
+        max_memory: "256G"
+        nodes: "c075-c078"
+        description: "Testing partition (no time limit)"
+        has_gpu: false
+      
+      # === Lab-specific Partitions ===
+      uavlab:
+        max_time: "infinite"
+        max_cpus: 80
+        max_memory: "256G"
+        nodes: "xe001"
+        description: "UAV Lab partition"
+        has_gpu: false
+      
+      uavlab2:
+        max_time: "infinite"
+        max_cpus: 80
+        max_memory: "256G"
+        max_gpus: 4
+        gpu_type: "v100"
+        nodes: "gpu041-gpu042"
+        description: "UAV Lab GPU partition"
+        has_gpu: true
+      
+      trustlab:
+        max_time: "infinite"
+        max_cpus: 80
+        max_memory: "256G"
+        nodes: "xe002"
+        description: "Trust Lab partition"
+        has_gpu: false
+    
+    # Extra SBATCH directives for this cluster
+    sbatch_extras: []
 
+# =============================================================================
+# Parallel Execution Settings
+# =============================================================================
+parallel:
+  enabled: true
+  max_threads: 4
+  max_batch_size: 5
+  max_parallel_jobs: 10
+
+# =============================================================================
 # Sandbox Settings
+# =============================================================================
 sandbox:
-  # All agent file operations restricted to project directory
   enforce_sandbox: true
-  
-  # Standard subdirectories created in each project
   subdirectories:
     - data
     - data/inputs
@@ -94,84 +268,80 @@ sandbox:
     - slurm/scripts
     - slurm/logs
 
+# =============================================================================
 # Conda Environment Settings
+# =============================================================================
 conda:
-  # Prefix for all project environments
   env_prefix: "agi_"
-  
-  # Default Python version for new environments
   default_python: "3.10"
-  
-  # Auto-export environment.yaml after package changes
   auto_export_yaml: true
-  
-  # Clean up environments after project completion
   auto_cleanup: false
-  
-  # Common channels to search
   channels:
     - defaults
     - conda-forge
     - bioconda
+    - pytorch  # For GPU jobs
 
+# =============================================================================
 # Logging
+# =============================================================================
 logging:
   level: "INFO"
   json_format: true
   console_output: true
-  
-  # Log files to generate
   files:
     - execution_log.jsonl
     - agent_activity.jsonl
     - slurm_jobs.jsonl
     - errors.jsonl
 
+# =============================================================================
 # Git Integration
+# =============================================================================
 git:
   auto_commit: true
   commit_on_success: true
   tag_failures: true
 
+# =============================================================================
 # Documentation
+# =============================================================================
 documentation:
   auto_generate_readme: true
   update_frequency: "on_completion"
   include_code_samples: true
-  
-  # Generate these reports
   reports:
     - task_summary
     - environment_summary
     - execution_log
     - slurm_job_summary
 
+# =============================================================================
 # Workflow
+# =============================================================================
 workflow:
   enable_checkpointing: true
   checkpoint_frequency: "per_subtask"
-  max_execution_time_minutes: 480  # 8 hours max
-  
-  # Sub-agent settings
+  max_execution_time_minutes: 480
+
   subtask:
     max_iterations: 12
     require_final_report: true
     report_on_failure: true
 
+# =============================================================================
 # Web Search
+# =============================================================================
 web_search:
   provider: "duckduckgo"
   max_results_per_query: 10
   rate_limit_seconds: 1.0
   cache_results: true
 
+# =============================================================================
 # Prompt Settings
+# =============================================================================
 prompts:
-  # Directory for storing prompt files
   prompts_dir: "prompts"
-  
-  # Save all prompts with timestamps
   archive_prompts: true
-  
-  # Prompt file naming pattern
   naming_pattern: "prompt_{timestamp}_{task_hash}.txt"

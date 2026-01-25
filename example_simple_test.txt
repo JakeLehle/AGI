@@ -1,0 +1,37 @@
+# Task Description
+
+Create a simple data processing pipeline that:
+1. Generates sample data
+2. Performs basic analysis
+3. Creates a visualization
+4. Writes a summary report
+
+This is a simple test task to verify the system is working correctly.
+
+# Input Files
+
+(None required - will generate sample data)
+
+# Expected Outputs
+
+- data/outputs/sample_data.csv
+- data/outputs/analysis_results.json
+- reports/figures/data_visualization.png
+- reports/summary.md
+
+# Context
+
+Test parameters:
+- Generate 1000 random data points
+- Include numeric and categorical columns
+- Calculate basic statistics (mean, median, std)
+- Create a simple bar chart or histogram
+
+This task should complete in a few minutes and requires minimal resources.
+Use it to verify:
+- Environment setup is correct
+- LLM connectivity works
+- File I/O operations work
+- Conda environment management works
+
+No special packages required beyond the base installation.

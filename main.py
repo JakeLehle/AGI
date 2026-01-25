@@ -1,15 +1,18 @@
 """
 Main entry point for the multi-agent system.
-Supports SLURM job submission and parallel execution on zeus cluster.
+Supports multiple SLURM clusters (CPU and GPU) with flexible configuration.
 
 Run with:
-    python main.py --prompt-file prompts/my_task.txt --project-dir /path/to/project
-
-With SLURM:
+    # Zeus cluster (CPU, default)
     python main.py --prompt-file prompts/my_task.txt --project-dir /path/to/project --slurm
 
-Or with inline task:
-    python main.py --task "Your task description" --project-dir /path/to/project
+    # GPU cluster with specific partition
+    python main.py --prompt-file prompts/gpu_task.txt --project-dir /path/to/project \\
+        --slurm --cluster gpu_cluster --partition gpu1v100 --gpus 2
+
+    # Check available clusters and partitions
+    python main.py --list-clusters --project-dir ./test
+    python main.py --cluster-status --cluster gpu_cluster --project-dir ./test
 """
 
 import argparse
@@ -23,7 +26,7 @@ import sys
 from workflows.langgraph_workflow import MultiAgentWorkflow
 from utils.logging_config import agent_logger
 from tools.sandbox import Sandbox
-from tools.slurm_tools import SlurmTools
+from tools.slurm_tools import SlurmTools, SlurmConfig
 
 
 def load_config(config_path: str = "config/config.yaml") -> dict:
@@ -36,8 +39,9 @@ def load_config(config_path: str = "config/config.yaml") -> dict:
         return {
             "ollama": {"model": "llama3.1:70b", "base_url": "http://127.0.0.1:11434"},
             "agents": {"max_retries": 12},
-            "slurm": {"enabled": False},
-            "parallel": {"enabled": True}
+            "slurm": {"enabled": False, "default_cluster": "zeus"},
+            "parallel": {"enabled": True},
+            "clusters": {}
         }
 
 
@@ -72,7 +76,6 @@ def load_prompt_file(prompt_path: str) -> dict:
     
     content = prompt_path.read_text()
     
-    # Parse sections
     result = {
         "task": "",
         "input_files": [],
@@ -88,7 +91,6 @@ def load_prompt_file(prompt_path: str) -> dict:
     for line in content.split('\n'):
         line_stripped = line.strip()
         
-        # Check for section headers
         if line_stripped.startswith('# Task') or line_stripped.startswith('# Description'):
             if section_content:
                 result[current_section] = '\n'.join(section_content).strip()
@@ -112,7 +114,6 @@ def load_prompt_file(prompt_path: str) -> dict:
         else:
             section_content.append(line)
     
-    # Don't forget last section
     if section_content:
         result[current_section] = '\n'.join(section_content).strip()
     
@@ -131,7 +132,6 @@ def load_prompt_file(prompt_path: str) -> dict:
             if line.strip() and not line.strip().startswith('#')
         ]
     
-    # Parse context if it's a string
     if isinstance(result.get("context"), str):
         result["context"] = {"notes": result["context"]}
     
@@ -143,14 +143,11 @@ def archive_prompt(prompt_data: dict, project_dir: Path, config: dict):
     prompts_dir = project_dir / config.get("prompts", {}).get("prompts_dir", "prompts")
     prompts_dir.mkdir(parents=True, exist_ok=True)
     
-    # Generate filename
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     task_hash = hashlib.md5(prompt_data.get("task", "")[:100].encode()).hexdigest()[:8]
     filename = f"prompt_{timestamp}_{task_hash}.json"
     
     archive_path = prompts_dir / filename
-    
-    # Add metadata
     prompt_data["archived_at"] = datetime.now().isoformat()
     
     with open(archive_path, 'w') as f:
@@ -162,40 +159,98 @@ def archive_prompt(prompt_data: dict, project_dir: Path, config: dict):
 def validate_project_dir(project_dir: str) -> Path:
     """Validate and create project directory"""
     project_path = Path(project_dir).resolve()
-    
-    # Create if doesn't exist
     project_path.mkdir(parents=True, exist_ok=True)
-    
     return project_path
 
 
-def check_slurm_status(sandbox: Sandbox) -> dict:
-    """Check SLURM availability and cluster status"""
-    slurm_tools = SlurmTools(sandbox)
+def list_clusters(config: dict):
+    """List all configured clusters"""
+    clusters = config.get("clusters", {})
+    
+    print("\n" + "="*70)
+    print("  Available Clusters")
+    print("="*70)
+    
+    default = config.get("slurm", {}).get("default_cluster", "zeus")
+    
+    for name, cluster_config in clusters.items():
+        is_default = " (DEFAULT)" if name == default else ""
+        has_gpu = cluster_config.get("has_gpu", False)
+        gpu_str = " [GPU]" if has_gpu else " [CPU]"
+        
+        print(f"\n  {name}{gpu_str}{is_default}")
+        print(f"    {cluster_config.get('description', 'No description')}")
+        print(f"    Cores/Node: {cluster_config.get('cores_per_node', 'N/A')}")
+        print(f"    Memory/Node: {cluster_config.get('memory_per_node', 'N/A')}")
+        print(f"    Default Partition: {cluster_config.get('default_partition', 'N/A')}")
+        
+        # List partitions
+        partitions = cluster_config.get("partitions", {})
+        if partitions:
+            print(f"    Partitions:")
+            for pname, pconfig in partitions.items():
+                gpu_info = ""
+                if pconfig.get("has_gpu"):
+                    gpu_info = f" (GPU: {pconfig.get('max_gpus', '?')}x {pconfig.get('gpu_type', '?')})"
+                print(f"      - {pname}: {pconfig.get('description', '')[:40]}{gpu_info}")
+    
+    print("\n" + "="*70 + "\n")
+
+
+def check_cluster_status(sandbox: Sandbox, config: dict, cluster_name: str = None, partition: str = None):
+    """Check and display cluster status"""
+    slurm_config = SlurmConfig(config_dict=config)
+    slurm_tools = SlurmTools(sandbox, config=slurm_config, cluster_name=cluster_name)
     
     if not slurm_tools.slurm_available:
-        return {
-            "available": False,
-            "message": "SLURM commands not found"
-        }
+        print("\n✗ SLURM is not available on this system\n")
+        return {"available": False}
     
-    status = slurm_tools.get_cluster_status()
+    # Print cluster summary
+    print("\n" + "="*70)
+    slurm_tools.print_cluster_summary()
+    
+    # Get live status
+    print("\n--- Live Status ---")
+    status = slurm_tools.get_cluster_status(partition=partition)
     
     if status["success"]:
-        return {
-            "available": True,
-            "idle_nodes": status.get("idle_count", 0),
-            "total_nodes": status.get("total_nodes", 0),
-            "message": f"{status.get('idle_count', 0)} idle nodes available"
-        }
+        print(f"Total Nodes: {status.get('total_nodes', 'N/A')}")
+        print(f"Idle Nodes: {status.get('idle_count', 0)}")
+        
+        if status.get("gpu_nodes"):
+            print(f"GPU Nodes: {status.get('gpu_count', 0)}")
+        
+        if partition:
+            part_info = slurm_tools.get_partition_info(partition)
+            if part_info.get("success"):
+                print(f"\nPartition '{partition}' Details:")
+                cfg = part_info.get("config", {})
+                print(f"  Max Time: {cfg.get('max_time')}")
+                print(f"  Max CPUs: {cfg.get('max_cpus')}")
+                print(f"  Max Memory: {cfg.get('max_memory')}")
+                if cfg.get("has_gpu"):
+                    print(f"  GPUs: {cfg.get('max_gpus')}x {cfg.get('gpu_type')}")
+        
+        # Show some idle nodes
+        idle_nodes = status.get("idle_nodes", [])
+        if idle_nodes:
+            print(f"\nIdle nodes: {', '.join(idle_nodes[:10])}")
+            if len(idle_nodes) > 10:
+                print(f"  ... and {len(idle_nodes) - 10} more")
     else:
-        return {
-            "available": False,
-            "message": status.get("error", "Unknown error")
-        }
+        print(f"Error getting status: {status.get('error')}")
+    
+    print("="*70 + "\n")
+    
+    return {
+        "available": True,
+        "idle_count": status.get("idle_count", 0),
+        "cluster": cluster_name or slurm_config.default_cluster
+    }
 
 
-def print_banner(task: str, config: dict, project_dir: Path, slurm_status: dict = None):
+def print_banner(task: str, config: dict, project_dir: Path, cluster_info: dict = None):
     """Print startup banner"""
     print(f"\n{'='*70}")
     print(f"  Multi-Agent System - Task Executor")
@@ -204,17 +259,28 @@ def print_banner(task: str, config: dict, project_dir: Path, slurm_status: dict 
     print(f"  Model: {config['ollama']['model']}")
     print(f"  Max Iterations: {config['agents']['max_retries']}")
     
-    if slurm_status:
-        if slurm_status.get("available"):
-            print(f"  SLURM: Enabled ({slurm_status.get('message', 'Available')})")
-        else:
-            print(f"  SLURM: Disabled ({slurm_status.get('message', 'Not available')})")
+    if cluster_info:
+        cluster_name = cluster_info.get('cluster', 'N/A')
+        partition = cluster_info.get('partition', 'default')
+        print(f"  Cluster: {cluster_name}")
+        print(f"  Partition: {partition}")
+        
+        if cluster_info.get('gpus', 0) > 0:
+            gpu_type = cluster_info.get('gpu_type', 'GPU')
+            print(f"  GPUs: {cluster_info['gpus']}x {gpu_type}")
+        
+        if cluster_info.get('nodelist'):
+            print(f"  Node(s): {cluster_info['nodelist']}")
+        
+        if cluster_info.get('idle_count'):
+            print(f"  Available Nodes: {cluster_info['idle_count']}")
     
     if config.get("parallel", {}).get("enabled"):
-        print(f"  Parallel Execution: Enabled (max {config.get('slurm', {}).get('max_parallel_jobs', 5)} concurrent)")
+        print(f"  Parallel Execution: Enabled")
     
     print(f"{'='*70}")
     print(f"\n  Task:")
+    
     # Wrap task text
     words = task.split()
     line = "    "
@@ -231,139 +297,94 @@ def print_banner(task: str, config: dict, project_dir: Path, slurm_status: dict 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Multi-Agent System for Complex Task Execution (zeus cluster)",
+        description="Multi-Agent System for Complex Task Execution (Multi-Cluster Support)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Run with a prompt file (interactive mode)
-  python main.py --prompt-file prompts/biotech_analysis.txt --project-dir ./biotech_project
+  # Run on zeus cluster (CPU, default)
+  python main.py --prompt-file prompts/analysis.txt --project-dir ./project --slurm
 
-  # Run with SLURM job submission
-  python main.py --prompt-file prompts/biotech_analysis.txt --project-dir ./biotech_project --slurm
+  # Run on GPU cluster with V100s
+  python main.py --prompt-file prompts/ml_task.txt --project-dir ./ml_project \\
+      --slurm --cluster gpu_cluster --partition gpu1v100 --gpus 2
 
-  # Run with inline task and parallel execution
-  python main.py --task "Analyze CSV files" --project-dir ./analysis --parallel
+  # Run on GPU cluster with A100s (high memory)
+  python main.py --task "Train large model" --project-dir ./training \\
+      --slurm --cluster gpu_cluster --partition gpu1a100 --gpus 4 --memory 256G
 
-  # Specify resources for SLURM jobs
-  python main.py --prompt-file prompts/task.txt --project-dir ./project --slurm --cpus 8 --memory 32G
+  # Run on specific node
+  python main.py --task "Debug job" --project-dir ./debug \\
+      --slurm --cluster gpu_cluster --partition gpu1v100 --nodelist gpu004
+
+  # List available clusters
+  python main.py --list-clusters --project-dir ./test
 
   # Check cluster status
-  python main.py --cluster-status --project-dir ./test
+  python main.py --cluster-status --cluster gpu_cluster --project-dir ./test
 
-  # Resume previous execution
-  python main.py --project-dir ./myproject --thread-id abc123 --resume
+  # Check specific partition status
+  python main.py --cluster-status --cluster gpu_cluster --partition gpu1a100 --project-dir ./test
         """
     )
     
     # Task input (mutually exclusive)
     task_group = parser.add_mutually_exclusive_group()
-    task_group.add_argument(
-        "--task",
-        type=str,
-        help="High-level task description (inline)"
-    )
-    task_group.add_argument(
-        "--prompt-file",
-        type=str,
-        help="Path to prompt file containing task description"
-    )
-    task_group.add_argument(
-        "--cluster-status",
-        action="store_true",
-        help="Just check and display cluster status"
-    )
+    task_group.add_argument("--task", type=str, help="High-level task description (inline)")
+    task_group.add_argument("--prompt-file", type=str, help="Path to prompt file containing task")
+    task_group.add_argument("--list-clusters", action="store_true", help="List all configured clusters")
+    task_group.add_argument("--cluster-status", action="store_true", help="Check cluster/partition status")
     
-    # Required project directory
-    parser.add_argument(
-        "--project-dir",
+    # Project directory (required for most operations)
+    parser.add_argument("--project-dir", type=str, required=True, help="Project directory for all files")
+    
+    # Cluster selection
+    cluster_group = parser.add_argument_group('Cluster Options')
+    cluster_group.add_argument(
+        "--cluster",
         type=str,
-        required=True,
-        help="Project directory for all files and outputs"
+        help="Cluster to use (e.g., 'zeus', 'gpu_cluster'). Default from config."
+    )
+    cluster_group.add_argument(
+        "--partition", "-p",
+        type=str,
+        help="SLURM partition to use (e.g., 'normal', 'gpu1v100', 'dgxa100')"
+    )
+    cluster_group.add_argument(
+        "--nodelist", "-w",
+        type=str,
+        help="Specific node(s) to run on (e.g., 'gpu001' or 'gpu[001-003]')"
+    )
+    cluster_group.add_argument(
+        "--exclude", "-x",
+        type=str,
+        help="Node(s) to exclude (e.g., 'gpu002')"
     )
     
     # SLURM options
     slurm_group = parser.add_argument_group('SLURM Options')
-    slurm_group.add_argument(
-        "--slurm",
-        action="store_true",
-        help="Enable SLURM job submission (default: interactive)"
-    )
-    slurm_group.add_argument(
-        "--no-slurm",
-        action="store_true",
-        help="Disable SLURM even if configured (force interactive)"
-    )
-    slurm_group.add_argument(
-        "--partition",
-        type=str,
-        default="normal",
-        help="SLURM partition to use (default: normal)"
-    )
-    slurm_group.add_argument(
-        "--cpus",
-        type=int,
-        help="CPUs per job (default: from config)"
-    )
-    slurm_group.add_argument(
-        "--memory",
-        type=str,
-        help="Memory per job, e.g., '16G' (default: from config)"
-    )
-    slurm_group.add_argument(
-        "--time",
-        type=str,
-        help="Time limit per job, e.g., '04:00:00' (default: from config)"
-    )
+    slurm_group.add_argument("--slurm", action="store_true", help="Enable SLURM job submission")
+    slurm_group.add_argument("--no-slurm", action="store_true", help="Disable SLURM (force interactive)")
+    slurm_group.add_argument("--cpus", "-c", type=int, help="CPUs per job")
+    slurm_group.add_argument("--memory", "--mem", type=str, help="Memory per job (e.g., '16G', '256G')")
+    slurm_group.add_argument("--time", "-t", type=str, help="Time limit (e.g., '04:00:00', '3-00:00:00')")
+    
+    # GPU options
+    gpu_group = parser.add_argument_group('GPU Options')
+    gpu_group.add_argument("--gpus", "-G", type=int, default=0, help="Number of GPUs to request")
+    gpu_group.add_argument("--gpu-type", type=str, help="GPU type (e.g., 'v100', 'a100')")
     
     # Parallel execution
-    parser.add_argument(
-        "--parallel",
-        action="store_true",
-        help="Enable parallel execution of independent subtasks"
-    )
-    parser.add_argument(
-        "--no-parallel",
-        action="store_true",
-        help="Disable parallel execution (sequential only)"
-    )
-    parser.add_argument(
-        "--max-parallel",
-        type=int,
-        help="Maximum parallel jobs (default: from config)"
-    )
+    parser.add_argument("--parallel", action="store_true", help="Enable parallel subtask execution")
+    parser.add_argument("--no-parallel", action="store_true", help="Disable parallel execution")
+    parser.add_argument("--max-parallel", type=int, help="Maximum parallel jobs")
     
     # Other options
-    parser.add_argument(
-        "--context",
-        type=str,
-        help="Additional context as JSON string"
-    )
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="config/config.yaml",
-        help="Path to config file"
-    )
-    parser.add_argument(
-        "--thread-id",
-        type=str,
-        help="Thread ID for resuming previous execution"
-    )
-    parser.add_argument(
-        "--resume",
-        action="store_true",
-        help="Resume previous execution (requires --thread-id)"
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Parse and validate inputs without executing"
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Enable verbose output"
-    )
+    parser.add_argument("--context", type=str, help="Additional context as JSON string")
+    parser.add_argument("--config", type=str, default="config/config.yaml", help="Path to config file")
+    parser.add_argument("--thread-id", type=str, help="Thread ID for resuming previous execution")
+    parser.add_argument("--resume", action="store_true", help="Resume previous execution")
+    parser.add_argument("--dry-run", action="store_true", help="Parse and validate without executing")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output")
     
     args = parser.parse_args()
     
@@ -376,31 +397,28 @@ Examples:
     # Initialize sandbox
     sandbox = Sandbox(project_dir)
     
-    # Check cluster status if requested
-    if args.cluster_status:
-        print("\nChecking cluster status...")
-        status = check_slurm_status(sandbox)
-        
-        if status["available"]:
-            print(f"\n✓ SLURM is available")
-            print(f"  Idle nodes: {status.get('idle_nodes', 'unknown')}")
-            print(f"  Total nodes: {status.get('total_nodes', 'unknown')}")
-            
-            # Get detailed status
-            slurm_tools = SlurmTools(sandbox)
-            detailed = slurm_tools.get_cluster_status()
-            if detailed["success"]:
-                print(f"\nNode Status:")
-                for node in detailed.get("nodes", [])[:15]:  # First 15 nodes
-                    print(f"  {node['name']}: {node['state']}")
-        else:
-            print(f"\n✗ SLURM is not available: {status.get('message')}")
-        
+    # Handle --list-clusters
+    if args.list_clusters:
+        list_clusters(config)
         sys.exit(0)
     
-    # Require task input if not checking status
+    # Handle --cluster-status
+    if args.cluster_status:
+        check_cluster_status(sandbox, config, args.cluster, args.partition)
+        sys.exit(0)
+    
+    # Require task input if not listing/checking
     if not args.task and not args.prompt_file:
         parser.error("Either --task or --prompt-file is required")
+    
+    # Determine cluster to use
+    cluster_name = args.cluster or config.get("slurm", {}).get("default_cluster", "zeus")
+    
+    # Get cluster config
+    cluster_config = config.get("clusters", {}).get(cluster_name, {})
+    
+    # Determine partition
+    partition = args.partition or cluster_config.get("default_partition", "normal")
     
     # Determine SLURM usage
     use_slurm = False
@@ -411,14 +429,17 @@ Examples:
     elif config.get("slurm", {}).get("enabled"):
         use_slurm = True
     
-    # Check SLURM availability if requested
+    # Check SLURM availability
     slurm_status = None
     if use_slurm:
-        slurm_status = check_slurm_status(sandbox)
-        if not slurm_status["available"]:
-            print(f"WARNING: SLURM requested but not available: {slurm_status.get('message')}")
-            print("Falling back to interactive mode")
+        slurm_config = SlurmConfig(config_dict=config)
+        slurm_tools = SlurmTools(sandbox, config=slurm_config, cluster_name=cluster_name)
+        
+        if not slurm_tools.slurm_available:
+            print(f"WARNING: SLURM requested but not available. Falling back to interactive mode.")
             use_slurm = False
+        else:
+            slurm_status = slurm_tools.get_cluster_status(partition=partition)
     
     # Determine parallel execution
     parallel_enabled = True
@@ -429,30 +450,42 @@ Examples:
     elif config.get("parallel", {}).get("enabled") is not None:
         parallel_enabled = config["parallel"]["enabled"]
     
-    # Build SLURM config from args and config file
-    slurm_config = {
-        "partition": args.partition or config.get("slurm", {}).get("partition", "normal"),
-        "cpus": args.cpus or config.get("slurm", {}).get("default_cpus", 4),
-        "memory": args.memory or config.get("slurm", {}).get("default_memory", "16G"),
-        "time": args.time or config.get("slurm", {}).get("default_time", "04:00:00"),
-        "max_parallel_jobs": args.max_parallel or config.get("slurm", {}).get("max_parallel_jobs", 5),
+    # Build SLURM config
+    slurm_job_config = {
+        "cluster": cluster_name,
+        "partition": partition,
+        "cpus": args.cpus or cluster_config.get("default_cpus", 4),
+        "memory": args.memory or cluster_config.get("default_memory", "16G"),
+        "time": args.time or cluster_config.get("default_time", "04:00:00"),
+        "gpus": args.gpus,
+        "gpu_type": args.gpu_type,
+        "nodelist": args.nodelist,
+        "exclude_nodes": args.exclude,
+        "max_parallel_jobs": args.max_parallel or config.get("parallel", {}).get("max_parallel_jobs", 10),
         "poll_interval": config.get("slurm", {}).get("poll_interval", 10),
         "max_poll_attempts": config.get("slurm", {}).get("max_poll_attempts", 720),
     }
     
-    # Load task from prompt file or inline
+    # Validate GPU request
+    if args.gpus and args.gpus > 0:
+        partition_config = cluster_config.get("partitions", {}).get(partition, {})
+        if not partition_config.get("has_gpu"):
+            gpu_partitions = [p for p, c in cluster_config.get("partitions", {}).items() if c.get("has_gpu")]
+            print(f"ERROR: Partition '{partition}' does not have GPUs.")
+            if gpu_partitions:
+                print(f"Available GPU partitions: {', '.join(gpu_partitions)}")
+            sys.exit(1)
+    
+    # Load task
     if args.prompt_file:
         try:
             prompt_data = load_prompt_file(args.prompt_file)
             main_task = prompt_data["task"]
             context = prompt_data.get("context", {})
-            
-            # Add input files and expected outputs to context
             context["input_files"] = prompt_data.get("input_files", [])
             context["expected_outputs"] = prompt_data.get("expected_outputs", [])
             context["prompt_file"] = prompt_data.get("prompt_file", "")
             
-            # Archive the prompt
             archive_path = archive_prompt(prompt_data, project_dir, config)
             print(f"Prompt archived to: {archive_path}")
             
@@ -466,31 +499,45 @@ Examples:
         main_task = args.task
         context = {}
         
-        # Parse additional context if provided
         if args.context:
             try:
                 context = json.loads(args.context)
             except json.JSONDecodeError:
-                print("Warning: Could not parse context JSON, proceeding without context")
+                print("Warning: Could not parse context JSON")
     
-    # Add project directory to context
+    # Add execution context
     context["project_dir"] = str(project_dir)
     context["use_slurm"] = use_slurm
+    context["cluster"] = cluster_name
+    context["partition"] = partition
     context["parallel_enabled"] = parallel_enabled
     
-    # Print startup banner
-    print_banner(main_task, config, project_dir, slurm_status)
+    # Prepare cluster info for banner
+    cluster_info = {
+        "cluster": cluster_name,
+        "partition": partition,
+        "gpus": args.gpus or 0,
+        "gpu_type": args.gpu_type or cluster_config.get("partitions", {}).get(partition, {}).get("gpu_type"),
+        "nodelist": args.nodelist,
+        "idle_count": slurm_status.get("idle_count") if slurm_status else None
+    }
     
-    # Dry run - just validate and show what would happen
+    # Print banner
+    print_banner(main_task, config, project_dir, cluster_info if use_slurm else None)
+    
+    # Dry run
     if args.dry_run:
         print("DRY RUN MODE - No execution will occur\n")
         print("Task:", main_task)
         print("\nContext:", json.dumps(context, indent=2))
         print("\nExecution Mode:", "SLURM" if use_slurm else "Interactive")
-        print("Parallel Execution:", "Enabled" if parallel_enabled else "Disabled")
-        print("\nSLURM Config:", json.dumps(slurm_config, indent=2))
-        print("\nProject structure will be created at:", project_dir)
-        print("\nDirectory tree:")
+        print("Cluster:", cluster_name)
+        print("Partition:", partition)
+        if args.gpus:
+            print("GPUs:", args.gpus, args.gpu_type or "")
+        print("Parallel:", "Enabled" if parallel_enabled else "Disabled")
+        print("\nSLURM Config:", json.dumps(slurm_job_config, indent=2))
+        print("\nProject structure:")
         print(sandbox.get_directory_tree())
         sys.exit(0)
     
@@ -503,7 +550,7 @@ Examples:
             project_dir=project_dir,
             use_slurm=use_slurm,
             parallel_enabled=parallel_enabled,
-            slurm_config=slurm_config
+            slurm_config=slurm_job_config
         )
     except Exception as e:
         print(f"Error initializing workflow: {e}")
@@ -526,14 +573,14 @@ Examples:
         print(f"  Status: {result['status']}")
         print(f"  Completed Subtasks: {len(result.get('completed_subtasks', []))}")
         print(f"  Failed Subtasks: {len(result.get('failed_subtasks', []))}")
+        print(f"  Cluster: {cluster_name}")
         print(f"  Execution Mode: {'SLURM' if use_slurm else 'Interactive'}")
         
         print(f"\n  Final Report:")
         print(f"  {'-'*66}")
         
-        # Print report with wrapping
         report = result.get('final_report', 'No report generated')
-        for line in report.split('\n')[:30]:  # First 30 lines
+        for line in report.split('\n')[:30]:
             print(f"  {line}")
         
         if len(report.split('\n')) > 30:
@@ -548,15 +595,11 @@ Examples:
         print(f"    - Outputs: {project_dir}/data/outputs/")
         print(f"    - Environment YAMLs: {project_dir}/envs/")
         if use_slurm:
+            print(f"    - SLURM Scripts: {project_dir}/slurm/scripts/")
             print(f"    - SLURM Logs: {project_dir}/slurm/logs/")
-        
-        print(f"\n  Git commands:")
-        print(f"    - View history: cd {project_dir} && git log")
-        print(f"    - View failures: cd {project_dir} && git tag -l 'failure-*'")
         
         print(f"\n{'='*70}\n")
         
-        # Return appropriate exit code
         if result['status'] == 'completed':
             sys.exit(0)
         elif result['status'] == 'escalated':
@@ -569,12 +612,9 @@ Examples:
         print(f"  Execution interrupted by user")
         print(f"  State saved - resume with --thread-id")
         
-        # Cancel any running SLURM jobs
         if use_slurm:
             print(f"  Cancelling SLURM jobs...")
             try:
-                from tools.slurm_tools import SlurmTools
-                slurm_tools = SlurmTools(sandbox)
                 slurm_tools.cancel_all_jobs()
             except:
                 pass
