@@ -12,7 +12,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
 from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.sqlite import SqliteSaver
+try:
+    from langgraph.checkpoint.memory import MemorySaver
+except ImportError:
+    # Fallback for older langgraph versions
+    try:
+        from langgraph.checkpoint.sqlite import SqliteSaver as MemorySaver
+    except ImportError:
+        MemorySaver = None
 
 from agents.master_agent import MasterAgent
 from agents.sub_agent import SubAgent
@@ -132,10 +139,14 @@ class MultiAgentWorkflow:
         # Build the workflow graph
         self.workflow = self._build_workflow()
         
-        # Add persistence
-        db_path = self.project_dir / "workflow_state.db"
-        self.memory = SqliteSaver.from_conn_string(str(db_path))
-        self.app = self.workflow.compile(checkpointer=self.memory)
+        # Add persistence (if available)
+        if MemorySaver is not None:
+            self.memory = MemorySaver()
+            self.app = self.workflow.compile(checkpointer=self.memory)
+        else:
+            # No checkpointing available
+            self.memory = None
+            self.app = self.workflow.compile()
     
     def _build_workflow(self) -> StateGraph:
         """Construct the LangGraph workflow"""
