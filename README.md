@@ -165,8 +165,8 @@ This system provides a **self-directed automation framework** that:
 ### Step 1: Clone the Repository
 
 ```bash
-git clone https://github.com/yourusername/multi-agent-system.git
-cd multi-agent-system
+git clone https://github.com/JakeLehle/AGI.git
+cd AGI
 ```
 
 ### Step 2: Create Conda Environment
