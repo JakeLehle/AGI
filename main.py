@@ -10,6 +10,10 @@ Run with:
     python main.py --prompt-file prompts/gpu_task.txt --project-dir /path/to/project \\
         --slurm --cluster gpu_cluster --partition gpu1v100 --gpus 2
 
+    # Override model and max iterations
+    python main.py --prompt-file prompts/task.txt --project-dir ./project \\
+        --model llama3.1:8b --max-iterations 6
+
     # Check available clusters and partitions
     python main.py --list-clusters --project-dir ./test
     python main.py --cluster-status --cluster gpu_cluster --project-dir ./test
@@ -250,14 +254,15 @@ def check_cluster_status(sandbox: Sandbox, config: dict, cluster_name: str = Non
     }
 
 
-def print_banner(task: str, config: dict, project_dir: Path, cluster_info: dict = None):
+def print_banner(task: str, config: dict, project_dir: Path, cluster_info: dict = None, 
+                 model: str = None, max_iterations: int = None):
     """Print startup banner"""
     print(f"\n{'='*70}")
     print(f"  Multi-Agent System - Task Executor")
     print(f"{'='*70}")
     print(f"  Project Directory: {project_dir}")
-    print(f"  Model: {config['ollama']['model']}")
-    print(f"  Max Iterations: {config['agents']['max_retries']}")
+    print(f"  Model: {model or config['ollama']['model']}")
+    print(f"  Max Iterations: {max_iterations or config['agents']['max_retries']}")
     
     if cluster_info:
         cluster_name = cluster_info.get('cluster', 'N/A')
@@ -312,6 +317,10 @@ Examples:
   python main.py --task "Train large model" --project-dir ./training \\
       --slurm --cluster gpu_cluster --partition gpu1a100 --gpus 4 --memory 256G
 
+  # Override model and max iterations from command line
+  python main.py --prompt-file prompts/task.txt --project-dir ./project \\
+      --model llama3.1:8b --max-iterations 6
+
   # Run on specific node
   python main.py --task "Debug job" --project-dir ./debug \\
       --slurm --cluster gpu_cluster --partition gpu1v100 --nodelist gpu004
@@ -336,6 +345,24 @@ Examples:
     
     # Project directory (required for most operations)
     parser.add_argument("--project-dir", type=str, required=True, help="Project directory for all files")
+    
+    # Model and execution options (NEW)
+    model_group = parser.add_argument_group('Model Options')
+    model_group.add_argument(
+        "--model", "-m",
+        type=str,
+        help="Ollama model to use (overrides config). E.g., 'llama3.1:70b', 'llama3.1:8b'"
+    )
+    model_group.add_argument(
+        "--max-iterations", "--max-retries",
+        type=int,
+        help="Maximum iterations per subtask (overrides config, max 12)"
+    )
+    model_group.add_argument(
+        "--ollama-url",
+        type=str,
+        help="Ollama server URL (default: http://127.0.0.1:11434)"
+    )
     
     # Cluster selection
     cluster_group = parser.add_argument_group('Cluster Options')
@@ -390,6 +417,17 @@ Examples:
     
     # Load configuration
     config = load_config(args.config)
+    
+    # Apply command-line overrides to config
+    if args.model:
+        config['ollama']['model'] = args.model
+    
+    if args.max_iterations:
+        # Enforce the hard limit of 12
+        config['agents']['max_retries'] = min(args.max_iterations, 12)
+    
+    if args.ollama_url:
+        config['ollama']['base_url'] = args.ollama_url
     
     # Validate and setup project directory
     project_dir = validate_project_dir(args.project_dir)
@@ -523,7 +561,12 @@ Examples:
     }
     
     # Print banner
-    print_banner(main_task, config, project_dir, cluster_info if use_slurm else None)
+    print_banner(
+        main_task, config, project_dir, 
+        cluster_info if use_slurm else None,
+        model=args.model,
+        max_iterations=args.max_iterations
+    )
     
     # Dry run
     if args.dry_run:
@@ -531,6 +574,8 @@ Examples:
         print("Task:", main_task)
         print("\nContext:", json.dumps(context, indent=2))
         print("\nExecution Mode:", "SLURM" if use_slurm else "Interactive")
+        print("Model:", config['ollama']['model'])
+        print("Max Iterations:", config['agents']['max_retries'])
         print("Cluster:", cluster_name)
         print("Partition:", partition)
         if args.gpus:
@@ -573,8 +618,17 @@ Examples:
         print(f"  Status: {result['status']}")
         print(f"  Completed Subtasks: {len(result.get('completed_subtasks', []))}")
         print(f"  Failed Subtasks: {len(result.get('failed_subtasks', []))}")
+        print(f"  Model Used: {config['ollama']['model']}")
+        print(f"  Max Iterations: {config['agents']['max_retries']}")
         print(f"  Cluster: {cluster_name}")
         print(f"  Execution Mode: {'SLURM' if use_slurm else 'Interactive'}")
+        
+        # Print attempt statistics if available
+        if result.get('subtask_attempts'):
+            print(f"\n  Attempt Statistics:")
+            for task_id, attempts in result.get('subtask_attempts', {}).items():
+                status_icon = "✓" if attempts < config['agents']['max_retries'] else "✗"
+                print(f"    {status_icon} {task_id}: {attempts}/{config['agents']['max_retries']} attempts")
         
         print(f"\n  Final Report:")
         print(f"  {'-'*66}")
@@ -604,6 +658,8 @@ Examples:
             sys.exit(0)
         elif result['status'] == 'escalated':
             sys.exit(2)
+        elif result['status'] == 'emergency_stopped':
+            sys.exit(3)
         else:
             sys.exit(1)
         
