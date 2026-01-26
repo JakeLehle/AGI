@@ -1,6 +1,7 @@
 """
 Sub-agent that executes tasks with built-in reflection capability.
 Supports both interactive execution and SLURM job submission.
+Includes file exploration and reasoning about missing resources.
 """
 
 from typing import Dict, Any, List, Optional
@@ -8,8 +9,14 @@ from pathlib import Path
 from datetime import datetime
 import json
 import time
+import re
 
-from langchain_community.llms import Ollama
+# Use updated import to avoid deprecation warning
+try:
+    from langchain_ollama import OllamaLLM
+except ImportError:
+    from langchain_community.llms import Ollama as OllamaLLM
+
 from utils.logging_config import agent_logger
 from tools.sandbox import Sandbox
 from tools.execution_tools import ExecutionTools
@@ -23,6 +30,7 @@ class SubAgent:
     Executes subtasks with reflection, retry logic, and real code execution.
     Supports SLURM job submission for cluster-based execution.
     Limited to max_iterations attempts before generating final report.
+    Includes file exploration capability to find missing resources.
     """
     
     def __init__(
@@ -59,8 +67,8 @@ class SubAgent:
         self.use_slurm = use_slurm and slurm_tools is not None
         self.slurm_config = slurm_config or {}
         
-        # Initialize LLM
-        self.llm = Ollama(
+        # Initialize LLM with new import
+        self.llm = OllamaLLM(
             model=ollama_model,
             base_url=ollama_base_url
         )
@@ -77,11 +85,13 @@ class SubAgent:
         self.tools_used = []
         self.errors_encountered = []
         self.slurm_jobs = []  # Track submitted SLURM jobs
+        self.file_search_cache = {}  # Cache file search results
     
     def execute(
         self,
         subtask: Dict[str, Any],
-        env_name: str = None
+        env_name: str = None,
+        prior_attempts: int = 0  # Track attempts across workflow invocations
     ) -> Dict[str, Any]:
         """
         Execute a subtask with iteration limit.
@@ -89,6 +99,7 @@ class SubAgent:
         Args:
             subtask: Dictionary with 'id', 'description', 'context', 'success_criteria'
             env_name: Conda environment to use
+            prior_attempts: Number of attempts from previous workflow invocations
             
         Returns:
             Result dictionary with success status, report, and execution details
@@ -99,11 +110,14 @@ class SubAgent:
         success_criteria = subtask.get('success_criteria', '')
         expected_outputs = context.get('expected_outputs', [])
         
+        # Calculate effective max iterations accounting for prior attempts
+        effective_max = max(1, self.max_iterations - prior_attempts)
+        
         agent_logger.log_task_start(
             agent_name=self.agent_id,
             task_id=task_id,
-            description=description,
-            attempt=1
+            description=f"{description} (prior_attempts={prior_attempts}, max={effective_max})",
+            attempt=prior_attempts + 1
         )
         
         # Reset tracking for this task
@@ -115,26 +129,69 @@ class SubAgent:
         self.errors_encountered = []
         self.slurm_jobs = []
         
+        # If we've already exceeded max attempts across invocations, fail immediately
+        if prior_attempts >= self.max_iterations:
+            agent_logger.log_task_failure(
+                agent_name=self.agent_id,
+                task_id=task_id,
+                error=f"Maximum total attempts ({self.max_iterations}) already exceeded",
+                context={"prior_attempts": prior_attempts}
+            )
+            return self._generate_max_attempts_result(subtask, prior_attempts)
+        
+        # FIRST: Explore project structure and identify required files
+        file_exploration = self._explore_and_identify_files(description, context)
+        if file_exploration.get('missing_critical'):
+            # Try to resolve missing files before starting main execution
+            resolution = self._resolve_missing_files(file_exploration['missing_files'], context)
+            if not resolution['resolved'] and resolution.get('blocking'):
+                # Can't proceed without these files
+                self.errors_encountered.append({
+                    "type": "missing_files",
+                    "files": file_exploration['missing_files'],
+                    "resolution_attempted": resolution
+                })
+                return {
+                    "success": False,
+                    "task_id": task_id,
+                    "iterations": 0,
+                    "max_iterations": self.max_iterations,
+                    "total_attempts": prior_attempts,
+                    "result": None,
+                    "report": self._generate_final_report(subtask, False, None),
+                    "files_created": [],
+                    "files_modified": [],
+                    "tools_used": ["file_exploration"],
+                    "errors": self.errors_encountered,
+                    "execution_history": [],
+                    "slurm_jobs": [],
+                    "execution_mode": "blocked_by_missing_files",
+                    "should_reformulate": True,
+                    "missing_files_info": file_exploration
+                }
+        
         # Main execution loop
         success = False
         final_result = None
         
-        while self.iteration_count < self.max_iterations and not success:
+        while self.iteration_count < effective_max and not success:
             self.iteration_count += 1
+            total_attempts = prior_attempts + self.iteration_count
             
             agent_logger.log_task_start(
                 agent_name=self.agent_id,
                 task_id=task_id,
-                description=f"Iteration {self.iteration_count}/{self.max_iterations}",
-                attempt=self.iteration_count
+                description=f"Iteration {self.iteration_count}/{effective_max} (total: {total_attempts}/{self.max_iterations})",
+                attempt=total_attempts
             )
             
-            # Get execution plan from LLM
+            # Get execution plan from LLM (include file exploration results)
             plan = self._get_execution_plan(
                 description,
                 context,
                 success_criteria,
-                self.execution_history
+                self.execution_history,
+                file_exploration
             )
             
             # Execute the plan (using SLURM or interactive)
@@ -146,6 +203,7 @@ class SubAgent:
             # Record this iteration
             self.execution_history.append({
                 "iteration": self.iteration_count,
+                "total_attempt": total_attempts,
                 "plan": plan,
                 "result": iteration_result,
                 "execution_mode": "slurm" if self.use_slurm else "interactive",
@@ -163,7 +221,7 @@ class SubAgent:
                 success = self._reflect_on_result(
                     subtask,
                     iteration_result,
-                    self.iteration_count
+                    total_attempts
                 )
                 if success:
                     final_result = iteration_result
@@ -174,6 +232,8 @@ class SubAgent:
             success,
             final_result
         )
+        
+        total_attempts_used = prior_attempts + self.iteration_count
         
         if success:
             agent_logger.log_task_success(
@@ -186,7 +246,7 @@ class SubAgent:
             agent_logger.log_task_failure(
                 agent_name=self.agent_id,
                 task_id=task_id,
-                error=f"Failed after {self.iteration_count} iterations",
+                error=f"Failed after {self.iteration_count} iterations (total: {total_attempts_used})",
                 context={"errors": self.errors_encountered}
             )
         
@@ -195,6 +255,7 @@ class SubAgent:
             "task_id": task_id,
             "iterations": self.iteration_count,
             "max_iterations": self.max_iterations,
+            "total_attempts": total_attempts_used,
             "result": final_result,
             "report": final_report,
             "files_created": self.files_created,
@@ -203,15 +264,237 @@ class SubAgent:
             "errors": self.errors_encountered,
             "execution_history": self.execution_history,
             "slurm_jobs": self.slurm_jobs,
-            "execution_mode": "slurm" if self.use_slurm else "interactive"
+            "execution_mode": "slurm" if self.use_slurm else "interactive",
+            "file_exploration": file_exploration
         }
+    
+    def _generate_max_attempts_result(self, subtask: Dict, prior_attempts: int) -> Dict[str, Any]:
+        """Generate result when max attempts already exceeded"""
+        return {
+            "success": False,
+            "task_id": subtask['id'],
+            "iterations": 0,
+            "max_iterations": self.max_iterations,
+            "total_attempts": prior_attempts,
+            "result": None,
+            "report": {
+                "task_id": subtask["id"],
+                "task_description": subtask["description"],
+                "success": False,
+                "summary": f"Task abandoned: exceeded maximum {self.max_iterations} total attempts across workflow invocations",
+                "recommendation": "SKIP or ESCALATE - do not retry"
+            },
+            "files_created": [],
+            "files_modified": [],
+            "tools_used": [],
+            "errors": [{"error": "max_attempts_exceeded", "total": prior_attempts}],
+            "execution_history": [],
+            "slurm_jobs": [],
+            "execution_mode": "skipped",
+            "should_skip": True  # Signal to workflow to skip, not reformulate
+        }
+    
+    def _explore_and_identify_files(self, description: str, context: Dict) -> Dict[str, Any]:
+        """
+        Explore project structure and identify files needed for the task.
+        This runs BEFORE the main execution loop to catch missing file issues early.
+        """
+        self.tools_used.append("file_exploration")
+        
+        # Get current directory structure
+        file_tree = self.sandbox.get_directory_tree(max_depth=3)
+        
+        # Get list of all files
+        all_files = self._get_all_files()
+        
+        prompt = f"""Analyze this task and identify what files are needed:
+
+Task: {description}
+
+Context: {json.dumps(context, indent=2)}
+
+Current project structure:
+```
+{file_tree}
+```
+
+Available files: {json.dumps(all_files[:50], indent=2)}  # First 50 files
+
+Questions to answer:
+1. What input files does this task need?
+2. Are those files present in the project structure?
+3. If files are mentioned but not found, where might they be?
+4. Can this task proceed without any missing files?
+
+Respond in JSON:
+{{
+    "required_files": [
+        {{"name": "filename", "purpose": "why needed", "found": true/false, "path": "path if found"}}
+    ],
+    "missing_files": ["list of files not found"],
+    "missing_critical": true/false,
+    "suggestions": ["where to look or how to proceed"],
+    "can_proceed": true/false,
+    "alternative_approach": "if files missing, what else can we do"
+}}
+"""
+        
+        try:
+            response = self.llm.invoke(prompt)
+            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            if json_match:
+                result = json.loads(json_match.group())
+                result['file_tree'] = file_tree
+                result['all_files'] = all_files[:50]
+                return result
+        except Exception as e:
+            agent_logger.log_reflection(
+                agent_name=self.agent_id,
+                task_id="file_exploration",
+                reflection=f"File exploration failed: {e}"
+            )
+        
+        return {
+            "required_files": [],
+            "missing_files": [],
+            "missing_critical": False,
+            "can_proceed": True,
+            "file_tree": file_tree,
+            "all_files": all_files[:50]
+        }
+    
+    def _get_all_files(self) -> List[str]:
+        """Get list of all files in project directory"""
+        all_files = []
+        try:
+            for path in self.sandbox.project_dir.rglob("*"):
+                if path.is_file():
+                    # Skip hidden files and common non-essential directories
+                    rel_path = path.relative_to(self.sandbox.project_dir)
+                    parts = rel_path.parts
+                    if any(p.startswith('.') for p in parts):
+                        continue
+                    if any(p in ['__pycache__', 'node_modules', '.git', 'logs'] for p in parts):
+                        continue
+                    all_files.append(str(rel_path))
+        except Exception as e:
+            pass
+        return sorted(all_files)
+    
+    def _resolve_missing_files(self, missing_files: List[str], context: Dict) -> Dict[str, Any]:
+        """
+        Try to resolve missing files by searching or suggesting alternatives.
+        """
+        self.tools_used.append("file_resolution")
+        
+        resolved = []
+        still_missing = []
+        
+        for filename in missing_files:
+            # Search for file by name (case-insensitive)
+            found_path = self._search_for_file(filename)
+            if found_path:
+                resolved.append({"name": filename, "found_at": found_path})
+            else:
+                still_missing.append(filename)
+        
+        # If we found some files, update context
+        if resolved:
+            agent_logger.log_reflection(
+                agent_name=self.agent_id,
+                task_id="file_resolution",
+                reflection=f"Found {len(resolved)} of {len(missing_files)} missing files: {resolved}"
+            )
+        
+        # Ask LLM what to do about still-missing files
+        if still_missing:
+            file_tree = self.sandbox.get_directory_tree(max_depth=2)
+            
+            prompt = f"""These files are needed but not found anywhere in the project:
+
+Missing files: {still_missing}
+
+Project structure:
+```
+{file_tree}
+```
+
+Context about the task: {json.dumps(context, indent=2)}
+
+Are these files:
+1. Files that should have been created by a previous step?
+2. Files that need to be downloaded/fetched?
+3. Files with wrong names (typos)?
+4. Not actually required (can proceed without)?
+
+Respond in JSON:
+{{
+    "resolved": true/false,
+    "blocking": true/false,
+    "reason": "explanation",
+    "action": "what to do",
+    "alternative_files": ["files that could substitute"],
+    "recommendation": "PROCEED/WAIT/FAIL"
+}}
+"""
+            
+            try:
+                response = self.llm.invoke(prompt)
+                json_match = re.search(r'\{.*\}', response, re.DOTALL)
+                if json_match:
+                    result = json.loads(json_match.group())
+                    result['resolved_files'] = resolved
+                    result['still_missing'] = still_missing
+                    return result
+            except:
+                pass
+        
+        return {
+            "resolved": len(still_missing) == 0,
+            "blocking": len(still_missing) > 0,
+            "resolved_files": resolved,
+            "still_missing": still_missing
+        }
+    
+    def _search_for_file(self, filename: str) -> Optional[str]:
+        """Search for a file in the project directory"""
+        
+        # Check cache first
+        if filename in self.file_search_cache:
+            return self.file_search_cache[filename]
+        
+        # Extract just the filename without path
+        base_name = Path(filename).name
+        
+        # Search strategies
+        search_patterns = [
+            filename,  # Exact match
+            f"*/{filename}",  # One level deep
+            f"**/{filename}",  # Any depth
+            f"**/{base_name}",  # Just filename at any depth
+            f"**/*{base_name}*",  # Partial match
+        ]
+        
+        for pattern in search_patterns:
+            try:
+                matches = list(self.sandbox.project_dir.glob(pattern))
+                if matches:
+                    result = str(matches[0].relative_to(self.sandbox.project_dir))
+                    self.file_search_cache[filename] = result
+                    return result
+            except Exception:
+                continue
+        
+        self.file_search_cache[filename] = None
+        return None
     
     def _get_execution_plan(
         self,
         description: str,
         context: Dict,
         success_criteria: str,
-        history: List[Dict]
+        history: List[Dict],
+        file_exploration: Dict = None
     ) -> Dict[str, Any]:
         """Get execution plan from LLM"""
         
@@ -220,14 +503,27 @@ class SubAgent:
         if history:
             history_summary = "\n\nPrevious attempts:\n"
             for h in history[-3:]:  # Last 3 attempts
-                history_summary += f"- Iteration {h['iteration']}: "
+                history_summary += f"- Iteration {h['iteration']} (total: {h.get('total_attempt', h['iteration'])}): "
                 if h['result'].get('success'):
                     history_summary += "Partially successful\n"
                 else:
-                    history_summary += f"Failed - {h['result'].get('error', 'Unknown error')}\n"
+                    errors = h['result'].get('error', h['result'].get('step_results', []))
+                    history_summary += f"Failed - {str(errors)[:200]}\n"
         
         # Current file structure
         file_tree = self.sandbox.get_directory_tree(max_depth=2)
+        
+        # File exploration context
+        file_context = ""
+        if file_exploration:
+            if file_exploration.get('required_files'):
+                file_context = "\n\nFile status:\n"
+                for f in file_exploration.get('required_files', []):
+                    status = "✓ Found" if f.get('found') else "✗ Missing"
+                    file_context += f"- {f.get('name')}: {status}"
+                    if f.get('path'):
+                        file_context += f" at {f['path']}"
+                    file_context += "\n"
         
         # Execution mode context
         execution_mode = "SLURM cluster (jobs submitted via sbatch)" if self.use_slurm else "Interactive (direct execution)"
@@ -244,6 +540,7 @@ Current project structure:
 ```
 
 Context: {json.dumps(context, indent=2)}
+{file_context}
 {history_summary}
 
 Available capabilities:
@@ -254,14 +551,17 @@ Available capabilities:
 5. Search the web for information
 6. Read and write files
 7. Install packages via conda (no sudo)
+8. List and search for files in the project
 
 {"NOTE: Scripts will be submitted to SLURM. For long-running tasks, this is more efficient." if self.use_slurm else ""}
+
+IMPORTANT: If previous attempts failed, try a DIFFERENT approach. Don't repeat the same steps.
 
 Create a specific execution plan. Respond in JSON format:
 {{
     "steps": [
         {{
-            "action": "write_script|execute_script|execute_command|search_web|read_file|write_file|install_package",
+            "action": "write_script|execute_script|execute_command|search_web|read_file|write_file|install_package|list_files",
             "language": "python|r|bash|perl" (for scripts),
             "filename": "script name" (for write_script),
             "code": "code content" (for write_script),
@@ -269,6 +569,7 @@ Create a specific execution plan. Respond in JSON format:
             "query": "search query" (for search_web),
             "filepath": "path" (for read/write file),
             "content": "content" (for write_file),
+            "directory": "path" (for list_files),
             "packages": ["pkg1", "pkg2"] (for install_package),
             "cpus": 4 (optional, for SLURM),
             "memory": "16G" (optional, for SLURM),
@@ -277,7 +578,7 @@ Create a specific execution plan. Respond in JSON format:
         }}
     ],
     "expected_outcomes": ["what files/outputs this should produce"],
-    "parallel_steps": [0, 1] (optional - indices of steps that can run in parallel)
+    "different_from_previous": "how this plan differs from failed attempts"
 }}
 
 Keep the plan focused and achievable. Prioritize getting working code over perfect code.
@@ -287,7 +588,6 @@ Keep the plan focused and achievable. Prioritize getting working code over perfe
         
         # Parse JSON response
         try:
-            import re
             json_match = re.search(r'\{.*\}', response, re.DOTALL)
             if json_match:
                 return json.loads(json_match.group())
@@ -297,6 +597,11 @@ Keep the plan focused and achievable. Prioritize getting working code over perfe
         # Fallback plan
         return {
             "steps": [
+                {
+                    "action": "list_files",
+                    "directory": ".",
+                    "reason": "Explore project structure to understand what's available"
+                },
                 {
                     "action": "execute_command",
                     "command": "echo 'Could not parse plan, listing files' && ls -la",
@@ -368,6 +673,20 @@ Keep the plan focused and achievable. Prioritize getting working code over perfe
                     step_result = {"success": True, "filepath": str(filepath)}
                     self.files_created.append(str(filepath))
                 
+                elif action == "list_files":
+                    self.tools_used.append("list_files")
+                    directory = step.get("directory", ".")
+                    try:
+                        dir_path = self.sandbox.safe_path(directory)
+                        files = list(dir_path.rglob("*"))[:100]  # Limit results
+                        step_result = {
+                            "success": True,
+                            "files": [str(f.relative_to(self.sandbox.project_dir)) for f in files if f.is_file()],
+                            "count": len(files)
+                        }
+                    except Exception as e:
+                        step_result = {"success": False, "error": str(e)}
+                
                 elif action == "install_package":
                     self.tools_used.append("conda_install")
                     packages = step.get("packages", [])
@@ -420,7 +739,7 @@ Keep the plan focused and achievable. Prioritize getting working code over perfe
             
             try:
                 # Actions that don't need SLURM
-                if action in ["search_web", "read_file", "write_file", "install_package"]:
+                if action in ["search_web", "read_file", "write_file", "install_package", "list_files"]:
                     # Execute these interactively
                     if action == "search_web":
                         self.tools_used.append("web_search")
@@ -440,6 +759,19 @@ Keep the plan focused and achievable. Prioritize getting working code over perfe
                         filepath.write_text(step.get("content", ""))
                         step_result = {"success": True, "filepath": str(filepath)}
                         self.files_created.append(str(filepath))
+                    elif action == "list_files":
+                        self.tools_used.append("list_files")
+                        directory = step.get("directory", ".")
+                        try:
+                            dir_path = self.sandbox.safe_path(directory)
+                            files = list(dir_path.rglob("*"))[:100]
+                            step_result = {
+                                "success": True,
+                                "files": [str(f.relative_to(self.sandbox.project_dir)) for f in files if f.is_file()],
+                                "count": len(files)
+                            }
+                        except Exception as e:
+                            step_result = {"success": False, "error": str(e)}
                     elif action == "install_package":
                         self.tools_used.append("conda_install")
                         packages = step.get("packages", [])
@@ -589,7 +921,7 @@ Keep the plan focused and achievable. Prioritize getting working code over perfe
         self,
         subtask: Dict,
         result: Dict,
-        iteration: int
+        total_attempts: int
     ) -> bool:
         """Have LLM reflect on whether the task is complete"""
         
@@ -612,7 +944,7 @@ Keep the plan focused and achievable. Prioritize getting working code over perfe
 Task: {subtask['description']}
 Success Criteria: {subtask.get('success_criteria', 'Task completed as described')}
 
-Iteration {iteration} result:
+Attempt {total_attempts} of {self.max_iterations} maximum result:
 {json.dumps(result, indent=2, default=str)[:2000]}
 {job_outputs}
 
@@ -621,18 +953,20 @@ Current project files:
 {file_tree}
 ```
 
-Is the task COMPLETE? Answer with JSON:
+Is the task COMPLETE? Be strict - only say complete if the success criteria are actually met.
+
+Answer with JSON:
 {{
     "complete": true/false,
     "reasoning": "brief explanation",
-    "missing": ["what's still needed if not complete"]
+    "missing": ["what's still needed if not complete"],
+    "confidence": 0.0-1.0
 }}
 """
         
         response = self.llm.invoke(prompt)
         
         try:
-            import re
             json_match = re.search(r'\{.*\}', response, re.DOTALL)
             if json_match:
                 reflection = json.loads(json_match.group())
@@ -658,6 +992,7 @@ Is the task COMPLETE? Answer with JSON:
         for h in self.execution_history:
             history_summary.append({
                 "iteration": h["iteration"],
+                "total_attempt": h.get("total_attempt", h["iteration"]),
                 "success": h["result"].get("success", False),
                 "steps_executed": h["result"].get("steps_executed", 0),
                 "mode": h.get("execution_mode", "interactive")
@@ -683,16 +1018,18 @@ Files created: {self.files_created}
 Tools used: {list(set(self.tools_used))}
 Errors encountered: {len(self.errors_encountered)}
 
+Error details (if any): {json.dumps(self.errors_encountered[:3], default=str)[:500]}
+
 Final project structure:
 ```
 {file_tree}
 ```
 
 Write a concise summary (3-5 sentences) of:
-1. What was accomplished
+1. What was accomplished (or what failed)
 2. Key files created
-3. Any issues encountered
-4. Recommendations for next steps
+3. Any issues encountered and their likely causes
+4. Recommendations for next steps (especially if failed)
 """
         
         summary = self.llm.invoke(prompt)

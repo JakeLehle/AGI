@@ -1,6 +1,7 @@
 """
 LangGraph workflow that orchestrates the multi-agent system.
 Supports parallel subtask execution via SLURM and state management.
+Enforces strict attempt limits across workflow invocations.
 """
 
 from typing import TypedDict, Annotated, List, Dict, Any, Optional
@@ -31,6 +32,11 @@ from utils.git_tracker import git_tracker
 from utils.documentation import doc_generator
 
 
+# GLOBAL LIMITS - These are enforced at the workflow level
+MAX_ATTEMPTS_PER_SUBTASK = 12  # Hard limit across all invocations
+MAX_WORKFLOW_ITERATIONS = 100  # Safety limit to prevent runaway workflows
+
+
 # Define the state that flows through the workflow
 class WorkflowState(TypedDict):
     # Input
@@ -46,6 +52,10 @@ class WorkflowState(TypedDict):
     # Parallel execution tracking
     parallel_batch: List[Dict[str, Any]]
     parallel_results: List[Dict[str, Any]]
+    
+    # ATTEMPT TRACKING - Key addition to enforce limits
+    subtask_attempts: Dict[str, int]  # {subtask_id: total_attempts}
+    workflow_iterations: int  # Total workflow loop iterations
     
     # Environment
     env_name: str
@@ -71,6 +81,7 @@ class MultiAgentWorkflow:
     """
     LangGraph workflow for multi-agent task execution.
     Supports both sequential and parallel execution via SLURM.
+    Enforces strict attempt limits to prevent infinite loops.
     """
     
     def __init__(
@@ -89,7 +100,7 @@ class MultiAgentWorkflow:
         Args:
             ollama_model: Ollama model to use
             ollama_base_url: Ollama server URL
-            max_retries: Maximum iterations per subtask
+            max_retries: Maximum iterations per subtask (capped at 12)
             project_dir: Project directory for all files
             use_slurm: Whether to use SLURM for job submission
             parallel_enabled: Whether to run independent subtasks in parallel
@@ -97,7 +108,8 @@ class MultiAgentWorkflow:
         """
         self.ollama_model = ollama_model
         self.ollama_base_url = ollama_base_url
-        self.max_retries = max_retries
+        # Enforce the hard limit
+        self.max_retries = min(max_retries, MAX_ATTEMPTS_PER_SUBTASK)
         self.project_dir = Path(project_dir) if project_dir else Path.cwd()
         self.use_slurm = use_slurm
         self.parallel_enabled = parallel_enabled
@@ -156,6 +168,7 @@ class MultiAgentWorkflow:
         # Add nodes
         workflow.add_node("setup_environment", self.setup_environment)
         workflow.add_node("decompose", self.master_decompose)
+        workflow.add_node("check_limits", self.check_workflow_limits)
         workflow.add_node("identify_parallel", self.identify_parallel_tasks)
         workflow.add_node("execute_parallel", self.execute_parallel_batch)
         workflow.add_node("execute_sequential", self.execute_sequential)
@@ -163,6 +176,7 @@ class MultiAgentWorkflow:
         workflow.add_node("master_review", self.master_review)
         workflow.add_node("generate_report", self.generate_final_report)
         workflow.add_node("cleanup", self.cleanup)
+        workflow.add_node("emergency_stop", self.emergency_stop)
         
         # Define flow
         workflow.set_entry_point("setup_environment")
@@ -170,8 +184,18 @@ class MultiAgentWorkflow:
         # Setup -> Decompose
         workflow.add_edge("setup_environment", "decompose")
         
-        # Decompose -> Identify parallel tasks
-        workflow.add_edge("decompose", "identify_parallel")
+        # Decompose -> Check limits
+        workflow.add_edge("decompose", "check_limits")
+        
+        # Check limits routes to continue or emergency stop
+        workflow.add_conditional_edges(
+            "check_limits",
+            self.route_after_limit_check,
+            {
+                "continue": "identify_parallel",
+                "stop": "emergency_stop"
+            }
+        )
         
         # After identifying parallel tasks, route based on parallelism
         workflow.add_conditional_edges(
@@ -195,7 +219,7 @@ class MultiAgentWorkflow:
             "handle_results",
             self.route_after_execution,
             {
-                "next_batch": "identify_parallel",
+                "next_batch": "check_limits",  # Check limits before continuing
                 "review": "master_review",
                 "complete": "generate_report"
             }
@@ -206,8 +230,8 @@ class MultiAgentWorkflow:
             "master_review",
             self.route_after_review,
             {
-                "retry": "identify_parallel",
-                "skip": "identify_parallel",
+                "retry": "check_limits",  # Check limits before retrying
+                "skip": "check_limits",
                 "escalate": "generate_report"
             }
         )
@@ -217,6 +241,9 @@ class MultiAgentWorkflow:
         
         # Cleanup is the end
         workflow.add_edge("cleanup", END)
+        
+        # Emergency stop also ends
+        workflow.add_edge("emergency_stop", END)
         
         return workflow
     
@@ -253,7 +280,9 @@ class MultiAgentWorkflow:
             "env_name": env_name,
             "project_dir": str(self.project_dir),
             "use_slurm": self.use_slurm,
-            "parallel_enabled": self.parallel_enabled
+            "parallel_enabled": self.parallel_enabled,
+            "subtask_attempts": {},  # Initialize attempt tracking
+            "workflow_iterations": 0
         }
     
     def master_decompose(self, state: WorkflowState) -> Dict:
@@ -264,19 +293,39 @@ class MultiAgentWorkflow:
             context=state.get('context', {})
         )
         
+        # Initialize attempt tracking for each subtask
+        subtask_attempts = {st['id']: 0 for st in subtasks}
+        
         return {
             "subtasks": subtasks,
             "current_subtask_idx": 0,
             "current_subtask": None,
             "parallel_batch": [],
             "parallel_results": [],
-            "max_retries": self.max_retries
+            "max_retries": self.max_retries,
+            "subtask_attempts": subtask_attempts
+        }
+    
+    def check_workflow_limits(self, state: WorkflowState) -> Dict:
+        """Check if workflow has exceeded safety limits"""
+        
+        workflow_iterations = state.get('workflow_iterations', 0) + 1
+        
+        agent_logger.log_reflection(
+            agent_name="workflow_monitor",
+            task_id="limit_check",
+            reflection=f"Workflow iteration {workflow_iterations}/{MAX_WORKFLOW_ITERATIONS}"
+        )
+        
+        return {
+            "workflow_iterations": workflow_iterations
         }
     
     def identify_parallel_tasks(self, state: WorkflowState) -> Dict:
         """Identify tasks that can be run in parallel"""
         
         subtasks = state['subtasks']
+        subtask_attempts = state.get('subtask_attempts', {})
         pending = [st for st in subtasks if st['status'] == 'pending']
         
         if not pending:
@@ -285,14 +334,29 @@ class MultiAgentWorkflow:
                 "status": "all_tasks_processed"
             }
         
-        # Find tasks with satisfied dependencies
+        # Find tasks with satisfied dependencies AND within attempt limits
         ready_tasks = []
         for st in pending:
+            task_id = st['id']
+            
+            # Check attempt limit FIRST
+            attempts = subtask_attempts.get(task_id, 0)
+            if attempts >= self.max_retries:
+                # Mark as failed due to max attempts
+                st['status'] = 'max_attempts_exceeded'
+                agent_logger.log_task_failure(
+                    agent_name="workflow",
+                    task_id=task_id,
+                    error=f"Skipping {task_id}: exceeded max attempts ({attempts}/{self.max_retries})",
+                    context={"attempts": attempts}
+                )
+                continue
+            
+            # Check dependencies
             deps_satisfied = True
             for dep_id in st.get('dependencies', []):
-                # Find the dependency task
                 dep_task = next((t for t in subtasks if t['id'] == dep_id), None)
-                if dep_task and dep_task['status'] not in ['completed', 'skipped']:
+                if dep_task and dep_task['status'] not in ['completed', 'skipped', 'max_attempts_exceeded']:
                     deps_satisfied = False
                     break
             
@@ -300,7 +364,13 @@ class MultiAgentWorkflow:
                 ready_tasks.append(st)
         
         if not ready_tasks:
-            # No tasks ready - might be blocked
+            # Check if we're blocked or actually done
+            still_pending = [st for st in subtasks if st['status'] == 'pending']
+            if not still_pending:
+                return {
+                    "parallel_batch": [],
+                    "status": "all_tasks_processed"
+                }
             return {
                 "parallel_batch": [],
                 "status": "blocked"
@@ -308,7 +378,6 @@ class MultiAgentWorkflow:
         
         # If parallel is enabled and we have multiple ready tasks, batch them
         if self.parallel_enabled and len(ready_tasks) > 1:
-            # Limit batch size based on available resources
             max_batch = self.slurm_config.get("max_parallel_jobs", 5)
             batch = ready_tasks[:max_batch]
             
@@ -320,12 +389,13 @@ class MultiAgentWorkflow:
             )
             
             return {
+                "subtasks": subtasks,  # Update with any status changes
                 "parallel_batch": batch,
                 "current_subtask": None
             }
         else:
-            # Sequential execution
             return {
+                "subtasks": subtasks,
                 "parallel_batch": [],
                 "current_subtask": ready_tasks[0]
             }
@@ -335,29 +405,29 @@ class MultiAgentWorkflow:
         
         batch = state['parallel_batch']
         env_name = state['env_name']
+        subtask_attempts = state.get('subtask_attempts', {})
         results = []
         
         if self.use_slurm and self.slurm_tools:
-            # Submit all jobs to SLURM
-            results = self._execute_batch_slurm(batch, env_name)
+            results = self._execute_batch_slurm(batch, env_name, subtask_attempts)
         else:
-            # Use thread pool for parallel execution
-            results = self._execute_batch_threads(batch, env_name)
+            results = self._execute_batch_threads(batch, env_name, subtask_attempts)
         
         return {
             "parallel_results": results
         }
     
-    def _execute_batch_slurm(self, batch: List[Dict], env_name: str) -> List[Dict]:
+    def _execute_batch_slurm(self, batch: List[Dict], env_name: str, subtask_attempts: Dict) -> List[Dict]:
         """Execute batch using SLURM job submissions"""
         
         results = []
-        job_map = {}  # Map job_id to subtask
         
-        # Submit all jobs
         for subtask in batch:
+            task_id = subtask['id']
+            prior_attempts = subtask_attempts.get(task_id, 0)
+            
             agent = SubAgent(
-                agent_id=f"agent_{subtask['id']}",
+                agent_id=f"agent_{task_id}",
                 sandbox=self.sandbox,
                 conda_tools=self.conda_tools,
                 slurm_tools=self.slurm_tools,
@@ -368,7 +438,8 @@ class MultiAgentWorkflow:
                 slurm_config=self.slurm_config
             )
             
-            result = agent.execute(subtask, env_name=env_name)
+            # Pass prior_attempts to enforce cross-invocation limit
+            result = agent.execute(subtask, env_name=env_name, prior_attempts=prior_attempts)
             results.append({
                 "subtask": subtask,
                 "result": result
@@ -376,15 +447,18 @@ class MultiAgentWorkflow:
         
         return results
     
-    def _execute_batch_threads(self, batch: List[Dict], env_name: str) -> List[Dict]:
+    def _execute_batch_threads(self, batch: List[Dict], env_name: str, subtask_attempts: Dict) -> List[Dict]:
         """Execute batch using thread pool (for non-SLURM parallel execution)"""
         
         results = []
         max_workers = min(len(batch), self.slurm_config.get("max_parallel_jobs", 4))
         
         def execute_subtask(subtask):
+            task_id = subtask['id']
+            prior_attempts = subtask_attempts.get(task_id, 0)
+            
             agent = SubAgent(
-                agent_id=f"agent_{subtask['id']}",
+                agent_id=f"agent_{task_id}",
                 sandbox=self.sandbox,
                 conda_tools=self.conda_tools,
                 slurm_tools=self.slurm_tools,
@@ -396,7 +470,7 @@ class MultiAgentWorkflow:
             )
             return {
                 "subtask": subtask,
-                "result": agent.execute(subtask, env_name=env_name)
+                "result": agent.execute(subtask, env_name=env_name, prior_attempts=prior_attempts)
             }
         
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -413,7 +487,8 @@ class MultiAgentWorkflow:
                         "result": {
                             "success": False,
                             "error": str(e),
-                            "task_id": subtask['id']
+                            "task_id": subtask['id'],
+                            "total_attempts": subtask_attempts.get(subtask['id'], 0)
                         }
                     })
         
@@ -424,9 +499,13 @@ class MultiAgentWorkflow:
         
         subtask = state['current_subtask']
         env_name = state['env_name']
+        subtask_attempts = state.get('subtask_attempts', {})
         
         if not subtask:
             return {"parallel_results": []}
+        
+        task_id = subtask['id']
+        prior_attempts = subtask_attempts.get(task_id, 0)
         
         # Install required packages for this subtask
         required_packages = subtask.get("required_packages", [])
@@ -438,7 +517,7 @@ class MultiAgentWorkflow:
         
         # Create sub-agent
         agent = SubAgent(
-            agent_id=f"agent_{subtask['id']}",
+            agent_id=f"agent_{task_id}",
             sandbox=self.sandbox,
             conda_tools=self.conda_tools,
             slurm_tools=self.slurm_tools,
@@ -449,7 +528,8 @@ class MultiAgentWorkflow:
             slurm_config=self.slurm_config
         )
         
-        result = agent.execute(subtask, env_name=env_name)
+        # Pass prior_attempts
+        result = agent.execute(subtask, env_name=env_name, prior_attempts=prior_attempts)
         
         return {
             "parallel_results": [{
@@ -462,21 +542,45 @@ class MultiAgentWorkflow:
         """Process results from parallel or sequential execution"""
         
         results = state.get('parallel_results', [])
+        subtask_attempts = state.get('subtask_attempts', {}).copy()
         completed = []
         failed = []
         
         for item in results:
             subtask = item['subtask']
             result = item['result']
+            task_id = subtask['id']
+            
+            # Update attempt count
+            new_attempts = result.get('total_attempts', subtask_attempts.get(task_id, 0) + 1)
+            subtask_attempts[task_id] = new_attempts
             
             # Update subtask status
             subtask['last_result'] = result
-            subtask['status'] = 'completed' if result.get('success') else 'failed'
+            subtask['attempts'] = new_attempts
+            
+            # Check for should_skip flag (agent exceeded max attempts)
+            if result.get('should_skip'):
+                subtask['status'] = 'max_attempts_exceeded'
+                failed.append(subtask)
+                
+                agent_logger.log_task_failure(
+                    agent_name=f"agent_{task_id}",
+                    task_id=task_id,
+                    error=f"Max attempts exceeded ({new_attempts})",
+                    context={"result": result}
+                )
+            elif result.get('success'):
+                subtask['status'] = 'completed'
+                completed.append(subtask)
+            else:
+                subtask['status'] = 'failed'
+                failed.append(subtask)
             
             # Git commit
             git_tracker.commit_task_attempt(
-                task_id=subtask['id'],
-                agent_name=f"agent_{subtask['id']}",
+                task_id=task_id,
+                agent_name=f"agent_{task_id}",
                 description=subtask['description'],
                 status="success" if result.get('success') else "failure",
                 files_modified=result.get('files_created', []),
@@ -487,29 +591,26 @@ class MultiAgentWorkflow:
             
             # Log to documentation
             doc_generator.log_change({
-                "task_id": subtask['id'],
+                "task_id": task_id,
                 "description": subtask['description'],
                 "status": "success" if result.get('success') else "failure",
-                "agent": f"agent_{subtask['id']}",
+                "agent": f"agent_{task_id}",
                 "tools_used": result.get('tools_used', []),
                 "result": result.get('report', {}),
                 "files_modified": result.get('files_created', []),
-                "attempts": result.get('iterations', 1),
+                "attempts": new_attempts,
                 "execution_mode": result.get('execution_mode', 'interactive')
             })
             
             # Track in master
             if result.get('success'):
-                self.master.mark_subtask_complete(subtask['id'], result.get('report', {}))
-                completed.append(subtask)
+                self.master.mark_subtask_complete(task_id, result.get('report', {}))
             else:
-                self.master.mark_subtask_failed(subtask['id'], result.get('report', {}))
-                failed.append(subtask)
+                self.master.mark_subtask_failed(task_id, result.get('report', {}))
         
         # Update subtasks list with new statuses
         updated_subtasks = []
         for st in state['subtasks']:
-            # Find matching result
             matching = next((r for r in results if r['subtask']['id'] == st['id']), None)
             if matching:
                 updated_subtasks.append(matching['subtask'])
@@ -518,43 +619,81 @@ class MultiAgentWorkflow:
         
         return {
             "subtasks": updated_subtasks,
+            "subtask_attempts": subtask_attempts,
             "completed_subtasks": completed,
             "failed_subtasks": failed,
-            "parallel_results": []  # Clear results
+            "parallel_results": []
         }
     
     def master_review(self, state: WorkflowState) -> Dict:
         """Master agent reviews failed subtasks and decides next steps"""
         
         failed = state.get('failed_subtasks', [])
+        subtask_attempts = state.get('subtask_attempts', {})
         
         if not failed:
             return {"master_decision": {"decision": "CONTINUE"}}
         
         # Review the most recent failure
         subtask = failed[-1]
+        task_id = subtask['id']
         failure_info = subtask.get('last_result', {})
+        total_attempts = subtask_attempts.get(task_id, 0)
         
+        # ENFORCE LIMIT: If max attempts reached, force SKIP (not REFORMULATE)
+        if total_attempts >= self.max_retries:
+            agent_logger.log_reflection(
+                agent_name="master",
+                task_id=task_id,
+                reflection=f"Forcing SKIP: {task_id} exceeded max attempts ({total_attempts}/{self.max_retries})"
+            )
+            
+            for st in state['subtasks']:
+                if st['id'] == task_id:
+                    st['status'] = 'skipped'
+                    break
+            
+            return {
+                "subtasks": state['subtasks'],
+                "master_decision": {
+                    "decision": "SKIP",
+                    "reasoning": f"Maximum attempts ({self.max_retries}) exceeded - cannot reformulate"
+                }
+            }
+        
+        # Normal master review
         decision = self.master.review_failure(subtask, failure_info)
+        
+        # Override REFORMULATE if close to limit
+        if decision['decision'] == 'REFORMULATE' and total_attempts >= self.max_retries - 2:
+            agent_logger.log_reflection(
+                agent_name="master",
+                task_id=task_id,
+                reflection=f"Overriding REFORMULATE to SKIP: only {self.max_retries - total_attempts} attempts remaining"
+            )
+            decision = {
+                "decision": "SKIP",
+                "reasoning": f"Only {self.max_retries - total_attempts} attempts remaining, skipping to prevent infinite loop"
+            }
         
         # Handle different decisions
         if decision['decision'] == 'REFORMULATE':
-            # Update subtask with new approach
             for st in state['subtasks']:
-                if st['id'] == subtask['id']:
+                if st['id'] == task_id:
                     st['description'] = decision.get('new_approach', st['description'])
                     st['context'] = {
                         **st.get('context', {}),
                         'reformulated': True,
-                        'original_description': subtask['description']
+                        'original_description': subtask['description'],
+                        'prior_attempts': total_attempts
                     }
                     st['status'] = 'pending'
-                    st['attempts'] = 0
+                    # DO NOT reset attempts - they carry over
                     break
         
         elif decision['decision'] == 'SKIP':
             for st in state['subtasks']:
-                if st['id'] == subtask['id']:
+                if st['id'] == task_id:
                     st['status'] = 'skipped'
                     break
         
@@ -571,6 +710,13 @@ class MultiAgentWorkflow:
             main_task=state['main_task'],
             subtask_results=state.get('completed_subtasks', [])
         )
+        
+        # Add attempt statistics
+        subtask_attempts = state.get('subtask_attempts', {})
+        attempt_stats = "\n\n## Attempt Statistics\n\n"
+        for task_id, attempts in subtask_attempts.items():
+            attempt_stats += f"- {task_id}: {attempts}/{self.max_retries} attempts\n"
+        report += attempt_stats
         
         # Save README
         doc_generator.save_readme()
@@ -606,7 +752,59 @@ class MultiAgentWorkflow:
         
         return {}
     
+    def emergency_stop(self, state: WorkflowState) -> Dict:
+        """Emergency stop when workflow limits exceeded"""
+        
+        workflow_iterations = state.get('workflow_iterations', 0)
+        
+        agent_logger.log_task_failure(
+            agent_name="workflow",
+            task_id="emergency_stop",
+            error=f"Workflow exceeded safety limit: {workflow_iterations} iterations",
+            context={
+                "subtask_attempts": state.get('subtask_attempts', {}),
+                "completed": len(state.get('completed_subtasks', [])),
+                "failed": len(state.get('failed_subtasks', []))
+            }
+        )
+        
+        # Generate emergency report
+        report = f"""# Emergency Stop Report
+
+**Reason**: Workflow exceeded maximum iterations ({workflow_iterations}/{MAX_WORKFLOW_ITERATIONS})
+
+## Summary
+- Completed subtasks: {len(state.get('completed_subtasks', []))}
+- Failed subtasks: {len(state.get('failed_subtasks', []))}
+- Total workflow iterations: {workflow_iterations}
+
+## Attempt Counts
+"""
+        for task_id, attempts in state.get('subtask_attempts', {}).items():
+            report += f"- {task_id}: {attempts} attempts\n"
+        
+        report += "\n## Recommendation\nReview the workflow logic and subtask definitions to prevent infinite loops."
+        
+        # Save report
+        report_path = self.sandbox.get_reports_dir() / "emergency_stop_report.md"
+        report_path.write_text(report)
+        
+        return {
+            "status": "emergency_stopped",
+            "final_report": report
+        }
+    
     # ==================== Routing Functions ====================
+    
+    def route_after_limit_check(self, state: WorkflowState) -> str:
+        """Route based on workflow iteration limit"""
+        
+        workflow_iterations = state.get('workflow_iterations', 0)
+        
+        if workflow_iterations >= MAX_WORKFLOW_ITERATIONS:
+            return "stop"
+        
+        return "continue"
     
     def route_execution_mode(self, state: WorkflowState) -> str:
         """Decide whether to execute parallel or sequential"""
@@ -633,13 +831,17 @@ class MultiAgentWorkflow:
         
         failed = state.get('failed_subtasks', [])
         subtasks = state.get('subtasks', [])
+        subtask_attempts = state.get('subtask_attempts', {})
         
-        # Check if any critical failures need review
-        if failed:
-            # Check if failed task blocks others
-            for f in failed:
+        # Check if any failures need review (and haven't exceeded max attempts)
+        for f in failed:
+            task_id = f['id']
+            attempts = subtask_attempts.get(task_id, 0)
+            
+            # Only review if under max attempts and task blocks others
+            if attempts < self.max_retries:
                 dependents = [st for st in subtasks 
-                            if f['id'] in st.get('dependencies', []) 
+                            if task_id in st.get('dependencies', []) 
                             and st['status'] == 'pending']
                 if dependents:
                     return "review"
@@ -696,6 +898,8 @@ class MultiAgentWorkflow:
             "current_subtask": None,
             "parallel_batch": [],
             "parallel_results": [],
+            "subtask_attempts": {},
+            "workflow_iterations": 0,
             "env_name": "",
             "completed_subtasks": [],
             "failed_subtasks": [],

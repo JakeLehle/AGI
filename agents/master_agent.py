@@ -7,8 +7,14 @@ from typing import Dict, Any, List, Optional
 from pathlib import Path
 from datetime import datetime
 import json
+import re
 
-from langchain_community.llms import Ollama
+# Use updated import to avoid deprecation warning
+try:
+    from langchain_ollama import OllamaLLM
+except ImportError:
+    from langchain_community.llms import Ollama as OllamaLLM
+
 from utils.logging_config import agent_logger
 from tools.sandbox import Sandbox
 
@@ -35,7 +41,7 @@ class MasterAgent:
         """
         self.sandbox = sandbox
         self.agent_id = "master"
-        self.llm = Ollama(
+        self.llm = OllamaLLM(
             model=ollama_model,
             base_url=ollama_base_url
         )
@@ -179,7 +185,6 @@ Create 3-7 subtasks. Respond in JSON format:
         """Parse LLM response into structured subtasks"""
         
         try:
-            import re
             json_match = re.search(r'\{.*\}', response, re.DOTALL)
             if json_match:
                 parsed = json.loads(json_match.group())
@@ -344,21 +349,27 @@ Create 3-7 subtasks. Respond in JSON format:
             Decision on how to proceed
         """
         
+        # Get attempt count from failure info
+        total_attempts = failure_info.get('total_attempts', failure_info.get('iterations', 1))
+        
         prompt = f"""A subtask has failed. Review and decide what to do.
 
 Subtask: {subtask['description']}
 Success Criteria: {subtask.get('success_criteria', 'Not specified')}
 
 Failure Information:
-- Iterations attempted: {failure_info.get('iterations', 'Unknown')}
+- Total attempts so far: {total_attempts}
 - Errors: {failure_info.get('errors', [])}
 - Summary: {failure_info.get('report', {}).get('summary', 'No summary')}
+- File exploration results: {failure_info.get('file_exploration', {})}
 
 Options:
 1. REFORMULATE: Rewrite the subtask with a different approach
 2. SPLIT: Break this subtask into smaller pieces
 3. SKIP: Mark as non-critical and continue (if other tasks don't depend on it)
 4. ESCALATE: This is blocking and needs human intervention
+
+IMPORTANT: If total_attempts >= 10, strongly prefer SKIP or ESCALATE to prevent infinite loops.
 
 Dependents that need this task: {self.task_dependencies.get(subtask['id'], {}).get('dependents', [])}
 
@@ -375,7 +386,6 @@ Respond in JSON:
         response = self.llm.invoke(prompt)
         
         try:
-            import re
             json_match = re.search(r'\{.*\}', response, re.DOTALL)
             if json_match:
                 decision = json.loads(json_match.group())
@@ -390,7 +400,14 @@ Respond in JSON:
         except:
             pass
         
-        # Fallback
+        # Fallback - if many attempts, force SKIP
+        if total_attempts >= 10:
+            return {
+                "decision": "SKIP",
+                "reasoning": f"Too many attempts ({total_attempts}), skipping to prevent infinite loop",
+                "blocking": False
+            }
+        
         return {
             "decision": "ESCALATE",
             "reasoning": "Could not determine best course of action",
@@ -416,7 +433,7 @@ Respond in JSON:
         # Gather statistics
         total_subtasks = len(self.subtasks)
         completed = len([s for s in self.subtasks if s["status"] == "completed"])
-        failed = len([s for s in self.subtasks if s["status"] == "failed"])
+        failed = len([s for s in self.subtasks if s["status"] in ["failed", "skipped", "max_attempts_exceeded"]])
         
         # Gather all files created
         all_files = []
@@ -443,7 +460,7 @@ Original Task: {main_task}
 Statistics:
 - Total subtasks: {total_subtasks}
 - Completed: {completed}
-- Failed: {failed}
+- Failed/Skipped: {failed}
 - Total iterations: {total_iterations}
 
 Subtask summaries:
@@ -489,7 +506,7 @@ Keep it concise but informative.
 |--------|-------|
 | Total Subtasks | {total_subtasks} |
 | Completed | {completed} |
-| Failed | {failed} |
+| Failed/Skipped | {failed} |
 | Total Iterations | {total_iterations} |
 | Files Created | {len(all_files)} |
 
@@ -514,7 +531,7 @@ Keep it concise but informative.
         """Get current progress summary"""
         
         completed = len([s for s in self.subtasks if s["status"] == "completed"])
-        failed = len([s for s in self.subtasks if s["status"] == "failed"])
+        failed = len([s for s in self.subtasks if s["status"] in ["failed", "skipped", "max_attempts_exceeded"]])
         pending = len([s for s in self.subtasks if s["status"] == "pending"])
         
         return {
