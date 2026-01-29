@@ -2,6 +2,15 @@
 Main entry point for the multi-agent system.
 Supports multiple SLURM clusters (CPU and GPU) with flexible configuration.
 
+ARCHITECTURE NOTE:
+-----------------
+This system maintains separation between:
+  - AGI_ROOT: The pipeline code repository (static, shared)
+  - PROJECT_DIR: The project-specific directory (logs, data, outputs)
+
+All execution artifacts (logs, outputs, reports) go to PROJECT_DIR.
+AGI_ROOT stays clean and only contains the pipeline code.
+
 Run with:
     # Zeus cluster (CPU, default)
     python main.py --prompt-file prompts/my_task.txt --project-dir /path/to/project --slurm
@@ -28,9 +37,13 @@ import hashlib
 import sys
 
 from workflows.langgraph_workflow import MultiAgentWorkflow
-from utils.logging_config import agent_logger
 from tools.sandbox import Sandbox
 from tools.slurm_tools import SlurmTools, SlurmConfig
+
+# Import configuration functions for project isolation
+from utils.logging_config import configure_logging, agent_logger
+from utils.documentation import configure_documentation, doc_generator
+from utils.git_tracker import configure_git_tracking, git_tracker
 
 
 def load_config(config_path: str = "config/config.yaml") -> dict:
@@ -346,7 +359,7 @@ Examples:
     # Project directory (required for most operations)
     parser.add_argument("--project-dir", type=str, required=True, help="Project directory for all files")
     
-    # Model and execution options (NEW)
+    # Model and execution options
     model_group = parser.add_argument_group('Model Options')
     model_group.add_argument(
         "--model", "-m",
@@ -431,6 +444,23 @@ Examples:
     
     # Validate and setup project directory
     project_dir = validate_project_dir(args.project_dir)
+    
+    # =========================================================================
+    # CRITICAL: Configure utilities for project isolation
+    # This ensures all logs, docs, and git operations happen in project_dir
+    # NOT in the AGI root directory where the code lives
+    # =========================================================================
+    configure_logging(str(project_dir))
+    configure_documentation(str(project_dir))
+    configure_git_tracking(str(project_dir))
+    
+    # Log that we've configured for this project
+    agent_logger.log_workflow_event("project_configured", {
+        "project_dir": str(project_dir),
+        "model": config['ollama']['model'],
+        "max_retries": config['agents']['max_retries']
+    })
+    # =========================================================================
     
     # Initialize sandbox
     sandbox = Sandbox(project_dir)
@@ -584,6 +614,10 @@ Examples:
         print("\nSLURM Config:", json.dumps(slurm_job_config, indent=2))
         print("\nProject structure:")
         print(sandbox.get_directory_tree())
+        print("\nProject Isolation:")
+        print(f"  Logs will go to: {project_dir}/logs/")
+        print(f"  Reports will go to: {project_dir}/reports/")
+        print(f"  Git operations in: {project_dir}/.git/")
         sys.exit(0)
     
     # Initialize workflow
@@ -653,6 +687,14 @@ Examples:
             print(f"    - SLURM Logs: {project_dir}/slurm/logs/")
         
         print(f"\n{'='*70}\n")
+        
+        # Save execution report to project directory
+        try:
+            report_path = doc_generator.save_execution_report()
+            print(f"  Execution report saved to: {report_path}")
+        except Exception as e:
+            if args.verbose:
+                print(f"  Warning: Could not save execution report: {e}")
         
         if result['status'] == 'completed':
             sys.exit(0)

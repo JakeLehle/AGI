@@ -10,7 +10,7 @@ name: AGI
 
 channels:
   - conda-forge
-  - defaults
+  - bioconda
 
 dependencies:
   # Python version
