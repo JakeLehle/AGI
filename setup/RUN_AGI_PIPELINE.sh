@@ -72,10 +72,8 @@ echo ">>> Loading modules..."
 # Try to load anaconda - adjust module name for your system
 if module avail anaconda 2>&1 | grep -q anaconda; then
     module load anaconda
-elif module avail conda 2>&1 | grep -q conda; then
-    module load conda
-elif module avail miniconda 2>&1 | grep -q miniconda; then
-    module load miniconda
+elif [ -f "$HOME/anaconda3/bin/activate" ]; then
+    source "$HOME/anaconda3/bin/activate"
 else
     echo "Warning: No anaconda/conda module found, assuming conda is in PATH"
 fi
