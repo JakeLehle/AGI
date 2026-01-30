@@ -3,13 +3,31 @@ Git integration for automatic change tracking.
 Every agent action is committed with detailed context.
 
 Supports project-scoped git operations where each project has its own repository.
+
+NOTE: Git tracking is OPTIONAL. If git is not available, the pipeline will
+continue to function - you just won't have automatic git commits.
 """
 
-import git
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, List
 import json
+import os
+
+# Handle missing git gracefully - don't crash on import
+GIT_AVAILABLE = False
+git = None
+
+try:
+    # Suppress the GitPython warning if git isn't found
+    os.environ.setdefault('GIT_PYTHON_REFRESH', 'quiet')
+    import git as git_module
+    git = git_module
+    GIT_AVAILABLE = True
+except ImportError as e:
+    # Git module not installed or git executable not found
+    GIT_AVAILABLE = False
+    print(f"Note: Git tracking disabled - {e}")
 
 
 class GitTracker:
@@ -18,6 +36,9 @@ class GitTracker:
     
     Can be initialized with a specific project path to ensure all git operations
     happen in the project's repository, not the AGI root.
+    
+    If git is not available, all operations become no-ops and the pipeline
+    continues without git tracking.
     """
     
     def __init__(self, repo_path: str = None):
@@ -31,7 +52,11 @@ class GitTracker:
         self.repo_path = Path(repo_path) if repo_path else None
         self.repo = None
         self._configured = False
+        self._git_available = GIT_AVAILABLE
         
+        if not self._git_available:
+            return
+            
         if self.repo_path:
             self._init_repo()
     
@@ -45,6 +70,10 @@ class GitTracker:
             repo_path: Absolute path to the project directory
             auto_init: If True, initialize git repo if it doesn't exist
         """
+        if not self._git_available:
+            print(f"Git tracking: Disabled (git not available)")
+            return
+            
         self.repo_path = Path(repo_path).resolve()
         
         if auto_init:
@@ -60,7 +89,7 @@ class GitTracker:
     
     def _init_repo(self):
         """Initialize or open the git repository"""
-        if not self.repo_path:
+        if not self._git_available or not self.repo_path:
             return
             
         try:
@@ -68,9 +97,13 @@ class GitTracker:
             self._configured = True
         except git.InvalidGitRepositoryError:
             # Initialize new repo
-            self.repo = git.Repo.init(self.repo_path)
-            self._initial_setup()
-            self._configured = True
+            try:
+                self.repo = git.Repo.init(self.repo_path)
+                self._initial_setup()
+                self._configured = True
+            except Exception as e:
+                print(f"Git tracking: Could not initialize repo - {e}")
+                self._configured = False
     
     def _initial_setup(self):
         """Create initial commit with .gitignore if this is a new repo"""
@@ -154,14 +187,15 @@ Thumbs.db
     
     def _ensure_configured(self):
         """Ensure tracker is configured before use"""
+        if not self._git_available:
+            return False
         if not self._configured or not self.repo:
-            # Return silently - git tracking is optional
             return False
         return True
     
     def is_available(self) -> bool:
         """Check if git tracking is available and configured"""
-        return self._configured and self.repo is not None
+        return self._git_available and self._configured and self.repo is not None
     
     def commit_task_attempt(
         self, 
