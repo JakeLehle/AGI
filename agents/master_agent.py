@@ -1,385 +1,389 @@
 """
-Master agent that decomposes high-level tasks into subtasks,
-coordinates sub-agents, and synthesizes final reports.
+Improved Master agent that decomposes high-level tasks into subtasks
+while preserving critical context: tools, file paths, reference scripts, and language requirements.
 """
 
 from typing import Dict, Any, List, Optional
-from pathlib import Path
-from datetime import datetime
-import json
-import re
-
-# Use updated import to avoid deprecation warning
-try:
-    from langchain_ollama import OllamaLLM
-except ImportError:
-    from langchain_community.llms import Ollama as OllamaLLM
-
+from langchain_community.llms import Ollama
 from utils.logging_config import agent_logger
-from tools.sandbox import Sandbox
+import re
+import json
 
 
 class MasterAgent:
-    """
-    Coordinates task decomposition, sub-agent assignment, and report synthesis.
-    Handles structured prompts with input files and expected outputs.
-    """
+    """Coordinates task decomposition and sub-agent assignment with full context preservation"""
     
-    def __init__(
-        self,
-        sandbox: Sandbox,
-        ollama_model: str = "llama3.1:70b",
-        ollama_base_url: str = "http://127.0.0.1:11434"
-    ):
-        """
-        Initialize master agent.
-        
-        Args:
-            sandbox: Sandbox instance for file operations
-            ollama_model: Ollama model to use
-            ollama_base_url: Ollama server URL
-        """
-        self.sandbox = sandbox
+    def __init__(self, ollama_model: str = "llama3.1:70b"):
+        self.llm = Ollama(model=ollama_model)
         self.agent_id = "master"
-        self.llm = OllamaLLM(
-            model=ollama_model,
-            base_url=ollama_base_url
-        )
-        
-        # Track overall progress
-        self.subtasks = []
-        self.completed_reports = []
-        self.task_dependencies = {}
     
-    def decompose_task(
-        self,
-        main_task: str,
-        context: Dict[str, Any] = None
-    ) -> List[Dict[str, Any]]:
+    def decompose_task(self, main_task: str, context: Dict[str, Any] = None) -> List[Dict[str, Any]]:
         """
-        Break down a high-level task into specific subtasks.
+        Break down a high-level task into specific subtasks while preserving ALL context.
         
         Args:
-            main_task: The main objective
-            context: Additional context including:
-                - input_files: List of input file paths
-                - expected_outputs: List of expected output file paths
-                - notes: Additional constraints or requirements
+            main_task: The main objective (full prompt with all specifications)
+            context: Additional context (user requirements, constraints, etc.)
         
         Returns:
-            List of subtask dictionaries with dependencies
+            List of subtask dictionaries with full context preserved
         """
-        context = context or {}
         
-        # Get input files and expected outputs
-        input_files = context.get("input_files", [])
-        expected_outputs = context.get("expected_outputs", [])
+        # First, extract critical context from the main task
+        extracted_context = self._extract_task_context(main_task)
         
-        # Build context string
         context_str = ""
+        if context:
+            context_str = f"\nAdditional Context:\n{json.dumps(context, indent=2)}"
         
-        if input_files:
-            context_str += "\nInput files available:\n"
-            for f in input_files:
-                # Check if file exists and get basic info
-                file_path = self.sandbox.project_dir / f
-                if file_path.exists():
-                    size = file_path.stat().st_size
-                    context_str += f"  - {f} ({size} bytes)\n"
-                else:
-                    context_str += f"  - {f} (not found - may need to be created or fetched)\n"
-        
-        if expected_outputs:
-            context_str += "\nExpected outputs to produce:\n"
-            for f in expected_outputs:
-                context_str += f"  - {f}\n"
-        
-        if context.get("notes"):
-            context_str += f"\nAdditional context:\n{context.get('notes')}\n"
-        
-        # Current project structure
-        file_tree = self.sandbox.get_directory_tree(max_depth=2)
-        
-        prompt = f"""You are a master coordinator breaking down a complex task into subtasks.
+        # Build a detailed prompt that enforces context preservation
+        prompt = f"""You are a master coordinator for a computational pipeline. Break down this high-level task into specific, actionable subtasks.
 
-Main Task: {main_task}
+CRITICAL: You MUST preserve ALL specific details from the original task. Do NOT generalize or substitute tools/packages.
+
+=== MAIN TASK ===
+{main_task}
 {context_str}
 
-Current project structure:
+=== EXTRACTED CONTEXT (MUST BE PRESERVED) ===
+- Language/Framework: {extracted_context.get('language', 'Not specified')}
+- Specified Packages: {', '.join(extracted_context.get('packages', [])) or 'None specified'}
+- Reference Scripts: {', '.join(extracted_context.get('reference_scripts', [])) or 'None specified'}
+- Input Files: {', '.join(extracted_context.get('input_files', [])) or 'None specified'}
+- Output Files: {', '.join(extracted_context.get('output_files', [])) or 'None specified'}
+- Completed Steps: {', '.join(extracted_context.get('completed_steps', [])) or 'None'}
+
+=== SUBTASK REQUIREMENTS ===
+1. Each subtask MUST include the EXACT tools/packages specified in the original task
+2. Do NOT substitute packages (e.g., don't suggest R/Seurat if Python/Scanpy was specified)
+3. Include specific file paths mentioned in the task
+4. Reference any example scripts mentioned
+5. Mark dependencies on previous subtasks
+6. Skip any steps marked as COMPLETED (✅)
+7. Each subtask should have clear inputs and outputs
+
+=== OUTPUT FORMAT (JSON) ===
+Return a JSON array of subtasks. Each subtask must have this structure:
+```json
+[
+  {{
+    "id": "subtask_1",
+    "title": "Brief title",
+    "description": "Detailed description preserving ALL specifics from original task",
+    "language": "python|r|bash|other",
+    "packages": ["package1", "package2"],
+    "reference_scripts": ["path/to/script.py"],
+    "input_files": ["path/to/input.h5ad"],
+    "output_files": ["path/to/output.h5ad"],
+    "success_criteria": "How to verify completion",
+    "dependencies": ["subtask_id of dependencies"],
+    "skip_if_exists": ["files that indicate this is already done"],
+    "code_hints": "Any code snippets or specific function calls mentioned"
+  }}
+]
 ```
-{file_tree}
-```
 
-Requirements for subtasks:
-1. Each subtask should be specific and actionable
-2. Order subtasks by dependency (what needs to happen first)
-3. Each subtask should have clear success criteria
-4. Consider what environment/tools each subtask needs
-5. Final subtask(s) should produce the expected outputs
+IMPORTANT: 
+- If the task mentions specific packages like "popV", "Scanpy", "Squidpy" - use THOSE EXACT packages
+- If the task mentions a reference script, include it so the sub-agent can examine it
+- If files are marked as existing or steps as completed, skip them
 
-Available capabilities for subtasks:
-- Python, R, bash, Perl, Java script execution
-- Web searching for information
-- File reading/writing
-- Conda package installation (no sudo)
-- Data analysis and transformation
-
-Create 3-7 subtasks. Respond in JSON format:
-{{
-    "subtasks": [
-        {{
-            "id": "subtask_1",
-            "title": "Brief title",
-            "description": "Detailed description of what to do",
-            "success_criteria": "How to know it's complete",
-            "dependencies": [],
-            "required_packages": ["package1", "package2"],
-            "language": "python|r|bash|mixed",
-            "expected_files": ["files this subtask should create"]
-        }},
-        {{
-            "id": "subtask_2",
-            "title": "Brief title",
-            "description": "Detailed description",
-            "success_criteria": "Success criteria",
-            "dependencies": ["subtask_1"],
-            "required_packages": [],
-            "language": "python",
-            "expected_files": []
-        }}
-    ],
-    "environment_name": "suggested conda environment name",
-    "reasoning": "Brief explanation of task breakdown"
-}}
+Return ONLY the JSON array, no other text.
 """
         
         response = self.llm.invoke(prompt)
         
         # Parse the response
-        subtasks = self._parse_subtasks(response, context)
+        subtasks = self._parse_subtasks_json(response, extracted_context)
         
-        # Store for tracking
-        self.subtasks = subtasks
-        self._build_dependency_graph(subtasks)
+        # Filter out completed subtasks
+        subtasks = self._filter_completed_subtasks(subtasks, extracted_context)
         
         agent_logger.log_task_start(
             agent_name=self.agent_id,
             task_id="decomposition",
-            description=f"Decomposed '{main_task[:50]}...' into {len(subtasks)} subtasks",
+            description=f"Decomposed task into {len(subtasks)} subtasks (preserved context: {len(extracted_context.get('packages', []))} packages, {len(extracted_context.get('reference_scripts', []))} reference scripts)",
             attempt=1
         )
         
-        # Save decomposition to file
-        decomp_path = self.sandbox.get_reports_dir() / "task_decomposition.json"
-        with open(decomp_path, 'w') as f:
-            json.dump({
-                "main_task": main_task,
-                "context": context,
-                "subtasks": subtasks,
-                "timestamp": datetime.now().isoformat()
-            }, f, indent=2)
-        
         return subtasks
     
-    def _parse_subtasks(self, response: str, context: Dict) -> List[Dict[str, Any]]:
-        """Parse LLM response into structured subtasks"""
+    def _extract_task_context(self, task: str) -> Dict[str, Any]:
+        """Extract critical context from the task description"""
         
+        context = {
+            "language": None,
+            "packages": [],
+            "reference_scripts": [],
+            "input_files": [],
+            "output_files": [],
+            "completed_steps": [],
+            "code_blocks": [],
+            "huggingface_repos": [],
+            "specific_functions": []
+        }
+        
+        # Detect language
+        python_indicators = ['python', 'scanpy', 'squidpy', 'anndata', 'pandas', 'numpy', '.py', 'popv', 'h5ad']
+        r_indicators = ['seurat', 'singlecell', 'bioconductor', '.R', 'library(']
+        
+        task_lower = task.lower()
+        python_score = sum(1 for ind in python_indicators if ind in task_lower)
+        r_score = sum(1 for ind in r_indicators if ind in task_lower)
+        
+        if python_score > r_score:
+            context["language"] = "python"
+        elif r_score > python_score:
+            context["language"] = "r"
+        
+        # Extract Python packages (common bioinformatics packages)
+        python_packages = [
+            'scanpy', 'squidpy', 'anndata', 'pandas', 'numpy', 'scipy',
+            'popv', 'popV', 'scvi', 'scvi-tools', 'cellxgene', 'leidenalg',
+            'matplotlib', 'seaborn', 'plotly', 'umap', 'scikit-learn',
+            'harmony', 'bbknn', 'scanorama', 'mnnpy'
+        ]
+        for pkg in python_packages:
+            # Case-insensitive but preserve original case if found
+            if pkg.lower() in task_lower:
+                # Find the actual case used in the task
+                pattern = re.compile(re.escape(pkg), re.IGNORECASE)
+                matches = pattern.findall(task)
+                if matches:
+                    context["packages"].append(matches[0])
+        
+        # Extract reference scripts
+        script_patterns = [
+            r'[Rr]eference\s+[Ss]cript[s]?:\s*[`"]?([^\s`"]+\.py)[`"]?',
+            r'[Ee]xample\s+[Ss]cript[s]?:\s*[`"]?([^\s`"]+\.py)[`"]?',
+            r'scripts?/[^\s`"]+\.py',
+            r'[`"]([^`"]+\.py)[`"]'
+        ]
+        for pattern in script_patterns:
+            matches = re.findall(pattern, task)
+            context["reference_scripts"].extend(matches)
+        
+        # Extract file paths
+        file_patterns = [
+            r'[`"]?([^\s`"]*\.h5ad)[`"]?',  # AnnData files
+            r'[`"]?([^\s`"]*\.csv)[`"]?',    # CSV files
+            r'[`"]?(data/[^\s`"]+)[`"]?',    # Data directory paths
+            r'[`"]?(outputs?/[^\s`"]+)[`"]?' # Output directory paths
+        ]
+        for pattern in file_patterns:
+            matches = re.findall(pattern, task)
+            for match in matches:
+                if 'input' in match.lower() or 'processed' in match.lower():
+                    context["input_files"].append(match)
+                elif 'output' in match.lower() or 'result' in match.lower():
+                    context["output_files"].append(match)
+        
+        # Extract completed steps (marked with ✅ or "COMPLETED")
+        completed_patterns = [
+            r'✅\s*(?:COMPLETED:?)?\s*([^\n]+)',
+            r'\[x\]\s*([^\n]+)',
+            r'COMPLETED:\s*([^\n]+)'
+        ]
+        for pattern in completed_patterns:
+            matches = re.findall(pattern, task)
+            context["completed_steps"].extend(matches)
+        
+        # Extract code blocks
+        code_block_pattern = r'```(?:python|py)?\n?(.*?)```'
+        code_blocks = re.findall(code_block_pattern, task, re.DOTALL)
+        context["code_blocks"] = code_blocks
+        
+        # Extract HuggingFace repos
+        hf_pattern = r'huggingface_repo\s*=\s*["\']([^"\']+)["\']'
+        hf_matches = re.findall(hf_pattern, task)
+        context["huggingface_repos"] = hf_matches
+        
+        # Extract specific function calls mentioned
+        func_pattern = r'(?:use|call|run)\s+[`"]?(\w+\.\w+|\w+)\([^)]*\)[`"]?'
+        func_matches = re.findall(func_pattern, task, re.IGNORECASE)
+        context["specific_functions"] = func_matches
+        
+        # Deduplicate
+        for key in context:
+            if isinstance(context[key], list):
+                context[key] = list(dict.fromkeys(context[key]))
+        
+        return context
+    
+    def _parse_subtasks_json(self, response: str, extracted_context: Dict) -> List[Dict[str, Any]]:
+        """Parse JSON response into structured subtasks"""
+        
+        # Try to extract JSON from response
         try:
-            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            # Look for JSON array
+            json_match = re.search(r'\[[\s\S]*\]', response)
             if json_match:
-                parsed = json.loads(json_match.group())
-                subtasks = parsed.get("subtasks", [])
+                subtasks = json.loads(json_match.group())
                 
-                # Normalize and enhance subtasks
-                normalized = []
-                for i, st in enumerate(subtasks):
-                    normalized.append({
-                        "id": st.get("id", f"subtask_{i+1}"),
-                        "title": st.get("title", f"Subtask {i+1}"),
-                        "description": st.get("description", ""),
-                        "success_criteria": st.get("success_criteria", ""),
-                        "dependencies": st.get("dependencies", []),
-                        "required_packages": st.get("required_packages", []),
-                        "language": st.get("language", "python"),
-                        "expected_files": st.get("expected_files", []),
-                        "status": "pending",
-                        "attempts": 0,
-                        "context": {
-                            "input_files": context.get("input_files", []),
-                            "expected_outputs": context.get("expected_outputs", []),
-                            "project_dir": str(self.sandbox.project_dir)
-                        }
-                    })
+                # Ensure all subtasks have required fields and inherit context
+                for i, subtask in enumerate(subtasks):
+                    subtask.setdefault("id", f"subtask_{i+1}")
+                    subtask.setdefault("status", "pending")
+                    subtask.setdefault("attempts", 0)
+                    
+                    # Inherit context if not specified
+                    if not subtask.get("language") and extracted_context.get("language"):
+                        subtask["language"] = extracted_context["language"]
+                    
+                    if not subtask.get("packages") and extracted_context.get("packages"):
+                        subtask["packages"] = extracted_context["packages"]
+                    
+                    if not subtask.get("reference_scripts") and extracted_context.get("reference_scripts"):
+                        subtask["reference_scripts"] = extracted_context["reference_scripts"]
+                    
+                    # Add code hints from extracted context
+                    if extracted_context.get("code_blocks") and not subtask.get("code_hints"):
+                        subtask["code_hints"] = extracted_context["code_blocks"]
+                    
+                    if extracted_context.get("huggingface_repos"):
+                        subtask["huggingface_repos"] = extracted_context["huggingface_repos"]
                 
-                return normalized
-                
+                return subtasks
         except json.JSONDecodeError:
             pass
         
-        # Fallback: try to parse numbered list
-        return self._parse_subtasks_from_text(response, context)
+        # Fallback: parse as text (old format)
+        return self._parse_subtasks_text(response, extracted_context)
     
-    def _parse_subtasks_from_text(self, response: str, context: Dict) -> List[Dict[str, Any]]:
-        """Fallback parser for non-JSON responses"""
+    def _parse_subtasks_text(self, response: str, extracted_context: Dict) -> List[Dict[str, Any]]:
+        """Fallback parser for text-based responses"""
         
         subtasks = []
         lines = response.strip().split('\n')
-        current_subtask = None
         
-        for line in lines:
+        for i, line in enumerate(lines):
             line = line.strip()
-            if not line:
+            if not line or not line[0].isdigit():
                 continue
             
-            # Check for numbered items
-            if line[0].isdigit() and '.' in line[:3]:
-                if current_subtask:
-                    subtasks.append(current_subtask)
+            parts = line.split('.', 1)
+            if len(parts) < 2:
+                continue
+            
+            content = parts[1].strip()
+            
+            if ':' in content:
+                title, rest = content.split(':', 1)
+                title = title.strip()
                 
-                # Extract title and description
-                content = line.split('.', 1)[1].strip()
-                if ':' in content:
-                    title, desc = content.split(':', 1)
+                success_criteria = ""
+                if '|' in rest:
+                    description, criteria_part = rest.split('|', 1)
+                    description = description.strip()
+                    if 'Success criteria:' in criteria_part:
+                        success_criteria = criteria_part.split('Success criteria:')[1].strip()
                 else:
-                    title = content[:50]
-                    desc = content
-                
-                current_subtask = {
-                    "id": f"subtask_{len(subtasks)+1}",
-                    "title": title.strip(),
-                    "description": desc.strip(),
-                    "success_criteria": "",
-                    "dependencies": [f"subtask_{len(subtasks)}"] if subtasks else [],
-                    "required_packages": [],
-                    "language": "python",
-                    "expected_files": [],
-                    "status": "pending",
-                    "attempts": 0,
-                    "context": context
-                }
-            elif current_subtask and ('success' in line.lower() or 'criteria' in line.lower()):
-                current_subtask["success_criteria"] = line.split(':', 1)[-1].strip()
-        
-        if current_subtask:
-            subtasks.append(current_subtask)
+                    description = rest.strip()
+            else:
+                title = content[:50]
+                description = content
+                success_criteria = ""
+            
+            subtasks.append({
+                "id": f"subtask_{i+1}",
+                "title": title,
+                "description": description,
+                "success_criteria": success_criteria,
+                "status": "pending",
+                "attempts": 0,
+                "dependencies": [],
+                # Inherit from extracted context
+                "language": extracted_context.get("language"),
+                "packages": extracted_context.get("packages", []),
+                "reference_scripts": extracted_context.get("reference_scripts", []),
+                "input_files": extracted_context.get("input_files", []),
+                "output_files": extracted_context.get("output_files", []),
+                "code_hints": extracted_context.get("code_blocks", []),
+                "huggingface_repos": extracted_context.get("huggingface_repos", [])
+            })
         
         return subtasks
     
-    def _build_dependency_graph(self, subtasks: List[Dict]):
-        """Build dependency graph for task ordering"""
-        self.task_dependencies = {}
+    def _filter_completed_subtasks(self, subtasks: List[Dict], extracted_context: Dict) -> List[Dict]:
+        """Filter out subtasks that are already completed"""
         
-        for st in subtasks:
-            task_id = st["id"]
-            deps = st.get("dependencies", [])
-            self.task_dependencies[task_id] = {
-                "dependencies": deps,
-                "dependents": [],
-                "status": "pending"
-            }
+        completed_steps = extracted_context.get("completed_steps", [])
+        if not completed_steps:
+            return subtasks
         
-        # Build reverse dependencies (dependents)
-        for st in subtasks:
-            task_id = st["id"]
-            for dep in st.get("dependencies", []):
-                if dep in self.task_dependencies:
-                    self.task_dependencies[dep]["dependents"].append(task_id)
-    
-    def get_next_subtask(self) -> Optional[Dict[str, Any]]:
-        """Get next subtask that has all dependencies satisfied"""
-        
-        for st in self.subtasks:
-            if st["status"] != "pending":
-                continue
-            
-            # Check if all dependencies are complete
-            deps_satisfied = True
-            for dep_id in st.get("dependencies", []):
-                dep_info = self.task_dependencies.get(dep_id, {})
-                if dep_info.get("status") != "completed":
-                    deps_satisfied = False
+        filtered = []
+        for subtask in subtasks:
+            # Check if this subtask matches any completed step
+            is_completed = False
+            for completed in completed_steps:
+                # Simple matching - could be more sophisticated
+                if (completed.lower() in subtask.get("title", "").lower() or
+                    completed.lower() in subtask.get("description", "").lower()):
+                    is_completed = True
+                    agent_logger.log_reflection(
+                        agent_name=self.agent_id,
+                        task_id=subtask["id"],
+                        reflection=f"Skipping subtask '{subtask['title']}' - matches completed step: {completed}"
+                    )
                     break
             
-            if deps_satisfied:
-                return st
+            if not is_completed:
+                filtered.append(subtask)
         
-        return None
+        return filtered
     
-    def mark_subtask_complete(self, task_id: str, report: Dict):
-        """Mark a subtask as complete and record its report"""
-        
-        for st in self.subtasks:
-            if st["id"] == task_id:
-                st["status"] = "completed"
-                st["report"] = report
-                break
-        
-        if task_id in self.task_dependencies:
-            self.task_dependencies[task_id]["status"] = "completed"
-        
-        self.completed_reports.append(report)
-    
-    def mark_subtask_failed(self, task_id: str, report: Dict):
-        """Mark a subtask as failed"""
-        
-        for st in self.subtasks:
-            if st["id"] == task_id:
-                st["status"] = "failed"
-                st["report"] = report
-                break
-        
-        if task_id in self.task_dependencies:
-            self.task_dependencies[task_id]["status"] = "failed"
-        
-        self.completed_reports.append(report)
-    
-    def review_failure(
-        self,
-        subtask: Dict,
-        failure_info: Dict
-    ) -> Dict[str, Any]:
+    def review_failure(self, subtask: Dict, failure_info: Dict) -> Dict[str, Any]:
         """
-        Review a failed subtask and decide next steps.
-        
-        Args:
-            subtask: The failed subtask
-            failure_info: Information about the failure
-        
-        Returns:
-            Decision on how to proceed
+        Review a failed subtask and decide next steps, preserving context.
         """
         
-        # Get attempt count from failure info
-        total_attempts = failure_info.get('total_attempts', failure_info.get('iterations', 1))
+        # Include full context in the review
+        context_summary = f"""
+Subtask Context:
+- Language: {subtask.get('language', 'Not specified')}
+- Packages: {', '.join(subtask.get('packages', []))}
+- Reference Scripts: {', '.join(subtask.get('reference_scripts', []))}
+- Input Files: {', '.join(subtask.get('input_files', []))}
+"""
         
-        prompt = f"""A subtask has failed. Review and decide what to do.
+        prompt = f"""
+A subtask has failed after {failure_info.get('attempts', 1)} attempt(s).
 
 Subtask: {subtask['description']}
 Success Criteria: {subtask.get('success_criteria', 'Not specified')}
 
+{context_summary}
+
 Failure Information:
-- Total attempts so far: {total_attempts}
-- Errors: {failure_info.get('errors', [])}
-- Summary: {failure_info.get('report', {}).get('summary', 'No summary')}
-- File exploration results: {failure_info.get('file_exploration', {})}
+{failure_info.get('reflection', {}).get('analysis', 'No analysis available')}
+
+Error: {failure_info.get('error', 'No error message')}
+
+As the master coordinator, what should we do?
+
+IMPORTANT: When reformulating, you MUST preserve:
+- The same language/framework ({subtask.get('language', 'as specified')})
+- The same packages ({', '.join(subtask.get('packages', []))})
+- The same reference scripts
+- The same input/output files
 
 Options:
-1. REFORMULATE: Rewrite the subtask with a different approach
+1. REFORMULATE: Rewrite the subtask with different approach (but SAME tools)
 2. SPLIT: Break this subtask into smaller pieces
-3. SKIP: Mark as non-critical and continue (if other tasks don't depend on it)
+3. SKIP: Mark as non-critical and continue
 4. ESCALATE: This is blocking and needs human intervention
-
-IMPORTANT: If total_attempts >= 10, strongly prefer SKIP or ESCALATE to prevent infinite loops.
-
-Dependents that need this task: {self.task_dependencies.get(subtask['id'], {}).get('dependents', [])}
 
 Respond in JSON:
 {{
-    "decision": "REFORMULATE|SPLIT|SKIP|ESCALATE",
+    "decision": "REFORMULATE/SPLIT/SKIP/ESCALATE",
     "reasoning": "explain your decision",
-    "new_approach": "if REFORMULATE, describe new approach",
+    "new_approach": "if REFORMULATE, describe new approach using the SAME specified tools",
     "sub_subtasks": ["if SPLIT, list smaller tasks"],
-    "blocking": true/false
+    "preserved_context": {{
+        "language": "{subtask.get('language')}",
+        "packages": {subtask.get('packages', [])},
+        "reference_scripts": {subtask.get('reference_scripts', [])}
+    }}
 }}
 """
         
@@ -400,148 +404,47 @@ Respond in JSON:
         except:
             pass
         
-        # Fallback - if many attempts, force SKIP
-        if total_attempts >= 10:
-            return {
-                "decision": "SKIP",
-                "reasoning": f"Too many attempts ({total_attempts}), skipping to prevent infinite loop",
-                "blocking": False
-            }
-        
         return {
-            "decision": "ESCALATE",
-            "reasoning": "Could not determine best course of action",
-            "blocking": True
+            "decision": "REFORMULATE",
+            "reasoning": "Failed to parse master decision, defaulting to reformulation",
+            "new_approach": "Try alternative method using the same specified tools"
         }
     
-    def generate_final_report(
-        self,
-        main_task: str,
-        subtask_results: List[Dict]
-    ) -> str:
-        """
-        Generate comprehensive final report from all subtask results.
+    def generate_final_report(self, main_task: str, subtask_results: List[Dict]) -> str:
+        """Generate comprehensive report from all subtask results"""
         
-        Args:
-            main_task: Original task description
-            subtask_results: Results from all subtasks
+        results_summary = "\n".join([
+            f"- {r['task_id']}: {r.get('result', {}).get('output', 'No output')[:200]}"
+            for r in subtask_results
+            if r.get('success')
+        ])
         
-        Returns:
-            Final report as markdown string
-        """
+        # Extract tools used
+        all_packages = set()
+        for r in subtask_results:
+            if r.get('packages'):
+                all_packages.update(r['packages'])
         
-        # Gather statistics
-        total_subtasks = len(self.subtasks)
-        completed = len([s for s in self.subtasks if s["status"] == "completed"])
-        failed = len([s for s in self.subtasks if s["status"] in ["failed", "skipped", "max_attempts_exceeded"]])
-        
-        # Gather all files created
-        all_files = []
-        all_tools = set()
-        total_iterations = 0
-        
-        for report in self.completed_reports:
-            all_files.extend(report.get("files_created", []))
-            all_tools.update(report.get("tools_used", []))
-            total_iterations += report.get("iterations_used", 0)
-        
-        # Current file structure
-        file_tree = self.sandbox.get_directory_tree(max_depth=3)
-        
-        # Get summaries from each subtask
-        summaries = []
-        for report in self.completed_reports:
-            summaries.append(f"- {report.get('task_description', 'Unknown')}: {report.get('summary', 'No summary')[:200]}")
-        
-        prompt = f"""Generate a comprehensive final report for this completed project.
+        prompt = f"""
+Generate a comprehensive final report for this completed project.
 
 Original Task: {main_task}
 
-Statistics:
-- Total subtasks: {total_subtasks}
-- Completed: {completed}
-- Failed/Skipped: {failed}
-- Total iterations: {total_iterations}
+Completed Subtasks:
+{results_summary}
 
-Subtask summaries:
-{chr(10).join(summaries)}
+Tools/Packages Used: {', '.join(all_packages) if all_packages else 'Not tracked'}
 
-Files created: {all_files}
-Tools used: {list(all_tools)}
+Create a professional report that:
+1. Summarizes the overall accomplishment
+2. Highlights key findings from each subtask
+3. Lists the specific tools and packages used
+4. Provides actionable recommendations
+5. Notes any limitations or areas for future work
 
-Final project structure:
-```
-{file_tree}
-```
-
-Create a professional markdown report that includes:
-1. Executive Summary (2-3 sentences)
-2. What Was Accomplished (bullet points)
-3. Files Generated (with descriptions)
-4. Issues Encountered (if any)
-5. Recommendations for Next Steps
-6. How to Use the Outputs
-
-Keep it concise but informative.
+Format as a well-structured document with sections.
 """
         
         report = self.llm.invoke(prompt)
         
-        # Add header and metadata
-        full_report = f"""# Project Report
-
-**Generated**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-**Task**: {main_task[:100]}...
-**Status**: {'Completed' if failed == 0 else 'Partially Completed'}
-
----
-
-{report}
-
----
-
-## Project Statistics
-
-| Metric | Value |
-|--------|-------|
-| Total Subtasks | {total_subtasks} |
-| Completed | {completed} |
-| Failed/Skipped | {failed} |
-| Total Iterations | {total_iterations} |
-| Files Created | {len(all_files)} |
-
-## File Structure
-
-```
-{file_tree}
-```
-
----
-
-*Report generated by Multi-Agent System*
-"""
-        
-        # Save report to file
-        report_path = self.sandbox.get_reports_dir() / "final_report.md"
-        report_path.write_text(full_report)
-        
-        return full_report
-    
-    def get_progress_summary(self) -> Dict[str, Any]:
-        """Get current progress summary"""
-        
-        completed = len([s for s in self.subtasks if s["status"] == "completed"])
-        failed = len([s for s in self.subtasks if s["status"] in ["failed", "skipped", "max_attempts_exceeded"]])
-        pending = len([s for s in self.subtasks if s["status"] == "pending"])
-        
-        return {
-            "total_subtasks": len(self.subtasks),
-            "completed": completed,
-            "failed": failed,
-            "pending": pending,
-            "progress_percent": (completed / len(self.subtasks) * 100) if self.subtasks else 0,
-            "subtasks": [
-                {"id": s["id"], "title": s["title"], "status": s["status"]}
-                for s in self.subtasks
-            ]
-        }
+        return report
