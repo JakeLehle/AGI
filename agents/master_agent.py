@@ -1,21 +1,55 @@
 """
 Improved Master agent that decomposes high-level tasks into subtasks
 while preserving critical context: tools, file paths, reference scripts, and language requirements.
+
+Integrated with sandbox, SLURM, and conda infrastructure.
 """
 
 from typing import Dict, Any, List, Optional
-from langchain_community.llms import Ollama
-from utils.logging_config import agent_logger
+from pathlib import Path
 import re
 import json
+
+# Use non-deprecated import
+try:
+    from langchain_ollama import OllamaLLM
+except ImportError:
+    from langchain_community.llms import Ollama as OllamaLLM
+
+from utils.logging_config import agent_logger
 
 
 class MasterAgent:
     """Coordinates task decomposition and sub-agent assignment with full context preservation"""
     
-    def __init__(self, ollama_model: str = "llama3.1:70b"):
-        self.llm = Ollama(model=ollama_model)
+    def __init__(
+        self,
+        sandbox=None,
+        ollama_model: str = "llama3.1:70b",
+        ollama_base_url: str = "http://127.0.0.1:11434",
+        **kwargs
+    ):
+        """
+        Initialize MasterAgent.
+        
+        Args:
+            sandbox: Sandbox instance for file operations
+            ollama_model: Ollama model to use for LLM calls
+            ollama_base_url: Ollama server URL
+            **kwargs: Additional arguments for forward compatibility
+        """
+        self.llm = OllamaLLM(model=ollama_model, base_url=ollama_base_url)
         self.agent_id = "master"
+        self.sandbox = sandbox
+        self.ollama_model = ollama_model
+        self.ollama_base_url = ollama_base_url
+        
+        # Track subtask status for reporting
+        self.subtask_status = {}
+        
+        # Store any additional kwargs for subclass compatibility
+        for key, value in kwargs.items():
+            setattr(self, key, value)
     
     def decompose_task(self, main_task: str, context: Dict[str, Any] = None) -> List[Dict[str, Any]]:
         """
@@ -34,7 +68,7 @@ class MasterAgent:
         
         context_str = ""
         if context:
-            context_str = f"\nAdditional Context:\n{json.dumps(context, indent=2)}"
+            context_str = f"\nAdditional Context:\n{json.dumps(context, indent=2, default=str)}"
         
         # Build a detailed prompt that enforces context preservation
         prompt = f"""You are a master coordinator for a computational pipeline. Break down this high-level task into specific, actionable subtasks.
@@ -72,6 +106,7 @@ Return a JSON array of subtasks. Each subtask must have this structure:
     "description": "Detailed description preserving ALL specifics from original task",
     "language": "python|r|bash|other",
     "packages": ["package1", "package2"],
+    "required_packages": ["package1", "package2"],
     "reference_scripts": ["path/to/script.py"],
     "input_files": ["path/to/input.h5ad"],
     "output_files": ["path/to/output.h5ad"],
@@ -98,6 +133,10 @@ Return ONLY the JSON array, no other text.
         
         # Filter out completed subtasks
         subtasks = self._filter_completed_subtasks(subtasks, extracted_context)
+        
+        # Initialize tracking
+        for st in subtasks:
+            self.subtask_status[st['id']] = {'status': 'pending', 'attempts': 0}
         
         agent_logger.log_task_start(
             agent_name=self.agent_id,
@@ -141,7 +180,8 @@ Return ONLY the JSON array, no other text.
             'scanpy', 'squidpy', 'anndata', 'pandas', 'numpy', 'scipy',
             'popv', 'popV', 'scvi', 'scvi-tools', 'cellxgene', 'leidenalg',
             'matplotlib', 'seaborn', 'plotly', 'umap', 'scikit-learn',
-            'harmony', 'bbknn', 'scanorama', 'mnnpy'
+            'harmony', 'bbknn', 'scanorama', 'mnnpy', 'celltypist',
+            'decoupler', 'omnipath', 'pydeseq2', 'gseapy', 'pyscenic'
         ]
         for pkg in python_packages:
             # Case-insensitive but preserve original case if found
@@ -225,6 +265,7 @@ Return ONLY the JSON array, no other text.
                     subtask.setdefault("id", f"subtask_{i+1}")
                     subtask.setdefault("status", "pending")
                     subtask.setdefault("attempts", 0)
+                    subtask.setdefault("dependencies", [])
                     
                     # Inherit context if not specified
                     if not subtask.get("language") and extracted_context.get("language"):
@@ -232,6 +273,10 @@ Return ONLY the JSON array, no other text.
                     
                     if not subtask.get("packages") and extracted_context.get("packages"):
                         subtask["packages"] = extracted_context["packages"]
+                    
+                    # Sync packages and required_packages
+                    if subtask.get("packages") and not subtask.get("required_packages"):
+                        subtask["required_packages"] = subtask["packages"]
                     
                     if not subtask.get("reference_scripts") and extracted_context.get("reference_scripts"):
                         subtask["reference_scripts"] = extracted_context["reference_scripts"]
@@ -295,6 +340,7 @@ Return ONLY the JSON array, no other text.
                 # Inherit from extracted context
                 "language": extracted_context.get("language"),
                 "packages": extracted_context.get("packages", []),
+                "required_packages": extracted_context.get("packages", []),
                 "reference_scripts": extracted_context.get("reference_scripts", []),
                 "input_files": extracted_context.get("input_files", []),
                 "output_files": extracted_context.get("output_files", []),
@@ -332,6 +378,19 @@ Return ONLY the JSON array, no other text.
         
         return filtered
     
+    def mark_subtask_complete(self, task_id: str, result: Dict = None):
+        """Mark a subtask as complete"""
+        if task_id in self.subtask_status:
+            self.subtask_status[task_id]['status'] = 'completed'
+            self.subtask_status[task_id]['result'] = result
+    
+    def mark_subtask_failed(self, task_id: str, result: Dict = None):
+        """Mark a subtask as failed"""
+        if task_id in self.subtask_status:
+            self.subtask_status[task_id]['status'] = 'failed'
+            self.subtask_status[task_id]['result'] = result
+            self.subtask_status[task_id]['attempts'] += 1
+    
     def review_failure(self, subtask: Dict, failure_info: Dict) -> Dict[str, Any]:
         """
         Review a failed subtask and decide next steps, preserving context.
@@ -349,7 +408,7 @@ Subtask Context:
         prompt = f"""
 A subtask has failed after {failure_info.get('attempts', 1)} attempt(s).
 
-Subtask: {subtask['description']}
+Subtask: {subtask.get('description', subtask.get('title', 'Unknown'))}
 Success Criteria: {subtask.get('success_criteria', 'Not specified')}
 
 {context_summary}
@@ -381,8 +440,8 @@ Respond in JSON:
     "sub_subtasks": ["if SPLIT, list smaller tasks"],
     "preserved_context": {{
         "language": "{subtask.get('language')}",
-        "packages": {subtask.get('packages', [])},
-        "reference_scripts": {subtask.get('reference_scripts', [])}
+        "packages": {json.dumps(subtask.get('packages', []))},
+        "reference_scripts": {json.dumps(subtask.get('reference_scripts', []))}
     }}
 }}
 """
@@ -396,7 +455,7 @@ Respond in JSON:
                 
                 agent_logger.log_reflection(
                     agent_name=self.agent_id,
-                    task_id=subtask['id'],
+                    task_id=subtask.get('id', 'unknown'),
                     reflection=f"Master decision: {decision.get('decision')} - {decision.get('reasoning')}"
                 )
                 
@@ -413,17 +472,24 @@ Respond in JSON:
     def generate_final_report(self, main_task: str, subtask_results: List[Dict]) -> str:
         """Generate comprehensive report from all subtask results"""
         
-        results_summary = "\n".join([
-            f"- {r['task_id']}: {r.get('result', {}).get('output', 'No output')[:200]}"
-            for r in subtask_results
-            if r.get('success')
-        ])
+        # Build results summary
+        results_summary = []
+        for r in subtask_results:
+            if r.get('success') or r.get('status') == 'completed':
+                task_id = r.get('task_id', r.get('id', 'unknown'))
+                output = r.get('result', {}).get('output', r.get('report', {}).get('summary', 'No output'))
+                if isinstance(output, dict):
+                    output = str(output)
+                results_summary.append(f"- {task_id}: {output[:200]}")
+        
+        results_str = "\n".join(results_summary) if results_summary else "No completed subtasks"
         
         # Extract tools used
         all_packages = set()
         for r in subtask_results:
-            if r.get('packages'):
-                all_packages.update(r['packages'])
+            packages = r.get('packages', [])
+            if packages:
+                all_packages.update(packages)
         
         prompt = f"""
 Generate a comprehensive final report for this completed project.
@@ -431,7 +497,7 @@ Generate a comprehensive final report for this completed project.
 Original Task: {main_task}
 
 Completed Subtasks:
-{results_summary}
+{results_str}
 
 Tools/Packages Used: {', '.join(all_packages) if all_packages else 'Not tracked'}
 
