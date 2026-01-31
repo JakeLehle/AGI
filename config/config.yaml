@@ -1,23 +1,131 @@
-# Multi-Agent System Configuration
-# Supports multiple SLURM clusters with different configurations
+# Multi-Agent System Configuration v2
+# Supports script-first architecture with token-based context management
 
+# =============================================================================
 # Ollama Settings
+# =============================================================================
 ollama:
-  model: "llama3.1:8b"    # Use "llama3.1:8b" for CPU testing
+  model: "llama3.1:70b"    # Use "llama3.1:8b" for CPU testing
   base_url: "http://127.0.0.1:11434"
-  context_length: 4096
+  # Note: context_length is now managed by context_manager, not here
+  # The model's actual context length should be >= max_tokens_per_task
+  model_context_length: 128000  # llama3.1:70b supports 128K
 
-# Agent Settings
+# =============================================================================
+# Context Management (NEW in v2)
+# Replaces iteration-based limits with token-based context windows
+# =============================================================================
+context:
+  # Maximum tokens per SubAgent context window
+  # Each task gets this much "thinking space" before context exhaustion
+  max_tokens_per_task: 70000
+  
+  # Maximum tokens for any single tool output (logs, file contents, etc.)
+  # Larger outputs are automatically paginated
+  max_tool_output_tokens: 25000
+  
+  # Minimum tokens needed to attempt another iteration
+  # If remaining < this, task is marked for skip/escalate
+  min_tokens_to_continue: 10000
+  
+  # Target size for history summaries when truncating
+  summary_target_tokens: 2000
+  
+  # Token estimation: characters per token (4 is conservative for LLaMA)
+  chars_per_token: 4
+  
+  # Enable automatic history summarization when context fills
+  auto_summarize: true
+  
+  # Percentage of context to keep as recent history (rest gets summarized)
+  recent_history_percent: 30
+
+# =============================================================================
+# Agent Settings (Updated for v2)
+# =============================================================================
 agents:
-  max_retries: 12
+  # Legacy setting - kept for backward compatibility but NOW IGNORED
+  # Context exhaustion (not iteration count) determines retry limits
+  max_retries: 12  # DEPRECATED: Use context.max_tokens_per_task instead
+  
   timeout_seconds: 300
   enable_dynamic_tools: true
+  
+  # Script-first settings (NEW in v2)
+  script_first:
+    enabled: true
+    
+    # Always generate scripts (vs interactive completion)
+    always_generate_script: true
+    
+    # Script output directory (relative to project)
+    scripts_dir: "scripts"
+    
+    # Add standard headers to generated scripts
+    add_script_headers: true
+    
+    # Verify outputs exist after script execution
+    verify_outputs: true
+    
+    # Maximum script generation attempts per task
+    max_script_generations: 5
+  
+  # Supported languages for script generation
   supported_languages:
     - python
     - r
     - bash
     - perl
-    - java
+  
+  # Language detection keywords
+  language_detection:
+    python:
+      - "scanpy"
+      - "pandas"
+      - "numpy"
+      - "anndata"
+      - "popv"
+      - "squidpy"
+      - ".py"
+      - "h5ad"
+    r:
+      - "seurat"
+      - "bioconductor"
+      - "SingleR"
+      - ".R"
+      - "Rscript"
+    bash:
+      - "bash"
+      - "shell"
+      - ".sh"
+
+# =============================================================================
+# Master Prompt Document (NEW in v2)
+# Living document that tracks pipeline state
+# =============================================================================
+master_document:
+  enabled: true
+  
+  # State persistence file (JSON)
+  state_file: "reports/master_prompt_state.json"
+  
+  # Human-readable status (Markdown)
+  status_file: "reports/pipeline_status.md"
+  
+  # Auto-save after each step completion/failure
+  auto_save: true
+  
+  # Include in final report
+  include_in_report: true
+  
+  # Track these fields per step
+  track_fields:
+    - script_path
+    - output_files
+    - conda_env_yaml
+    - error_summary
+    - attempts
+    - context_tokens_used
 
 # =============================================================================
 # SLURM Configuration
@@ -26,15 +134,34 @@ slurm:
   enabled: true
   
   # Default cluster to use (can be overridden with --cluster CLI option)
-  # Options: "zeus" or "gpu_cluster"
   default_cluster: "zeus"
   
-  # Polling settings (shared across clusters)
+  # Polling settings
   poll_interval: 10       # Seconds between job status checks
   max_poll_attempts: 720  # Max attempts (2 hours at 10s intervals)
   
   # Job naming prefix
   job_prefix: "agi"
+  
+  # Script-first specific settings (NEW in v2)
+  script_submission:
+    # Generate sbatch scripts (vs direct srun)
+    use_sbatch: true
+    
+    # Save sbatch scripts for debugging/resubmission
+    save_sbatch_scripts: true
+    
+    # Directory for sbatch scripts
+    sbatch_dir: "slurm/scripts"
+    
+    # Directory for job logs
+    logs_dir: "slurm/logs"
+    
+    # Wait for job completion (vs fire-and-forget)
+    wait_for_completion: true
+    
+    # Timeout for waiting (0 = use max_poll_attempts * poll_interval)
+    wait_timeout_seconds: 0
 
 # =============================================================================
 # Cluster Configurations
@@ -242,13 +369,26 @@ clusters:
     sbatch_extras: []
 
 # =============================================================================
-# Parallel Execution Settings
+# Parallel Execution Settings (Updated for v2)
 # =============================================================================
 parallel:
   enabled: true
-  max_threads: 4
-  max_batch_size: 5
+  
+  # Maximum parallel SLURM jobs to submit at once
   max_parallel_jobs: 10
+  
+  # Thread pool size for local parallel operations
+  max_threads: 4
+  
+  # Maximum tasks to batch together
+  max_batch_size: 5
+  
+  # Strategy for identifying parallel tasks
+  # Options: "dependency_based", "all_pending", "manual"
+  parallel_strategy: "dependency_based"
+  
+  # Minimum tasks to trigger parallel mode (otherwise sequential)
+  min_tasks_for_parallel: 2
 
 # =============================================================================
 # Sandbox Settings
@@ -259,7 +399,9 @@ sandbox:
     - data
     - data/inputs
     - data/outputs
+    - data/outputs/analysis
     - scripts
+    - scripts/generated      # NEW: For auto-generated scripts
     - logs
     - envs
     - reports
@@ -269,18 +411,53 @@ sandbox:
     - slurm/logs
 
 # =============================================================================
-# Conda Environment Settings
+# Conda Environment Settings (Updated for v2)
 # =============================================================================
 conda:
   env_prefix: "agi_"
   default_python: "3.10"
   auto_export_yaml: true
   auto_cleanup: false
+  
+  # NEW in v2: Task-specific environments
+  task_specific_envs:
+    enabled: true
+    # Create separate env for each task (vs shared project env)
+    per_task: true
+    # Naming pattern for task envs
+    naming_pattern: "task_{task_id}_{date}"
+    # Export YAML for each task env
+    export_yaml: true
+    # YAML output directory
+    yaml_dir: "envs"
+  
   channels:
     - defaults
     - conda-forge
     - bioconda
     - pytorch  # For GPU jobs
+  
+  # Package mapping: common names -> conda packages
+  # Helps with automatic environment creation
+  package_mapping:
+    scanpy: "conda-forge::scanpy"
+    squidpy: "conda-forge::squidpy"
+    anndata: "conda-forge::anndata"
+    pandas: "conda-forge::pandas"
+    numpy: "conda-forge::numpy"
+    scipy: "conda-forge::scipy"
+    matplotlib: "conda-forge::matplotlib"
+    seaborn: "conda-forge::seaborn"
+    scikit-learn: "conda-forge::scikit-learn"
+  
+  # Packages that must be installed via pip (not in conda)
+  pip_only_packages:
+    - popv
+    - popV
+    - scvi-tools
+    - cellxgene
+    - celltypist
+    - decoupler
 
 # =============================================================================
 # Logging
@@ -289,11 +466,18 @@ logging:
   level: "INFO"
   json_format: true
   console_output: true
+  
+  # Log files
   files:
     - execution_log.jsonl
     - agent_activity.jsonl
     - slurm_jobs.jsonl
     - errors.jsonl
+    - context_usage.jsonl    # NEW: Track token usage
+  
+  # NEW in v2: Context tracking
+  track_context_usage: true
+  log_token_estimates: true
 
 # =============================================================================
 # Git Integration
@@ -302,6 +486,10 @@ git:
   auto_commit: true
   commit_on_success: true
   tag_failures: true
+  
+  # NEW in v2: Commit generated scripts
+  commit_scripts: true
+  commit_conda_yamls: true
 
 # =============================================================================
 # Documentation
@@ -310,24 +498,96 @@ documentation:
   auto_generate_readme: true
   update_frequency: "on_completion"
   include_code_samples: true
+  
   reports:
     - task_summary
     - environment_summary
     - execution_log
     - slurm_job_summary
+    - pipeline_status      # NEW: From master document
+    - context_usage        # NEW: Token usage report
+    - script_inventory     # NEW: List of generated scripts
 
 # =============================================================================
-# Workflow
+# Workflow (Updated for v2)
 # =============================================================================
 workflow:
   enable_checkpointing: true
   checkpoint_frequency: "per_subtask"
   max_execution_time_minutes: 480
-
+  
+  # Master document settings
+  master_document:
+    enabled: true
+    persist_state: true
+    resume_from_state: true  # Resume pipeline from saved state on restart
+  
   subtask:
-    max_iterations: 12
+    # DEPRECATED: max_iterations is now ignored
+    # Context exhaustion determines retry limits
+    max_iterations: 12  # IGNORED - kept for backward compatibility
+    
+    # NEW: Token-based settings (override context.* if specified)
+    # max_context_tokens: 70000  # Uncomment to override
+    # min_tokens_to_continue: 10000  # Uncomment to override
+    
     require_final_report: true
     report_on_failure: true
+    
+    # NEW in v2: Script-first behavior
+    generate_script: true
+    submit_via_slurm: true
+    verify_outputs: true
+    
+    # Failure handling
+    on_context_exhausted: "skip"  # Options: "skip", "escalate", "retry_with_summary"
+    on_unrecoverable_error: "skip"  # Options: "skip", "escalate", "abort"
+
+# =============================================================================
+# Failure Diagnosis (NEW in v2)
+# Automatic error pattern detection and recovery
+# =============================================================================
+failure_diagnosis:
+  enabled: true
+  
+  # Error patterns and their recovery strategies
+  patterns:
+    missing_package:
+      regex: "ModuleNotFoundError: No module named ['\"]([\\w]+)['\"]"
+      recoverable: true
+      action: "add_package_and_retry"
+    
+    missing_file:
+      regex: "FileNotFoundError:.*['\"]([^\"']+)['\"]"
+      recoverable: true
+      action: "check_paths_and_retry"
+    
+    out_of_memory:
+      regex: "MemoryError|OutOfMemoryError|OOM"
+      recoverable: true
+      action: "increase_memory_and_retry"
+      memory_multiplier: 2.0
+    
+    gpu_memory:
+      regex: "CUDA out of memory|CUDA error"
+      recoverable: true
+      action: "reduce_batch_or_use_cpu"
+    
+    permission_error:
+      regex: "Permission denied"
+      recoverable: false
+      action: "escalate"
+    
+    timeout:
+      regex: "Timeout|exceeded time limit"
+      recoverable: true
+      action: "increase_time_and_retry"
+      time_multiplier: 2.0
+    
+    syntax_error:
+      regex: "SyntaxError|IndentationError"
+      recoverable: true
+      action: "regenerate_script"
 
 # =============================================================================
 # Web Search
@@ -345,3 +605,53 @@ prompts:
   prompts_dir: "prompts"
   archive_prompts: true
   naming_pattern: "prompt_{timestamp}_{task_hash}.txt"
+
+# =============================================================================
+# Resource Defaults by Task Type (NEW in v2)
+# Automatic resource selection based on task characteristics
+# =============================================================================
+resource_profiles:
+  # Default profile
+  default:
+    cpus: 4
+    memory: "16G"
+    time: "04:00:00"
+    gpus: 0
+    partition: null  # Use cluster default
+  
+  # Single-cell analysis (high memory)
+  single_cell:
+    keywords: ["scanpy", "anndata", "h5ad", "scRNA", "single-cell"]
+    cpus: 8
+    memory: "64G"
+    time: "08:00:00"
+    gpus: 0
+    partition: null
+  
+  # Deep learning (GPU required)
+  deep_learning:
+    keywords: ["torch", "tensorflow", "scvi", "popv", "neural", "model training"]
+    cpus: 8
+    memory: "64G"
+    time: "12:00:00"
+    gpus: 1
+    gpu_type: "v100"
+    partition: "gpu1v100"
+  
+  # Large-scale analysis (high memory + long time)
+  large_scale:
+    keywords: ["whole genome", "million cells", "large dataset", "batch processing"]
+    cpus: 16
+    memory: "256G"
+    time: "24:00:00"
+    gpus: 0
+    partition: "bigmem"
+  
+  # Quick tasks (minimal resources)
+  quick:
+    keywords: ["convert", "rename", "copy", "simple", "quick"]
+    cpus: 2
+    memory: "8G"
+    time: "01:00:00"
+    gpus: 0
+    partition: null
