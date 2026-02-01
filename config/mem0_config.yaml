@@ -1,0 +1,91 @@
+# =============================================================================
+# Mem0 Configuration for AGI Pipeline v3
+# =============================================================================
+# Fully self-hosted: Embedded Qdrant + Ollama (no external APIs)
+#
+# Environment Variables:
+#   AGI_DATA_DIR - Base directory for data storage (default: ~/agi_data)
+#   OLLAMA_BASE_URL - Ollama server URL (default: http://localhost:11434)
+# =============================================================================
+
+version: "v1.1"
+
+# -----------------------------------------------------------------------------
+# Vector Store: Embedded Qdrant (file-based, no container needed)
+# -----------------------------------------------------------------------------
+vector_store:
+  provider: "qdrant"
+  config:
+    # Embedded mode - just a directory path, no server needed
+    path: "${AGI_DATA_DIR}/qdrant_storage"
+    
+    # Collection for reflexion memory
+    collection_name: "agi_reflexion_memory"
+    
+    # Must match embedding model output dimensions
+    # nomic-embed-text = 768 dimensions
+    embedding_model_dims: 768
+    
+    # Persist to disk (survives restarts)
+    on_disk: true
+
+# -----------------------------------------------------------------------------
+# LLM: Ollama (for memory extraction/summarization)
+# -----------------------------------------------------------------------------
+# Using smaller model for memory ops to keep main model free for agents
+llm:
+  provider: "ollama"
+  config:
+    model: "llama3.1:8b"
+    temperature: 0
+    max_tokens: 2000
+    ollama_base_url: "${OLLAMA_BASE_URL}"
+
+# -----------------------------------------------------------------------------
+# Embedder: Ollama with nomic-embed-text
+# -----------------------------------------------------------------------------
+embedder:
+  provider: "ollama"
+  config:
+    model: "nomic-embed-text"
+    ollama_base_url: "${OLLAMA_BASE_URL}"
+
+# -----------------------------------------------------------------------------
+# History Database: SQLite for memory operation history
+# -----------------------------------------------------------------------------
+history_db_path: "${AGI_DATA_DIR}/mem0_history.db"
+
+# -----------------------------------------------------------------------------
+# Custom Prompts for AGI-Specific Memory Extraction
+# -----------------------------------------------------------------------------
+custom_fact_extraction_prompt: |
+  You are a memory extraction system for an AI agent pipeline. Extract key facts
+  from this interaction that would help prevent repeated failures and enable
+  solution reuse.
+  
+  Focus on extracting:
+  1. Error patterns - What went wrong and why
+  2. Approaches tried - What was attempted (successful or not)
+  3. Environment details - Conda env, Python version, packages, paths
+  4. Solutions that worked - Fixes that resolved issues
+  5. Configuration issues - Settings that caused problems
+  
+  Be specific and actionable. Each fact should be independently useful.
+  
+  Input: {input}
+  
+  Extract facts as a JSON list of strings.
+
+custom_update_memory_prompt: |
+  Update the existing memory with new information from this interaction.
+  
+  Rules:
+  - If new info contradicts old info, prefer the newer information
+  - If a solution is found, mark related failure memories as resolved
+  - Preserve error patterns even after resolution (for future reference)
+  - Keep approach descriptions specific enough to detect duplicates
+  
+  Existing memory: {existing_memory}
+  New information: {new_memory}
+  
+  Return the updated memory.
