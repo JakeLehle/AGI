@@ -1,16 +1,18 @@
 """
-LangGraph Workflow - Script-First Architecture
+LangGraph Workflow - Script-First Architecture with Reflexion Memory
 
 Orchestrates multi-agent system with:
 - Token-based context limits (70K per agent) instead of iteration counts
 - Parallel SLURM job submission for independent tasks
 - Script generation and execution paradigm
 - Living document master prompt management
+- **Reflexion Memory for loop prevention** (NEW)
 
 Key changes from iteration-based:
 - SubAgents generate scripts, submit SLURM jobs, monitor completion
 - Context window exhaustion (not iteration count) determines retry limits
 - Master document tracks pipeline state across invocations
+- Reflexion Engine prevents infinite loops via semantic similarity detection
 """
 
 from typing import TypedDict, Annotated, List, Dict, Any, Optional
@@ -20,6 +22,7 @@ import uuid
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+import logging
 
 from langgraph.graph import StateGraph, END
 try:
@@ -39,6 +42,21 @@ from utils.logging_config import agent_logger
 from utils.git_tracker import git_tracker
 from utils.documentation import doc_generator
 from utils.context_manager import ContextManager
+
+# ============================================================================
+# REFLEXION MEMORY INTEGRATION
+# ============================================================================
+from utils.reflexion_integration import (
+    ReflexionState,
+    create_initial_reflexion_state,
+    handle_failure as reflexion_handle_failure,
+    check_before_retry,
+    record_solution,
+    find_similar_solutions,
+    get_memory_client,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class WorkflowState(TypedDict):
@@ -76,17 +94,22 @@ class WorkflowState(TypedDict):
     final_report: str
     status: str
     master_decision: Dict[str, Any]
+    
+    # ========== REFLEXION MEMORY STATE (NEW) ==========
+    reflexion: ReflexionState
+    task_attempt_counts: Dict[str, int]  # task_id -> attempt count
 
 
 class MultiAgentWorkflow:
     """
-    LangGraph workflow with script-first architecture.
+    LangGraph workflow with script-first architecture and reflexion memory.
     
     Key features:
     - Token-based context limits (70K) instead of iteration counts
     - Parallel SLURM job submission
     - Script generation → SLURM submit → monitor paradigm
     - Living document master prompt
+    - **Reflexion Memory for semantic duplicate detection** (NEW)
     """
     
     # Token limits
@@ -101,7 +124,8 @@ class MultiAgentWorkflow:
         project_dir: str = None,
         use_slurm: bool = True,
         parallel_enabled: bool = True,
-        slurm_config: Dict[str, Any] = None
+        slurm_config: Dict[str, Any] = None,
+        use_reflexion_memory: bool = True  # NEW: Enable/disable reflexion
     ):
         self.ollama_model = ollama_model
         self.ollama_base_url = ollama_base_url
@@ -109,6 +133,7 @@ class MultiAgentWorkflow:
         self.use_slurm = use_slurm
         self.parallel_enabled = parallel_enabled
         self.slurm_config = slurm_config or {}
+        self.use_reflexion_memory = use_reflexion_memory
         
         # Initialize sandbox
         self.sandbox = Sandbox(self.project_dir)
@@ -145,6 +170,16 @@ class MultiAgentWorkflow:
         # Thread lock for parallel execution
         self._lock = threading.Lock()
         
+        # ========== REFLEXION MEMORY CLIENT (NEW) ==========
+        self.memory_client = None
+        if use_reflexion_memory:
+            try:
+                self.memory_client = get_memory_client()
+                logger.info("Reflexion memory enabled")
+            except Exception as e:
+                logger.warning(f"Failed to initialize reflexion memory: {e}")
+                self.use_reflexion_memory = False
+        
         # Build workflow
         self.workflow = self._build_workflow()
         
@@ -168,6 +203,7 @@ class MultiAgentWorkflow:
         workflow.add_node("execute_sequential", self.execute_sequential)
         workflow.add_node("wait_for_jobs", self.wait_for_parallel_jobs)
         workflow.add_node("handle_results", self.handle_results)
+        workflow.add_node("reflexion_check", self.reflexion_check)  # NEW
         workflow.add_node("master_review", self.master_review)
         workflow.add_node("generate_report", self.generate_final_report)
         workflow.add_node("cleanup", self.cleanup)
@@ -195,14 +231,25 @@ class MultiAgentWorkflow:
         # After sequential execution
         workflow.add_edge("execute_sequential", "handle_results")
         
-        # After handling results
+        # After handling results - go through reflexion check first (NEW)
         workflow.add_conditional_edges(
             "handle_results",
             self.route_after_execution,
             {
                 "next_batch": "identify_parallel",
-                "review": "master_review",
+                "review": "reflexion_check",  # Changed: go to reflexion first
                 "complete": "generate_report"
+            }
+        )
+        
+        # After reflexion check (NEW)
+        workflow.add_conditional_edges(
+            "reflexion_check",
+            self.route_after_reflexion,
+            {
+                "apply_solution": "execute_sequential",  # Apply known fix
+                "escalate": "generate_report",           # Give up
+                "master_review": "master_review",        # Let master decide
             }
         )
         
@@ -238,7 +285,8 @@ class MultiAgentWorkflow:
         agent_logger.log_workflow_event("setup_complete", {
             "env_name": env_name,
             "use_slurm": self.use_slurm,
-            "parallel_enabled": self.parallel_enabled
+            "parallel_enabled": self.parallel_enabled,
+            "reflexion_enabled": self.use_reflexion_memory  # NEW
         })
         
         return {
@@ -247,7 +295,9 @@ class MultiAgentWorkflow:
             "use_slurm": self.use_slurm,
             "parallel_enabled": self.parallel_enabled,
             "agent_context_status": {},
-            "running_jobs": {}
+            "running_jobs": {},
+            "reflexion": create_initial_reflexion_state(),  # NEW
+            "task_attempt_counts": {}  # NEW
         }
     
     def master_decompose(self, state: WorkflowState) -> Dict:
@@ -324,6 +374,21 @@ class MultiAgentWorkflow:
         for subtask in batch:
             task_id = subtask['id']
             
+            # ========== CHECK REFLEXION MEMORY BEFORE RETRY (NEW) ==========
+            if self.use_reflexion_memory and subtask.get('context', {}).get('retry_reason'):
+                proposed_approach = subtask.get('context', {}).get('retry_reason', '')
+                check = check_before_retry(task_id, proposed_approach)
+                
+                if not check["allowed"]:
+                    logger.warning(
+                        f"Task {task_id}: Proposed approach rejected as duplicate "
+                        f"(similarity: {check['similarity']:.2f})"
+                    )
+                    # Modify the approach or add context
+                    subtask['context'] = subtask.get('context', {})
+                    subtask['context']['avoid_approach'] = check['similar_approach']
+                    subtask['context']['duplicate_warning'] = True
+            
             # Mark as running in master document
             self.master.master_document.mark_running(task_id)
             
@@ -341,8 +406,6 @@ class MultiAgentWorkflow:
             )
             
             # Generate script and submit (don't wait)
-            # This is a simplified version - full implementation would
-            # separate script generation from job submission
             result = agent.execute(subtask, env_name=env_name)
             
             if result.get('job_id'):
@@ -407,6 +470,21 @@ class MultiAgentWorkflow:
         
         task_id = subtask['id']
         
+        # ========== CHECK FOR KNOWN SOLUTIONS FIRST (NEW) ==========
+        if self.use_reflexion_memory:
+            # Check if we have a known solution for similar errors
+            previous_error = subtask.get('context', {}).get('previous_error')
+            if previous_error:
+                solutions = find_similar_solutions(previous_error)
+                if solutions and solutions[0].get('score', 0) > 0.8:
+                    logger.info(
+                        f"Task {task_id}: Found known solution "
+                        f"(score: {solutions[0]['score']:.2f})"
+                    )
+                    subtask['context'] = subtask.get('context', {})
+                    subtask['context']['suggested_solution'] = solutions[0].get('solution')
+                    subtask['context']['solution_confidence'] = solutions[0].get('score')
+        
         # Mark as running
         self.master.master_document.mark_running(task_id)
         
@@ -442,11 +520,15 @@ class MultiAgentWorkflow:
         results = state.get('parallel_results', [])
         completed = []
         failed = []
+        task_attempt_counts = state.get('task_attempt_counts', {})
         
         for item in results:
             subtask = item['subtask']
             result = item['result']
             task_id = subtask['id']
+            
+            # Update attempt count
+            task_attempt_counts[task_id] = task_attempt_counts.get(task_id, 0) + 1
             
             # Update subtask status
             subtask['last_result'] = result
@@ -457,6 +539,24 @@ class MultiAgentWorkflow:
                 
                 # Update master document
                 self.master.mark_subtask_complete(task_id, result)
+                
+                # ========== RECORD SOLUTION IF WE RECOVERED FROM FAILURE (NEW) ==========
+                if self.use_reflexion_memory:
+                    previous_error = subtask.get('context', {}).get('previous_error')
+                    if previous_error:
+                        # We succeeded after a failure - record the solution
+                        approach = subtask.get('context', {}).get('retry_reason', '')
+                        if approach:
+                            try:
+                                record_solution(
+                                    task_id=task_id,
+                                    problem_pattern=previous_error[:500],
+                                    error_type=state.get('reflexion', {}).get('last_error_type', 'unknown'),
+                                    solution=approach,
+                                )
+                                logger.info(f"Task {task_id}: Recorded solution for future reuse")
+                            except Exception as e:
+                                logger.warning(f"Failed to record solution: {e}")
                 
                 # Git commit
                 git_tracker.commit_task_attempt(
@@ -481,6 +581,30 @@ class MultiAgentWorkflow:
             else:
                 subtask['status'] = 'failed'
                 failed.append(subtask)
+                
+                # ========== STORE FAILURE IN REFLEXION MEMORY (NEW) ==========
+                if self.use_reflexion_memory:
+                    try:
+                        error_msg = result.get('error', 'Unknown error')
+                        approach = subtask.get('context', {}).get('retry_reason', subtask.get('description', ''))
+                        
+                        reflexion_state = reflexion_handle_failure(
+                            task_id=task_id,
+                            error_message=error_msg,
+                            approach_tried=approach,
+                            script_path=result.get('script_path'),
+                            slurm_job_id=result.get('job_id'),
+                        )
+                        
+                        # Store reflexion state for routing
+                        state['reflexion'] = reflexion_state
+                        
+                        logger.info(
+                            f"Task {task_id}: Reflexion decision: {reflexion_state['action']} "
+                            f"(attempts: {reflexion_state['attempt_count']})"
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to record failure in memory: {e}")
                 
                 # Update master document
                 self.master.mark_subtask_failed(task_id, result)
@@ -508,18 +632,91 @@ class MultiAgentWorkflow:
             "subtasks": updated_subtasks,
             "completed_subtasks": completed,
             "failed_subtasks": failed,
-            "parallel_results": []
+            "parallel_results": [],
+            "task_attempt_counts": task_attempt_counts
+        }
+    
+    # ========== NEW NODE: REFLEXION CHECK ==========
+    def reflexion_check(self, state: WorkflowState) -> Dict:
+        """
+        Check reflexion memory before master review.
+        
+        This node:
+        1. Checks if we've hit escalation thresholds
+        2. Looks for known solutions
+        3. Checks for duplicate approaches
+        """
+        failed = state.get('failed_subtasks', [])
+        reflexion = state.get('reflexion', {})
+        
+        if not failed or not self.use_reflexion_memory:
+            return {"reflexion": reflexion}
+        
+        subtask = failed[-1]
+        task_id = subtask['id']
+        result = subtask.get('last_result', {})
+        error_msg = result.get('error', '')
+        
+        # Check reflexion decision
+        action = reflexion.get('action', 'retry')
+        
+        if action == 'escalate':
+            # Hit escalation threshold
+            logger.warning(
+                f"Task {task_id}: Reflexion engine recommends escalation - "
+                f"{reflexion.get('reason')}"
+            )
+            reflexion['should_escalate'] = True
+            
+        elif action == 'apply_solution':
+            # We have a known solution
+            solution = reflexion.get('known_solution')
+            confidence = reflexion.get('solution_confidence', 0)
+            
+            logger.info(
+                f"Task {task_id}: Applying known solution (confidence: {confidence:.2f})"
+            )
+            
+            # Update subtask with solution
+            subtask['status'] = 'pending'
+            subtask['context'] = subtask.get('context', {})
+            subtask['context']['retry_reason'] = solution
+            subtask['context']['from_memory'] = True
+            subtask['context']['solution_confidence'] = confidence
+            
+            # Update in state
+            for st in state['subtasks']:
+                if st['id'] == task_id:
+                    st['status'] = 'pending'
+                    st['context'] = subtask['context']
+            
+            reflexion['should_apply_solution'] = True
+            
+        elif action == 'reject_duplicate':
+            # Approach was a duplicate
+            logger.warning(
+                f"Task {task_id}: Proposed approach was duplicate "
+                f"(similarity: {reflexion.get('similarity_score', 0):.2f})"
+            )
+            reflexion['is_duplicate'] = True
+        
+        return {
+            "reflexion": reflexion,
+            "subtasks": state['subtasks'],
+            "current_subtask": subtask if action == 'apply_solution' else None
         }
     
     def master_review(self, state: WorkflowState) -> Dict:
         """Master reviews failures"""
         failed = state.get('failed_subtasks', [])
+        reflexion = state.get('reflexion', {})
         
         if not failed:
             return {"master_decision": {"decision": "CONTINUE"}}
         
         subtask = failed[-1]
         result = subtask.get('last_result', {})
+        task_id = subtask['id']
         
         # Check context status - if exhausted, force skip
         context_status = result.get('context_status', {})
@@ -545,8 +742,47 @@ class MultiAgentWorkflow:
                 }
             }
         
+        # ========== CHECK REFLEXION RECOMMENDATION (NEW) ==========
+        if reflexion.get('should_escalate'):
+            agent_logger.log_reflection(
+                agent_name="master",
+                task_id=task_id,
+                reflection=f"Reflexion engine recommends escalation: {reflexion.get('reason')}"
+            )
+            return {
+                "master_decision": {
+                    "decision": "ESCALATE",
+                    "reasoning": reflexion.get('reason', 'Too many failed attempts')
+                }
+            }
+        
+        if reflexion.get('is_duplicate'):
+            # Need a genuinely different approach
+            agent_logger.log_reflection(
+                agent_name="master",
+                task_id=task_id,
+                reflection=f"Previous approach was duplicate, need different strategy"
+            )
+            # Add context for master to generate different approach
+            result['duplicate_warning'] = True
+            result['similar_approach'] = reflexion.get('similar_approach', '')
+        
         # Normal master review
         decision = self.master.review_failure(subtask, result)
+        
+        # ========== VALIDATE RETRY APPROACH AGAINST MEMORY (NEW) ==========
+        if decision['decision'] == 'RETRY' and self.use_reflexion_memory:
+            proposed = decision.get('modification', '')
+            if proposed:
+                check = check_before_retry(task_id, proposed)
+                if not check['allowed']:
+                    logger.warning(
+                        f"Task {task_id}: Master's proposed approach is too similar to previous "
+                        f"(similarity: {check['similarity']:.2f}). Requesting different approach."
+                    )
+                    # Ask master to try again with different approach
+                    result['must_avoid'] = check['similar_approach']
+                    decision = self.master.review_failure(subtask, result)
         
         if decision['decision'] == 'RETRY':
             # Update subtask for retry
@@ -584,6 +820,23 @@ class MultiAgentWorkflow:
                 context_summary += f"- {agent_id}: {usage_pct:.1f}% context used\n"
         
         report += context_summary
+        
+        # ========== ADD REFLEXION MEMORY SUMMARY (NEW) ==========
+        if self.use_reflexion_memory:
+            try:
+                memory_summary = "\n\n## Reflexion Memory Summary\n\n"
+                for task_id, count in state.get('task_attempt_counts', {}).items():
+                    memory_summary += f"- {task_id}: {count} attempt(s)\n"
+                
+                # Get overall stats
+                client = get_memory_client()
+                stats = client._engine.get_stats() if hasattr(client, '_engine') else {}
+                if stats:
+                    memory_summary += f"\nTotal memories stored: {stats.get('memory', {}).get('total', 'N/A')}\n"
+                
+                report += memory_summary
+            except Exception as e:
+                logger.warning(f"Failed to add memory summary: {e}")
         
         # Save documentation
         doc_generator.save_readme()
@@ -654,6 +907,18 @@ class MultiAgentWorkflow:
         
         return "complete"
     
+    # ========== NEW ROUTING FUNCTION ==========
+    def route_after_reflexion(self, state: WorkflowState) -> str:
+        """Route after reflexion check"""
+        reflexion = state.get('reflexion', {})
+        
+        if reflexion.get('should_escalate'):
+            return "escalate"
+        elif reflexion.get('should_apply_solution'):
+            return "apply_solution"
+        else:
+            return "master_review"
+    
     def route_after_review(self, state: WorkflowState) -> str:
         """Route after master review"""
         decision = state.get('master_decision', {})
@@ -706,7 +971,9 @@ class MultiAgentWorkflow:
             "parallel_enabled": self.parallel_enabled,
             "final_report": "",
             "status": "started",
-            "master_decision": {}
+            "master_decision": {},
+            "reflexion": create_initial_reflexion_state(),  # NEW
+            "task_attempt_counts": {}  # NEW
         }
         
         final_state = self.app.invoke(
