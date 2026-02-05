@@ -183,9 +183,9 @@ if echo "$MODELS" | grep -qE "(llama3|mistral|qwen)"; then
     echo -e "  ${GREEN}✓${NC} LLM model available"
 else
     echo -e "  ${YELLOW}!${NC} No standard LLM found"
-    echo "  Pulling llama3.1:8b (recommended for memory operations)..."
-    ollama pull llama3.1:8b
-    echo -e "  ${GREEN}✓${NC} llama3.1:8b pulled"
+    echo "  Pulling llama3.1:70b (recommended for memory operations)..."
+    ollama pull llama3.1:70b
+    echo -e "  ${GREEN}✓${NC} llama3.1:70b pulled"
 fi
 
 # -----------------------------------------------------------------------------
