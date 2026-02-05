@@ -230,9 +230,12 @@ class ReflexionMemory:
         memory_text = self._failure_to_text(record)
         
         # Store with metadata for filtering
+        # infer=False skips LLM fact extraction (fast, ~100ms vs 30-60s)
+        # We don't need extraction since we're storing structured records
         result = self.memory.add(
             memory_text,
             user_id=self.FAILURES_USER,
+            infer=False,  # Skip LLM extraction for speed
             metadata={
                 "task_id": task_id,
                 "error_type": error_type.value if isinstance(error_type, FailureType) else error_type,
@@ -314,6 +317,7 @@ class ReflexionMemory:
         result = self.memory.add(
             memory_text,
             user_id=self.SOLUTIONS_USER,
+            infer=False,  # Skip LLM extraction for speed
             metadata={
                 "task_id": task_id,
                 "error_type": (

@@ -53,9 +53,9 @@ def get_default_config() -> Dict[str, Any]:
         "llm": {
             "provider": "ollama",
             "config": {
-                "model": "llama3.1:8b",
+                "model": "llama3.1:70b",
                 "temperature": 0,
-                "max_tokens": 2000,
+                "max_tokens": 60000,
                 "ollama_base_url": ollama_url,
             }
         },
