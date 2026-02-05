@@ -2,22 +2,30 @@
 LangGraph Workflow - Script-First Architecture with Reflexion Memory
 
 Orchestrates multi-agent system with:
-- Token-based context limits (70K per agent) instead of iteration counts
+- Token-based context limits (configurable, default 60K) instead of iteration counts
+- Each subtask gets its own persistent context window
 - Parallel SLURM job submission for independent tasks
 - Script generation and execution paradigm
 - Living document master prompt management
 - **Reflexion Memory for loop prevention** (NEW)
 
-Key changes from iteration-based:
+Key v3 architecture principles:
 - SubAgents generate scripts, submit SLURM jobs, monitor completion
 - Context window exhaustion (not iteration count) determines retry limits
+- Each subtask maintains its own context across ALL retries
+- Reflexion Engine prevents repeating semantically similar approaches
 - Master document tracks pipeline state across invocations
-- Reflexion Engine prevents infinite loops via semantic similarity detection
+
+Environment Variables:
+- AGI_MAX_CONTEXT_TOKENS: Max tokens per subtask (default: 60000)
+- AGI_MAX_TOOL_OUTPUT_TOKENS: Max tool output before summarization (default: 25000)
+- AGI_MIN_TOKENS_TO_CONTINUE: Min tokens to continue (default: 5000)
 """
 
 from typing import TypedDict, Annotated, List, Dict, Any, Optional
 from pathlib import Path
 import operator
+import os
 import uuid
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -105,16 +113,18 @@ class MultiAgentWorkflow:
     LangGraph workflow with script-first architecture and reflexion memory.
     
     Key features:
-    - Token-based context limits (70K) instead of iteration counts
+    - Token-based context limits (configurable via environment) instead of iteration counts
+    - Each subtask gets its own persistent context window
     - Parallel SLURM job submission
     - Script generation → SLURM submit → monitor paradigm
     - Living document master prompt
     - **Reflexion Memory for semantic duplicate detection** (NEW)
     """
     
-    # Token limits
-    MAX_CONTEXT_TOKENS = 70_000
-    MAX_TOOL_OUTPUT_TOKENS = 25_000
+    # Token limits - read from environment or use defaults
+    MAX_CONTEXT_TOKENS = int(os.environ.get('AGI_MAX_CONTEXT_TOKENS', 60000))
+    MAX_TOOL_OUTPUT_TOKENS = int(os.environ.get('AGI_MAX_TOOL_OUTPUT_TOKENS', 25000))
+    MIN_TOKENS_TO_CONTINUE = int(os.environ.get('AGI_MIN_TOKENS_TO_CONTINUE', 5000))
     
     def __init__(
         self,
@@ -179,6 +189,14 @@ class MultiAgentWorkflow:
             except Exception as e:
                 logger.warning(f"Failed to initialize reflexion memory: {e}")
                 self.use_reflexion_memory = False
+        
+        # Log token-based context limits
+        logger.info(
+            f"Token-based context limits: "
+            f"max={self.MAX_CONTEXT_TOKENS}, "
+            f"tool_output={self.MAX_TOOL_OUTPUT_TOKENS}, "
+            f"min_continue={self.MIN_TOKENS_TO_CONTINUE}"
+        )
         
         # Build workflow
         self.workflow = self._build_workflow()
@@ -722,7 +740,7 @@ class MultiAgentWorkflow:
         context_status = result.get('context_status', {})
         remaining_tokens = context_status.get('remaining_tokens', 10000)
         
-        if remaining_tokens < 5000:
+        if remaining_tokens < self.MIN_TOKENS_TO_CONTINUE:
             agent_logger.log_reflection(
                 agent_name="master",
                 task_id=subtask['id'],
@@ -897,7 +915,7 @@ class MultiAgentWorkflow:
         for f in failed:
             # Only review if context not exhausted
             context_status = f.get('last_result', {}).get('context_status', {})
-            if context_status.get('remaining_tokens', 10000) >= 5000:
+            if context_status.get('remaining_tokens', 10000) >= self.MIN_TOKENS_TO_CONTINUE:
                 return "review"
         
         # Check for more pending

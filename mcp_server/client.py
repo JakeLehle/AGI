@@ -285,8 +285,9 @@ class MemoryClient:
                 except ValueError:
                     pass
             
+            # Note: ReflexionMemory uses 'problem_description' as the parameter name
             return self._memory.get_working_solutions(
-                error_message=error_message,
+                problem_description=error_message,
                 error_type=ft,
                 limit=limit,
             )
