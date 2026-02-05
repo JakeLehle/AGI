@@ -178,16 +178,18 @@ def test_full_workflow_simulation():
 
 
 def test_memory_client_modes():
-    """Test that both direct and server modes work."""
+    """Test that direct mode works (reusing existing client)."""
     print("\n" + "=" * 50)
     print("TEST 5: Memory Client Modes")
     print("=" * 50)
     
-    from mcp_server.client import MemoryClient
+    # Reuse the singleton client to avoid Qdrant lock issues
+    # (embedded Qdrant only allows one client at a time)
+    from utils.reflexion_integration import get_memory_client
     
-    # Test direct mode
-    print("  Testing direct mode...")
-    client = MemoryClient(use_direct=True)
+    # Test direct mode using existing singleton
+    print("  Testing direct mode (singleton)...")
+    client = get_memory_client()
     result = client.classify_error("SyntaxError: invalid syntax")
     
     if result["error_type"] == "syntax_error":
@@ -203,6 +205,20 @@ def main():
     print("\n" + "=" * 50)
     print("  Reflexion Integration Test Suite")
     print("=" * 50)
+    
+    # Clean up test data from previous runs
+    print("\n  Cleaning up previous test data...")
+    try:
+        from utils.reflexion_integration import get_memory_client
+        client = get_memory_client()
+        for task_id in ["integration_test_1", "integration_test_2", "integration_test_3", "integration_test_4"]:
+            try:
+                client._memory.clear_task_memory(task_id)
+            except:
+                pass
+        print("  ✓ Cleanup complete\n")
+    except Exception as e:
+        print(f"  ⚠ Cleanup skipped: {e}\n")
     
     results = {}
     
