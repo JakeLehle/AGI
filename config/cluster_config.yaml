@@ -1,0 +1,191 @@
+# =============================================================================
+# AGI Pipeline - Cluster Configuration
+# =============================================================================
+# Place this file at: {AGI_ROOT}/config/cluster_config.yaml
+#
+# Set the cluster via environment variable in RUN_AGI_PIPELINE.sh:
+#   export AGI_CLUSTER="zeus_cpu"   # For CPU cluster
+#   export AGI_CLUSTER="gpu_v100"   # For GPU cluster
+# =============================================================================
+
+default_cluster: zeus_cpu
+
+clusters:
+
+  # ---------------------------------------------------------------------------
+  # Zeus CPU Cluster - Jake's high-memory CPU jobs
+  # ---------------------------------------------------------------------------
+  zeus_cpu:
+    name: "Zeus CPU Cluster"
+    description: "High-memory CPU cluster (up to 192 cores, 900GB RAM)"
+    
+    slurm:
+      partition: "normal"
+      account: "jlehle"
+      nodes: 1
+      ntasks: 1
+      cpus_per_task: 40        # Default for subtasks
+      memory: "64G"            # Default for subtasks
+      time: "08:00:00"         # Default for subtasks
+    
+    # Maximum limits for this cluster
+    limits:
+      max_cpus: 192
+      max_memory: "900G"
+      max_time: "7-00:00:00"
+    
+    gpu:
+      available: false
+
+  # ---------------------------------------------------------------------------
+  # GPU V100 Cluster
+  # ---------------------------------------------------------------------------
+  gpu_v100:
+    name: "GPU Cluster (V100)"
+    description: "GPU cluster with V100 cards"
+    
+    slurm:
+      partition: "gpu1v100"
+      account: "sdz852"
+      nodes: 1
+      ntasks: 1
+      cpus_per_task: 10
+      # NOTE: No memory specification for this cluster
+      time: "12:00:00"
+    
+    limits:
+      max_cpus: 40
+      max_time: "3-00:00:00"
+    
+    gpu:
+      available: true
+      default_count: 1
+      max_count: 4
+      type: "v100"
+      # Use --gpus N format (not --gres=gpu:N)
+      directive_format: "--gpus {count}"
+
+  # ---------------------------------------------------------------------------
+  # GPU A100 Cluster
+  # ---------------------------------------------------------------------------
+  gpu_a100:
+    name: "GPU Cluster (A100)"
+    description: "GPU cluster with A100 cards"
+    
+    slurm:
+      partition: "gpu1a100"
+      account: "sdz852"
+      nodes: 1
+      ntasks: 1
+      cpus_per_task: 16
+      time: "12:00:00"
+    
+    limits:
+      max_cpus: 64
+      max_time: "3-00:00:00"
+    
+    gpu:
+      available: true
+      default_count: 1
+      max_count: 8
+      type: "a100"
+      directive_format: "--gpus {count}"
+
+  # ---------------------------------------------------------------------------
+  # DGX A100 
+  # ---------------------------------------------------------------------------
+  dgx_a100:
+    name: "DGX A100"
+    description: "DGX system with A100 GPUs"
+    
+    slurm:
+      partition: "dgxa100"
+      account: "sdz852"
+      nodes: 1
+      ntasks: 1
+      cpus_per_task: 32
+      time: "24:00:00"
+    
+    limits:
+      max_cpus: 128
+      max_time: "7-00:00:00"
+    
+    gpu:
+      available: true
+      default_count: 1
+      max_count: 8
+      type: "a100"
+      directive_format: "--gpus {count}"
+
+
+# =============================================================================
+# Task Presets - Resource profiles for different task types
+# =============================================================================
+
+task_presets:
+  light:
+    cpus: 4
+    memory: "8G"
+    time: "01:00:00"
+    gpus: 0
+    
+  standard:
+    cpus: 16
+    memory: "32G"
+    time: "04:00:00"
+    gpus: 0
+    
+  heavy:
+    cpus: 40
+    memory: "128G"
+    time: "12:00:00"
+    gpus: 0
+    
+  maximum:
+    cpus: 96
+    memory: "500G"
+    time: "24:00:00"
+    gpus: 0
+
+  gpu_single:
+    cpus: 10
+    time: "08:00:00"
+    gpus: 1
+    
+  gpu_multi:
+    cpus: 20
+    time: "24:00:00"
+    gpus: 4
+
+
+# =============================================================================
+# Keyword Detection - Auto-select resources based on task description
+# =============================================================================
+
+keyword_detection:
+  gpu_required:
+    - "deep learning"
+    - "neural network"
+    - "pytorch"
+    - "tensorflow"
+    - "cuda"
+    - "gpu"
+    - "training"
+    - "embedding"
+    
+  heavy_memory:
+    - "single-cell"
+    - "scRNA"
+    - "anndata"
+    - "h5ad"
+    - "scanpy"
+    - "squidpy"
+    - "spatial"
+    - "large dataset"
+    - "genome-wide"
+    
+  light:
+    - "plot"
+    - "visualization"
+    - "summary"
+    - "report"

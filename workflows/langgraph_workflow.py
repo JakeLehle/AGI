@@ -42,7 +42,7 @@ except ImportError:
         MemorySaver = None
 
 from agents.master_agent import MasterAgent
-from agents.sub_agent import ScriptFirstSubAgent
+from agents.sub_agent import ScriptFirstSubAgentV3 as ScriptFirstSubAgent
 from tools.sandbox import Sandbox
 from tools.conda_tools import CondaTools
 from tools.slurm_tools import SlurmTools, SlurmConfig
