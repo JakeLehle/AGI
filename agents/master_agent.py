@@ -1,16 +1,26 @@
 """
-Master Agent with Living Document Management
+Master Agent v3.2 - Comprehensive Task Decomposition with Validation
+
+The master agent now follows a 3-phase approach:
+1. EXTRACTION: Parse the detailed prompt and extract EVERY step exactly as written
+2. EXPANSION: Expand each step into a comprehensive execution plan
+3. VALIDATION: Verify each plan captures the original step's full intent
+
+Key improvements over v3.1:
+- Multi-format step detection (numbered, checkboxes, headers, bullet points)
+- Preserves original step text verbatim alongside expanded plan
+- Validates expanded plans against original steps
+- Richer subtask format with original_text, expanded_plan, validation_status
+- Better handling of code snippets and implementation hints in prompts
 
 The master prompt serves as a living document that:
 1. Contains all pipeline steps with status
 2. Gets updated when subtasks complete (adds script paths)
 3. Gets updated when subtasks fail (adds error summaries)
 4. Maintains a comprehensive view of pipeline state
-
-Token-based context management for the master's coordination window.
 """
 
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from pathlib import Path
 import re
 import json
@@ -25,16 +35,20 @@ from utils.logging_config import agent_logger
 from utils.context_manager import ContextManager
 
 
+# =============================================================================
+# MASTER PROMPT DOCUMENT
+# =============================================================================
+
 class MasterPromptDocument:
     """
     Living document that tracks pipeline state.
     
     Structure:
-    - Pipeline overview
-    - Step definitions with status
-    - Completed steps with script paths and outputs
-    - Failed steps with error summaries
-    - Dependencies and relationships
+    - Original prompt (preserved verbatim)
+    - Extracted steps (parsed from original)
+    - Expanded plans (detailed execution plans)
+    - Validation status for each step
+    - Completion status with script paths and outputs
     """
     
     def __init__(self, original_prompt: str, project_dir: Path):
@@ -43,211 +57,157 @@ class MasterPromptDocument:
         self.created_at = datetime.now()
         self.last_updated = datetime.now()
         
-        # Step tracking
+        # Step tracking - now includes more detail
         self.steps: Dict[str, Dict] = {}  # step_id -> step info
         self.step_order: List[str] = []   # Ordered list of step IDs
         
-        # Parse original prompt to extract steps
-        self._parse_original_prompt()
+        # Extracted vs Expanded tracking
+        self.extracted_steps: List[Dict] = []  # Raw extracted steps
+        self.validation_results: Dict[str, Dict] = {}  # step_id -> validation
         
-        # Document path
+        # Document paths
         self.document_path = project_dir / "reports" / "master_prompt_state.json"
         self.markdown_path = project_dir / "reports" / "pipeline_status.md"
-    
-    def _parse_original_prompt(self):
-        """Extract steps from original prompt"""
-        # This is a simplified parser - could be more sophisticated
-        lines = self.original_prompt.split('\n')
-        step_count = 0
         
-        for line in lines:
-            # Look for numbered steps or task markers
-            step_match = re.match(r'^\s*(\d+)\.\s*(.+)', line)
-            if step_match:
-                step_count += 1
-                step_id = f"step_{step_count}"
-                self.steps[step_id] = {
-                    'id': step_id,
-                    'title': step_match.group(2).strip()[:100],
-                    'description': step_match.group(2).strip(),
-                    'status': 'pending',
-                    'attempts': 0,
-                    'script_path': None,
-                    'output_files': [],
-                    'error_summary': None,
-                    'created_at': datetime.now().isoformat()
-                }
-                self.step_order.append(step_id)
-            
-            # Look for checkbox items
-            checkbox_match = re.match(r'^\s*[-*]\s*\[([x\s])\]\s*(.+)', line, re.IGNORECASE)
-            if checkbox_match:
-                step_count += 1
-                step_id = f"step_{step_count}"
-                is_complete = checkbox_match.group(1).lower() == 'x'
-                self.steps[step_id] = {
-                    'id': step_id,
-                    'title': checkbox_match.group(2).strip()[:100],
-                    'description': checkbox_match.group(2).strip(),
-                    'status': 'completed' if is_complete else 'pending',
-                    'attempts': 0,
-                    'script_path': None,
-                    'output_files': [],
-                    'error_summary': None,
-                    'created_at': datetime.now().isoformat()
-                }
-                self.step_order.append(step_id)
+        # Ensure directories exist
+        self.document_path.parent.mkdir(parents=True, exist_ok=True)
     
-    def add_step(self, step_id: str, title: str, description: str, **kwargs):
-        """Add or update a step"""
-        if step_id not in self.steps:
-            self.step_order.append(step_id)
-        
+    def add_step(
+        self,
+        step_id: str,
+        title: str,
+        description: str,
+        original_text: str = "",  # NEW: Original step text from prompt
+        expanded_plan: str = "",  # NEW: Detailed execution plan
+        validation_status: str = "pending",  # NEW: pending, validated, needs_revision
+        packages: List[str] = None,
+        dependencies: List[str] = None,
+        code_hints: List[str] = None,  # NEW: Code snippets from original prompt
+    ):
+        """Add a step with full context preservation"""
         self.steps[step_id] = {
             'id': step_id,
             'title': title,
             'description': description,
-            'status': kwargs.get('status', 'pending'),
-            'attempts': kwargs.get('attempts', 0),
-            'script_path': kwargs.get('script_path'),
-            'output_files': kwargs.get('output_files', []),
-            'conda_env_yaml': kwargs.get('conda_env_yaml'),
-            'error_summary': kwargs.get('error_summary'),
-            'dependencies': kwargs.get('dependencies', []),
-            'packages': kwargs.get('packages', []),
-            'created_at': datetime.now().isoformat()
+            'original_text': original_text,
+            'expanded_plan': expanded_plan,
+            'validation_status': validation_status,
+            'status': 'pending',
+            'attempts': 0,
+            'script_path': None,
+            'output_files': [],
+            'error_summary': None,
+            'packages': packages or [],
+            'dependencies': dependencies or [],
+            'code_hints': code_hints or [],
+            'created_at': datetime.now().isoformat(),
+            'last_updated': datetime.now().isoformat()
         }
-        self.last_updated = datetime.now()
+        if step_id not in self.step_order:
+            self.step_order.append(step_id)
+        self._save()
     
-    def mark_complete(self, step_id: str, script_path: str, output_files: List[str], **kwargs):
-        """Mark a step as complete with its outputs"""
+    def mark_running(self, step_id: str):
+        """Mark step as currently running"""
+        if step_id in self.steps:
+            self.steps[step_id]['status'] = 'running'
+            self.steps[step_id]['last_updated'] = datetime.now().isoformat()
+            self._save()
+    
+    def mark_complete(self, step_id: str, script_path: str = None, output_files: List[str] = None):
+        """Mark step as complete with results"""
         if step_id in self.steps:
             self.steps[step_id]['status'] = 'completed'
             self.steps[step_id]['script_path'] = script_path
-            self.steps[step_id]['output_files'] = output_files
-            self.steps[step_id]['completed_at'] = datetime.now().isoformat()
-            self.steps[step_id].update(kwargs)
-            self.last_updated = datetime.now()
+            self.steps[step_id]['output_files'] = output_files or []
+            self.steps[step_id]['last_updated'] = datetime.now().isoformat()
             self._save()
     
-    def mark_failed(self, step_id: str, error_summary: str, attempts: int, **kwargs):
-        """Mark a step as failed with error information"""
+    def mark_failed(self, step_id: str, error_summary: str, attempts: int = 1, script_path: str = None):
+        """Mark step as failed with error info"""
         if step_id in self.steps:
             self.steps[step_id]['status'] = 'failed'
-            self.steps[step_id]['error_summary'] = error_summary
+            self.steps[step_id]['error_summary'] = error_summary[:1000]
             self.steps[step_id]['attempts'] = attempts
-            self.steps[step_id]['failed_at'] = datetime.now().isoformat()
-            self.steps[step_id].update(kwargs)
-            self.last_updated = datetime.now()
+            self.steps[step_id]['script_path'] = script_path
+            self.steps[step_id]['last_updated'] = datetime.now().isoformat()
             self._save()
     
-    def mark_running(self, step_id: str):
-        """Mark a step as currently running"""
+    def update_validation(self, step_id: str, status: str, issues: List[str] = None):
+        """Update validation status for a step"""
+        self.validation_results[step_id] = {
+            'status': status,
+            'issues': issues or [],
+            'validated_at': datetime.now().isoformat()
+        }
         if step_id in self.steps:
-            self.steps[step_id]['status'] = 'running'
-            self.steps[step_id]['started_at'] = datetime.now().isoformat()
-            self.last_updated = datetime.now()
-    
-    def get_pending_steps(self) -> List[Dict]:
-        """Get all pending steps"""
-        return [self.steps[sid] for sid in self.step_order 
-                if self.steps[sid]['status'] == 'pending']
-    
-    def get_ready_steps(self) -> List[Dict]:
-        """Get steps that are ready to run (dependencies satisfied)"""
-        ready = []
-        completed_ids = {sid for sid in self.step_order 
-                        if self.steps[sid]['status'] == 'completed'}
-        
-        for step_id in self.step_order:
-            step = self.steps[step_id]
-            if step['status'] != 'pending':
-                continue
-            
-            deps = set(step.get('dependencies', []))
-            if deps.issubset(completed_ids):
-                ready.append(step)
-        
-        return ready
-    
-    def generate_status_markdown(self) -> str:
-        """Generate markdown summary of pipeline status"""
-        completed = [s for s in self.steps.values() if s['status'] == 'completed']
-        failed = [s for s in self.steps.values() if s['status'] == 'failed']
-        pending = [s for s in self.steps.values() if s['status'] == 'pending']
-        running = [s for s in self.steps.values() if s['status'] == 'running']
-        
-        md = f"""# Pipeline Status
-
-**Last Updated**: {self.last_updated.isoformat()}
-**Total Steps**: {len(self.steps)}
-
-## Summary
-- ✅ Completed: {len(completed)}
-- ❌ Failed: {len(failed)}
-- ⏳ Pending: {len(pending)}
-- 🔄 Running: {len(running)}
-
----
-
-## Completed Steps
-
-"""
-        for step in completed:
-            md += f"""### ✅ {step['title']}
-- **Script**: `{step.get('script_path', 'N/A')}`
-- **Outputs**: {', '.join(step.get('output_files', [])) or 'None recorded'}
-- **Completed**: {step.get('completed_at', 'Unknown')}
-
-"""
-        
-        if failed:
-            md += """---
-
-## Failed Steps
-
-"""
-            for step in failed:
-                md += f"""### ❌ {step['title']}
-- **Attempts**: {step.get('attempts', 0)}
-- **Error**: {step.get('error_summary', 'No details')[:200]}
-- **Last Script**: `{step.get('script_path', 'N/A')}`
-
-"""
-        
-        if pending:
-            md += """---
-
-## Pending Steps
-
-"""
-            for step in pending:
-                deps = step.get('dependencies', [])
-                md += f"- [ ] {step['title']}"
-                if deps:
-                    md += f" (depends on: {', '.join(deps)})"
-                md += "\n"
-        
-        return md
+            self.steps[step_id]['validation_status'] = status
+        self._save()
     
     def _save(self):
-        """Save state to files"""
-        self.document_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Save JSON state
+        """Save state to JSON file"""
+        self.last_updated = datetime.now()
         state = {
-            'original_prompt': self.original_prompt[:5000],
-            'created_at': self.created_at.isoformat(),
-            'last_updated': self.last_updated.isoformat(),
+            'original_prompt': self.original_prompt,
             'steps': self.steps,
-            'step_order': self.step_order
+            'step_order': self.step_order,
+            'extracted_steps': self.extracted_steps,
+            'validation_results': self.validation_results,
+            'created_at': self.created_at.isoformat(),
+            'last_updated': self.last_updated.isoformat()
         }
+        
+        self.document_path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.document_path, 'w') as f:
             json.dump(state, f, indent=2, default=str)
         
-        # Save markdown
+        # Also save markdown version
         md = self.generate_status_markdown()
         self.markdown_path.write_text(md)
+    
+    def generate_status_markdown(self) -> str:
+        """Generate markdown status document"""
+        lines = [
+            "# Pipeline Status",
+            f"\nLast Updated: {self.last_updated.isoformat()}",
+            f"\n## Summary",
+            f"- Total Steps: {len(self.steps)}",
+            f"- Completed: {len([s for s in self.steps.values() if s['status'] == 'completed'])}",
+            f"- Failed: {len([s for s in self.steps.values() if s['status'] == 'failed'])}",
+            f"- Pending: {len([s for s in self.steps.values() if s['status'] == 'pending'])}",
+            f"- Running: {len([s for s in self.steps.values() if s['status'] == 'running'])}",
+            "\n## Steps\n"
+        ]
+        
+        for step_id in self.step_order:
+            step = self.steps.get(step_id, {})
+            status_icon = {
+                'completed': '✅',
+                'failed': '❌',
+                'running': '🔄',
+                'pending': '⏳'
+            }.get(step.get('status', 'pending'), '⏳')
+            
+            validation = '✓' if step.get('validation_status') == 'validated' else '?'
+            
+            lines.append(f"### {status_icon} {step.get('title', step_id)} [{validation}]")
+            lines.append(f"\n**Status**: {step.get('status', 'pending')}")
+            
+            if step.get('original_text'):
+                lines.append(f"\n**Original Step**:\n> {step['original_text'][:500]}...")
+            
+            if step.get('expanded_plan'):
+                lines.append(f"\n**Execution Plan**:\n{step['expanded_plan'][:1000]}...")
+            
+            if step.get('script_path'):
+                lines.append(f"\n**Script**: `{step['script_path']}`")
+            
+            if step.get('error_summary'):
+                lines.append(f"\n**Error**: {step['error_summary'][:300]}...")
+            
+            lines.append("")
+        
+        return '\n'.join(lines)
     
     @classmethod
     def load(cls, project_dir: Path) -> Optional['MasterPromptDocument']:
@@ -261,12 +221,15 @@ class MasterPromptDocument:
                 state = json.load(f)
             
             doc = cls(state['original_prompt'], project_dir)
-            doc.steps = state['steps']
-            doc.step_order = state['step_order']
+            doc.steps = state.get('steps', {})
+            doc.step_order = state.get('step_order', [])
+            doc.extracted_steps = state.get('extracted_steps', [])
+            doc.validation_results = state.get('validation_results', {})
             doc.created_at = datetime.fromisoformat(state['created_at'])
             doc.last_updated = datetime.fromisoformat(state['last_updated'])
             return doc
-        except Exception:
+        except Exception as e:
+            print(f"Warning: Could not load master document: {e}")
             return None
     
     def to_context_string(self, max_tokens: int = 10000) -> str:
@@ -278,10 +241,10 @@ class MasterPromptDocument:
         parts = [
             f"Pipeline Status: {len(completed)} completed, {len(failed)} failed, {len(pending)} pending",
             "",
-            "Completed with scripts:"
+            "Completed steps:"
         ]
         
-        for s in completed[:10]:  # Limit for context
+        for s in completed[:10]:
             parts.append(f"  ✅ {s['title']}: {s.get('script_path', 'N/A')}")
         
         if failed:
@@ -297,18 +260,22 @@ class MasterPromptDocument:
         return "\n".join(parts)
 
 
+# =============================================================================
+# MASTER AGENT
+# =============================================================================
+
 class MasterAgent:
     """
-    Master agent that coordinates task decomposition and manages the living document.
+    Master agent v3.2 with comprehensive task decomposition.
     
     Key responsibilities:
-    1. Decompose tasks into subtasks with full context preservation
-    2. Maintain the master prompt document
-    3. Review failures and decide next actions
-    4. Generate final reports
+    1. EXTRACT: Parse ALL steps from the detailed prompt
+    2. EXPAND: Create detailed execution plans for each step
+    3. VALIDATE: Verify plans match original intent
+    4. ASSIGN: Hand off validated plans to sub-agents
+    5. TRACK: Maintain the master prompt document
     """
     
-    # Context limits for master coordination
     MAX_CONTEXT_TOKENS = 70_000
     
     def __init__(
@@ -346,7 +313,6 @@ class MasterAgent:
     
     def initialize_document(self, main_task: str) -> MasterPromptDocument:
         """Initialize or load the master prompt document"""
-        # Try to load existing
         existing = MasterPromptDocument.load(self.project_dir)
         if existing:
             self.master_document = existing
@@ -365,106 +331,130 @@ class MasterAgent:
         
         return self.master_document
     
-    def decompose_task(self, main_task: str, context: Dict[str, Any] = None) -> List[Dict[str, Any]]:
+    # =========================================================================
+    # PHASE 1: COMPREHENSIVE EXTRACTION
+    # =========================================================================
+    
+    def _extract_steps_from_prompt(self, prompt: str) -> List[Dict[str, Any]]:
         """
-        Break down task into subtasks while preserving all context.
-        Updates the master document with decomposed steps.
+        Extract ALL steps from the prompt using multiple detection strategies.
+        
+        Supports:
+        - Numbered steps: "1. ", "1) ", "Step 1:"
+        - Checkboxes: "- [ ]", "- [x]", "* [ ]"
+        - Headers: "## Step 1", "### Task 1"
+        - Bullet points with keywords: "- First,", "- Next,"
+        - Code blocks associated with steps
         """
-        # Initialize document
-        self.initialize_document(main_task)
+        extracted = []
+        lines = prompt.split('\n')
         
-        # Extract context from the task
-        extracted_context = self._extract_task_context(main_task)
+        current_step = None
+        current_content = []
+        current_code_blocks = []
+        in_code_block = False
+        code_block_content = []
+        step_number = 0
         
-        # Check for already completed steps
-        if self.master_document.steps:
-            completed = [s for s in self.master_document.steps.values() 
-                        if s['status'] == 'completed']
-            if completed:
-                agent_logger.log_reflection(
-                    agent_name=self.agent_id,
-                    task_id="decompose",
-                    reflection=f"Skipping {len(completed)} already completed steps"
-                )
+        for i, line in enumerate(lines):
+            # Track code blocks
+            if line.strip().startswith('```'):
+                if in_code_block:
+                    # End of code block
+                    in_code_block = False
+                    if current_step is not None:
+                        current_code_blocks.append('\n'.join(code_block_content))
+                    code_block_content = []
+                else:
+                    # Start of code block
+                    in_code_block = True
+                continue
+            
+            if in_code_block:
+                code_block_content.append(line)
+                continue
+            
+            # Detect step patterns
+            step_match = None
+            step_title = None
+            
+            # Pattern 1: Numbered steps "1. ", "1) ", "1:"
+            numbered = re.match(r'^\s*(\d+)[.):]\s*(.+)', line)
+            if numbered:
+                step_match = numbered
+                step_title = numbered.group(2).strip()
+            
+            # Pattern 2: "Step N:" or "Task N:"
+            step_keyword = re.match(r'^\s*(?:Step|Task|Phase)\s*(\d+)[:\s]*(.+)?', line, re.IGNORECASE)
+            if step_keyword and not step_match:
+                step_match = step_keyword
+                step_title = step_keyword.group(2).strip() if step_keyword.group(2) else f"Step {step_keyword.group(1)}"
+            
+            # Pattern 3: Markdown headers "## Step", "### 1."
+            header = re.match(r'^#{1,4}\s*(?:Step\s*)?(\d+)?[.:\s]*(.+)?', line)
+            if header and not step_match:
+                # Only treat as step if it looks like a task header
+                header_text = header.group(2) or ""
+                if any(kw in header_text.lower() for kw in ['step', 'task', 'phase', 'stage', 'part']):
+                    step_match = header
+                    step_title = header_text.strip()
+            
+            # Pattern 4: Checkbox items "- [ ]", "- [x]"
+            checkbox = re.match(r'^\s*[-*]\s*\[([x\s])\]\s*(.+)', line, re.IGNORECASE)
+            if checkbox and not step_match:
+                step_match = checkbox
+                step_title = checkbox.group(2).strip()
+            
+            # Pattern 5: Bold/emphasized items that look like steps
+            bold_step = re.match(r'^\s*[-*]?\s*\*\*(.+?)\*\*[:\s]*(.+)?', line)
+            if bold_step and not step_match:
+                title_text = bold_step.group(1).strip()
+                # Check if it looks like a step
+                if any(kw in title_text.lower() for kw in ['step', 'task', 'create', 'implement', 'setup', 'configure', 'run', 'analyze']):
+                    step_match = bold_step
+                    step_title = title_text + (f": {bold_step.group(2)}" if bold_step.group(2) else "")
+            
+            # If we found a new step
+            if step_match:
+                # Save previous step if exists
+                if current_step is not None:
+                    current_step['full_text'] = '\n'.join(current_content).strip()
+                    current_step['code_hints'] = current_code_blocks.copy()
+                    extracted.append(current_step)
+                
+                # Start new step
+                step_number += 1
+                current_step = {
+                    'step_number': step_number,
+                    'title': step_title[:200] if step_title else f"Step {step_number}",
+                    'full_text': '',
+                    'code_hints': [],
+                    'line_start': i
+                }
+                current_content = [line]
+                current_code_blocks = []
+            
+            elif current_step is not None:
+                # Continue building current step content
+                current_content.append(line)
         
-        context_str = ""
-        if context:
-            context_str = f"\nAdditional Context:\n{json.dumps(context, indent=2, default=str)}"
+        # Don't forget the last step
+        if current_step is not None:
+            current_step['full_text'] = '\n'.join(current_content).strip()
+            current_step['code_hints'] = current_code_blocks.copy()
+            extracted.append(current_step)
         
-        # Build decomposition prompt
-        prompt = f"""You are a master coordinator for a computational biology pipeline.
-Break down this task into specific, executable subtasks.
-
-=== MAIN TASK ===
-{main_task}
-{context_str}
-
-=== CURRENT STATUS ===
-{self.master_document.to_context_string(5000) if self.master_document else 'No existing steps'}
-
-=== EXTRACTED CONTEXT (PRESERVE EXACTLY) ===
-- Language: {extracted_context.get('language', 'python')}
-- Packages: {', '.join(extracted_context.get('packages', []))}
-- Reference Scripts: {', '.join(extracted_context.get('reference_scripts', []))}
-- Input Files: {', '.join(extracted_context.get('input_files', []))}
-- Output Files: {', '.join(extracted_context.get('output_files', []))}
-
-=== SUBTASK REQUIREMENTS ===
-Each subtask should:
-1. Be independently executable as a script
-2. Have clear input and output files
-3. Use the EXACT packages specified (no substitutions)
-4. Include success criteria (output files that should exist)
-5. Note dependencies on other subtasks
-
-=== OUTPUT FORMAT (JSON) ===
-Return a JSON array:
-```json
-[
-  {{
-    "id": "subtask_1",
-    "title": "Brief title",
-    "description": "What this subtask does",
-    "language": "python",
-    "packages": ["scanpy", "pandas"],
-    "input_files": ["data/input.h5ad"],
-    "output_files": ["data/outputs/result.h5ad"],
-    "reference_scripts": [],
-    "dependencies": [],
-    "success_criteria": "File data/outputs/result.h5ad exists"
-  }}
-]
-```
-
-Return ONLY the JSON array."""
-
-        response = self.llm.invoke(prompt)
+        # If no steps were found, treat the whole prompt as one step
+        if not extracted:
+            extracted.append({
+                'step_number': 1,
+                'title': 'Main Task',
+                'full_text': prompt,
+                'code_hints': [],
+                'line_start': 0
+            })
         
-        # Parse response
-        subtasks = self._parse_subtasks_json(response, extracted_context)
-        
-        # Update master document with new subtasks
-        for subtask in subtasks:
-            self.master_document.add_step(
-                step_id=subtask['id'],
-                title=subtask.get('title', subtask['id']),
-                description=subtask.get('description', ''),
-                packages=subtask.get('packages', []),
-                dependencies=subtask.get('dependencies', [])
-            )
-            self.subtask_status[subtask['id']] = {'status': 'pending', 'attempts': 0}
-        
-        # Save document
-        self.master_document._save()
-        
-        agent_logger.log_task_start(
-            agent_name=self.agent_id,
-            task_id="decomposition",
-            description=f"Decomposed into {len(subtasks)} subtasks",
-            attempt=1
-        )
-        
-        return subtasks
+        return extracted
     
     def _extract_task_context(self, task: str) -> Dict[str, Any]:
         """Extract critical context from task description"""
@@ -475,24 +465,28 @@ Return ONLY the JSON array."""
             "input_files": [],
             "output_files": [],
             "completed_steps": [],
-            "huggingface_repos": []
+            "huggingface_repos": [],
+            "environment_hints": []
         }
         
         # Detect language
         task_lower = task.lower()
-        python_indicators = ['python', 'scanpy', 'squidpy', 'anndata', 'pandas', '.py', 'popv', 'h5ad']
-        r_indicators = ['seurat', 'singlecell', 'bioconductor', '.R']
+        python_indicators = ['python', 'scanpy', 'squidpy', 'anndata', 'pandas', '.py', 'popv', 'h5ad', 'numpy', 'scipy']
+        r_indicators = ['seurat', 'singlecell', 'bioconductor', '.R', 'r script']
         
         python_score = sum(1 for ind in python_indicators if ind in task_lower)
         r_score = sum(1 for ind in r_indicators if ind in task_lower)
         
         context["language"] = "python" if python_score >= r_score else "r"
         
-        # Extract packages
+        # Extract packages (expanded list)
         python_packages = [
             'scanpy', 'squidpy', 'anndata', 'pandas', 'numpy', 'scipy',
             'popv', 'popV', 'scvi', 'scvi-tools', 'cellxgene', 'leidenalg',
-            'matplotlib', 'seaborn', 'celltypist', 'decoupler'
+            'matplotlib', 'seaborn', 'celltypist', 'decoupler', 'sklearn',
+            'scikit-learn', 'torch', 'pytorch', 'tensorflow', 'keras',
+            'statsmodels', 'plotly', 'bokeh', 'networkx', 'igraph',
+            'requests', 'aiohttp', 'fastapi', 'flask', 'django'
         ]
         for pkg in python_packages:
             if pkg.lower() in task_lower:
@@ -503,29 +497,45 @@ Return ONLY the JSON array."""
         
         # Extract file paths
         file_patterns = [
-            (r'[`"]?([^\s`"]*\.h5ad)[`"]?', 'h5ad'),
-            (r'[`"]?([^\s`"]*\.csv)[`"]?', 'csv'),
-            (r'[`"]?(data/[^\s`"]+)[`"]?', 'data'),
+            (r'[`"\']?([^\s`"\']*\.h5ad)[`"\']?', 'h5ad'),
+            (r'[`"\']?([^\s`"\']*\.csv)[`"\']?', 'csv'),
+            (r'[`"\']?([^\s`"\']*\.tsv)[`"\']?', 'tsv'),
+            (r'[`"\']?([^\s`"\']*\.parquet)[`"\']?', 'parquet'),
+            (r'[`"\']?(data/[^\s`"\']+)[`"\']?', 'data'),
+            (r'[`"\']?(output[s]?/[^\s`"\']+)[`"\']?', 'output'),
         ]
-        for pattern, _ in file_patterns:
+        for pattern, ftype in file_patterns:
             matches = re.findall(pattern, task)
             for match in matches:
-                if 'input' in match.lower() or 'processed' in match.lower():
-                    context["input_files"].append(match)
-                elif 'output' in match.lower():
-                    context["output_files"].append(match)
+                if 'input' in match.lower() or ftype in ['h5ad', 'csv', 'tsv', 'parquet']:
+                    if match not in context["input_files"]:
+                        context["input_files"].append(match)
+                if 'output' in match.lower() or ftype == 'output':
+                    if match not in context["output_files"]:
+                        context["output_files"].append(match)
         
         # Extract reference scripts
-        script_pattern = r'scripts?/[^\s`"]+\.py'
-        context["reference_scripts"] = re.findall(script_pattern, task)
+        script_patterns = [
+            r'scripts?/[^\s`"\']+\.py',
+            r'[`"\']([^\s`"\']+\.py)[`"\']',
+        ]
+        for pattern in script_patterns:
+            matches = re.findall(pattern, task)
+            context["reference_scripts"].extend(matches)
         
         # Extract HuggingFace repos
         hf_pattern = r'huggingface_repo\s*=\s*["\']([^"\']+)["\']'
         context["huggingface_repos"] = re.findall(hf_pattern, task)
         
         # Extract completed steps
-        completed_pattern = r'✅\s*(?:COMPLETED:?)?\s*([^\n]+)'
-        context["completed_steps"] = re.findall(completed_pattern, task)
+        completed_patterns = [
+            r'✅\s*(?:COMPLETED:?)?\s*([^\n]+)',
+            r'\[x\]\s*([^\n]+)',
+            r'DONE:\s*([^\n]+)',
+        ]
+        for pattern in completed_patterns:
+            matches = re.findall(pattern, task, re.IGNORECASE)
+            context["completed_steps"].extend(matches)
         
         # Deduplicate
         for key in context:
@@ -534,176 +544,452 @@ Return ONLY the JSON array."""
         
         return context
     
-    def _parse_subtasks_json(self, response: str, extracted_context: Dict) -> List[Dict[str, Any]]:
-        """Parse JSON response into subtasks"""
-        try:
-            json_match = re.search(r'\[[\s\S]*\]', response)
-            if json_match:
-                subtasks = json.loads(json_match.group())
-                
-                for i, subtask in enumerate(subtasks):
-                    subtask.setdefault('id', f'subtask_{i+1}')
-                    subtask.setdefault('status', 'pending')
-                    subtask.setdefault('attempts', 0)
-                    subtask.setdefault('dependencies', [])
-                    
-                    # Inherit context if not specified
-                    if not subtask.get('language'):
-                        subtask['language'] = extracted_context.get('language', 'python')
-                    if not subtask.get('packages'):
-                        subtask['packages'] = extracted_context.get('packages', [])
-                    if not subtask.get('reference_scripts'):
-                        subtask['reference_scripts'] = extracted_context.get('reference_scripts', [])
-                    if extracted_context.get('huggingface_repos'):
-                        subtask['huggingface_repos'] = extracted_context['huggingface_repos']
-                    
-                    # Sync packages
-                    subtask['required_packages'] = subtask.get('packages', [])
-                
-                return subtasks
-        except json.JSONDecodeError:
-            pass
-        
-        # Fallback: create single subtask from response
-        return [{
-            'id': 'subtask_1',
-            'title': 'Main task',
-            'description': response[:500],
-            'language': extracted_context.get('language', 'python'),
-            'packages': extracted_context.get('packages', []),
-            'reference_scripts': extracted_context.get('reference_scripts', []),
-            'input_files': extracted_context.get('input_files', []),
-            'output_files': extracted_context.get('output_files', []),
-            'status': 'pending',
-            'attempts': 0,
-            'dependencies': []
-        }]
+    # =========================================================================
+    # PHASE 2: DETAILED EXPANSION
+    # =========================================================================
     
-    def mark_subtask_complete(self, task_id: str, result: Dict = None):
+    def _expand_step(self, step: Dict[str, Any], context: Dict[str, Any], all_steps: List[Dict]) -> Dict[str, Any]:
+        """
+        Expand a single extracted step into a detailed execution plan.
+        
+        This is where the magic happens - we take the user's step description
+        and create a comprehensive plan that includes:
+        - Detailed explanation of what needs to be done
+        - Specific packages and imports
+        - Input/output file specifications
+        - Code structure suggestions
+        - Success criteria
+        """
+        step_text = step.get('full_text', step.get('title', ''))
+        code_hints = step.get('code_hints', [])
+        
+        # Build context about other steps for dependency awareness
+        other_steps_summary = "\n".join([
+            f"  - Step {s['step_number']}: {s['title'][:100]}"
+            for s in all_steps if s['step_number'] != step.get('step_number')
+        ])
+        
+        prompt = f"""You are expanding a pipeline step into a detailed execution plan.
+
+=== ORIGINAL STEP FROM USER'S PROMPT ===
+Step {step.get('step_number', '?')}: {step.get('title', 'Unknown')}
+
+Full Description:
+{step_text}
+
+{"Code Hints from User:" if code_hints else ""}
+{chr(10).join(['```' + ch + '```' for ch in code_hints[:3]]) if code_hints else ""}
+
+=== CONTEXT ===
+Language: {context.get('language', 'python')}
+Available Packages: {', '.join(context.get('packages', []))}
+Input Files: {', '.join(context.get('input_files', []))}
+Output Files: {', '.join(context.get('output_files', []))}
+
+Other Steps in Pipeline:
+{other_steps_summary}
+
+=== YOUR TASK ===
+Create a COMPREHENSIVE execution plan that:
+1. Captures EVERYTHING the user described in this step
+2. Expands on any code hints or suggestions they provided
+3. Specifies exact packages and imports needed
+4. Defines clear input and output files
+5. Provides a step-by-step implementation approach
+6. Includes success criteria (what files should exist, what results expected)
+
+=== OUTPUT FORMAT (JSON) ===
+```json
+{{
+    "expanded_title": "Descriptive title for this step",
+    "expanded_plan": "A detailed paragraph explaining exactly what this step does and how to implement it. Include specific function calls, data transformations, and expected outputs. This should be comprehensive enough that a developer could implement it without referring back to the original prompt.",
+    "packages": ["list", "of", "specific", "packages"],
+    "imports_needed": ["import pandas as pd", "import scanpy as sc"],
+    "input_files": ["path/to/input.h5ad"],
+    "output_files": ["path/to/output.h5ad"],
+    "key_operations": ["Load data", "Filter cells", "Normalize", "Save results"],
+    "code_approach": "Brief description of the code structure - e.g., 'Use scanpy.pp.filter_cells() with min_genes=200, then normalize_total() with target_sum=1e4'",
+    "success_criteria": "File output.h5ad exists and contains filtered data with >1000 cells",
+    "dependencies": ["step_1", "step_2"],
+    "estimated_complexity": "low|medium|high",
+    "potential_issues": ["Memory usage if large dataset", "May need to adjust filter thresholds"]
+}}
+```
+
+IMPORTANT: Your expanded_plan should be DETAILED and COMPREHENSIVE. Do not summarize - expand and clarify. Include ALL details from the user's original step description."""
+
+        try:
+            response = self.llm.invoke(prompt)
+            
+            # Parse JSON response
+            json_match = re.search(r'\{[\s\S]*\}', response)
+            if json_match:
+                expanded = json.loads(json_match.group())
+                return {
+                    'success': True,
+                    'expanded': expanded,
+                    'raw_response': response
+                }
+        except json.JSONDecodeError as e:
+            agent_logger.log_reflection(
+                agent_name=self.agent_id,
+                task_id=f"expand_step_{step.get('step_number', '?')}",
+                reflection=f"JSON parse error: {e}"
+            )
+        except Exception as e:
+            agent_logger.log_reflection(
+                agent_name=self.agent_id,
+                task_id=f"expand_step_{step.get('step_number', '?')}",
+                reflection=f"Expansion error: {e}"
+            )
+        
+        # Fallback: create basic expansion
+        return {
+            'success': False,
+            'expanded': {
+                'expanded_title': step.get('title', 'Unknown Step'),
+                'expanded_plan': step_text,
+                'packages': context.get('packages', []),
+                'input_files': context.get('input_files', []),
+                'output_files': context.get('output_files', []),
+                'key_operations': [],
+                'code_approach': '',
+                'success_criteria': 'Step completes without error',
+                'dependencies': [],
+                'estimated_complexity': 'medium',
+                'potential_issues': []
+            }
+        }
+    
+    # =========================================================================
+    # PHASE 3: VALIDATION
+    # =========================================================================
+    
+    def _validate_expansion(self, original_step: Dict, expanded: Dict) -> Dict[str, Any]:
+        """
+        Validate that the expanded plan captures the original step's intent.
+        
+        Checks:
+        - Does the expanded plan mention key concepts from the original?
+        - Are all code hints incorporated?
+        - Are input/output files preserved?
+        - Is the scope appropriate (not too narrow, not too broad)?
+        """
+        original_text = original_step.get('full_text', '').lower()
+        expanded_plan = expanded.get('expanded_plan', '').lower()
+        expanded_title = expanded.get('expanded_title', '').lower()
+        
+        issues = []
+        
+        # Check 1: Key terms from original should appear in expanded
+        # Extract significant words (excluding common words)
+        common_words = {'the', 'a', 'an', 'is', 'are', 'to', 'for', 'of', 'and', 'or', 'in', 'on', 'with', 'this', 'that'}
+        original_words = set(re.findall(r'\b\w{4,}\b', original_text)) - common_words
+        expanded_words = set(re.findall(r'\b\w{4,}\b', expanded_plan + ' ' + expanded_title))
+        
+        missing_key_terms = []
+        for word in original_words:
+            if len(word) > 5 and word not in expanded_words:
+                # Check if it's a significant term (package name, file type, etc.)
+                if any(indicator in word for indicator in ['file', 'data', 'output', 'input', 'cell', 'gene', 'cluster']):
+                    missing_key_terms.append(word)
+        
+        if len(missing_key_terms) > 3:
+            issues.append(f"Missing key terms from original: {', '.join(missing_key_terms[:5])}")
+        
+        # Check 2: Code hints should be reflected
+        code_hints = original_step.get('code_hints', [])
+        if code_hints:
+            code_hint_text = ' '.join(code_hints).lower()
+            # Extract function calls from code hints
+            functions = re.findall(r'(\w+)\s*\(', code_hint_text)
+            mentioned_functions = sum(1 for f in functions if f in expanded_plan)
+            if functions and mentioned_functions < len(functions) / 2:
+                issues.append(f"Code hints not fully incorporated (found {mentioned_functions}/{len(functions)} functions)")
+        
+        # Check 3: Expansion should be substantial
+        if len(expanded.get('expanded_plan', '')) < len(original_text) * 0.5:
+            issues.append("Expanded plan seems too brief compared to original")
+        
+        # Check 4: Should have concrete outputs
+        if not expanded.get('output_files') and not expanded.get('success_criteria'):
+            issues.append("Missing concrete output files or success criteria")
+        
+        # Determine validation status
+        if not issues:
+            status = 'validated'
+        elif len(issues) <= 2:
+            status = 'validated_with_warnings'
+        else:
+            status = 'needs_revision'
+        
+        return {
+            'status': status,
+            'issues': issues,
+            'coverage_score': 1.0 - (len(issues) * 0.2),  # Rough score
+        }
+    
+    # =========================================================================
+    # MAIN DECOMPOSITION METHOD
+    # =========================================================================
+    
+    def decompose_task(self, main_task: str, context: Dict[str, Any] = None) -> List[Dict[str, Any]]:
+        """
+        Comprehensive task decomposition with extraction, expansion, and validation.
+        
+        This is the main entry point that orchestrates the 3-phase approach:
+        1. Extract ALL steps from the detailed prompt
+        2. Expand each step into a detailed execution plan
+        3. Validate each plan against the original
+        """
+        # Initialize document
+        self.initialize_document(main_task)
+        
+        # Check for already completed steps
+        if self.master_document.steps:
+            completed = [s for s in self.master_document.steps.values() 
+                        if s['status'] == 'completed']
+            pending = [s for s in self.master_document.steps.values() 
+                      if s['status'] == 'pending']
+            
+            if completed:
+                agent_logger.log_reflection(
+                    agent_name=self.agent_id,
+                    task_id="decompose",
+                    reflection=f"Skipping {len(completed)} completed steps, {len(pending)} pending"
+                )
+                
+                # Return pending steps for re-execution
+                if pending:
+                    return self._convert_steps_to_subtasks(pending)
+        
+        # Extract global context
+        extracted_context = self._extract_task_context(main_task)
+        if context:
+            # Merge provided context
+            for key, value in context.items():
+                if isinstance(value, list):
+                    extracted_context[key] = list(set(extracted_context.get(key, []) + value))
+                elif value:
+                    extracted_context[key] = value
+        
+        agent_logger.log_reflection(
+            agent_name=self.agent_id,
+            task_id="decompose",
+            reflection=f"Extracted context: {len(extracted_context.get('packages', []))} packages, {len(extracted_context.get('input_files', []))} inputs"
+        )
+        
+        # =====================================================================
+        # PHASE 1: EXTRACTION
+        # =====================================================================
+        print("\n  Phase 1: Extracting steps from prompt...")
+        extracted_steps = self._extract_steps_from_prompt(main_task)
+        self.master_document.extracted_steps = extracted_steps
+        
+        agent_logger.log_reflection(
+            agent_name=self.agent_id,
+            task_id="extraction",
+            reflection=f"Extracted {len(extracted_steps)} steps from prompt"
+        )
+        print(f"    Found {len(extracted_steps)} steps")
+        
+        # =====================================================================
+        # PHASE 2: EXPANSION
+        # =====================================================================
+        print("\n  Phase 2: Expanding each step into detailed plans...")
+        subtasks = []
+        
+        for i, step in enumerate(extracted_steps):
+            print(f"    Expanding step {i+1}/{len(extracted_steps)}: {step.get('title', 'Unknown')[:50]}...")
+            
+            # Expand the step
+            expansion_result = self._expand_step(step, extracted_context, extracted_steps)
+            expanded = expansion_result.get('expanded', {})
+            
+            # =====================================================================
+            # PHASE 3: VALIDATION
+            # =====================================================================
+            validation = self._validate_expansion(step, expanded)
+            
+            if validation['status'] == 'needs_revision':
+                print(f"      ⚠️ Validation issues: {', '.join(validation['issues'][:2])}")
+                # Could re-expand here with feedback, for now just log
+                agent_logger.log_reflection(
+                    agent_name=self.agent_id,
+                    task_id=f"validate_step_{i+1}",
+                    reflection=f"Validation issues: {validation['issues']}"
+                )
+            else:
+                print(f"      ✓ Validated")
+            
+            # Create subtask with full context
+            step_id = f"step_{i+1}"
+            subtask = {
+                'id': step_id,
+                'title': expanded.get('expanded_title', step.get('title', f'Step {i+1}')),
+                'description': expanded.get('expanded_plan', step.get('full_text', '')),
+                'original_text': step.get('full_text', ''),  # Preserve original
+                'expanded_plan': expanded.get('expanded_plan', ''),
+                'language': extracted_context.get('language', 'python'),
+                'packages': expanded.get('packages', extracted_context.get('packages', [])),
+                'imports_needed': expanded.get('imports_needed', []),
+                'input_files': expanded.get('input_files', extracted_context.get('input_files', [])),
+                'output_files': expanded.get('output_files', extracted_context.get('output_files', [])),
+                'key_operations': expanded.get('key_operations', []),
+                'code_approach': expanded.get('code_approach', ''),
+                'code_hints': step.get('code_hints', []),
+                'success_criteria': expanded.get('success_criteria', ''),
+                'dependencies': expanded.get('dependencies', []),
+                'validation_status': validation['status'],
+                'validation_issues': validation.get('issues', []),
+                'status': 'pending',
+                'attempts': 0
+            }
+            
+            subtasks.append(subtask)
+            
+            # Update master document
+            self.master_document.add_step(
+                step_id=step_id,
+                title=subtask['title'],
+                description=subtask['description'],
+                original_text=subtask['original_text'],
+                expanded_plan=subtask['expanded_plan'],
+                validation_status=validation['status'],
+                packages=subtask['packages'],
+                dependencies=subtask['dependencies'],
+                code_hints=subtask.get('code_hints', [])
+            )
+            
+            self.subtask_status[step_id] = {'status': 'pending', 'attempts': 0}
+        
+        # Save document
+        self.master_document._save()
+        
+        print(f"\n  ✓ Decomposition complete: {len(subtasks)} subtasks created")
+        
+        agent_logger.log_task_start(
+            agent_name=self.agent_id,
+            task_id="decomposition",
+            description=f"Decomposed into {len(subtasks)} subtasks with validation",
+            attempt=1
+        )
+        
+        return subtasks
+    
+    def _convert_steps_to_subtasks(self, steps: List[Dict]) -> List[Dict[str, Any]]:
+        """Convert stored steps back to subtask format"""
+        subtasks = []
+        for step in steps:
+            subtasks.append({
+                'id': step['id'],
+                'title': step.get('title', step['id']),
+                'description': step.get('expanded_plan', step.get('description', '')),
+                'original_text': step.get('original_text', ''),
+                'expanded_plan': step.get('expanded_plan', ''),
+                'language': 'python',
+                'packages': step.get('packages', []),
+                'input_files': [],
+                'output_files': step.get('output_files', []),
+                'code_hints': step.get('code_hints', []),
+                'success_criteria': step.get('success_criteria', ''),
+                'dependencies': step.get('dependencies', []),
+                'validation_status': step.get('validation_status', 'pending'),
+                'status': step.get('status', 'pending'),
+                'attempts': step.get('attempts', 0)
+            })
+        return subtasks
+    
+    # =========================================================================
+    # OTHER METHODS (unchanged from v3.1)
+    # =========================================================================
+    
+    def mark_subtask_complete(self, task_id: str, outputs: Dict = None, report: str = None):
         """Mark subtask as complete and update master document"""
         if task_id in self.subtask_status:
             self.subtask_status[task_id]['status'] = 'completed'
-            self.subtask_status[task_id]['result'] = result
+            self.subtask_status[task_id]['result'] = outputs
         
         if self.master_document:
             self.master_document.mark_complete(
                 step_id=task_id,
-                script_path=result.get('script_path') if result else None,
-                output_files=result.get('output_files', []) if result else []
+                script_path=outputs.get('script_path') if outputs else None,
+                output_files=outputs.get('output_files', []) if outputs else []
             )
     
-    def mark_subtask_failed(self, task_id: str, result: Dict = None):
+    def mark_subtask_failed(self, task_id: str, error: str, details: str = None):
         """Mark subtask as failed and update master document"""
         if task_id in self.subtask_status:
             self.subtask_status[task_id]['status'] = 'failed'
-            self.subtask_status[task_id]['result'] = result
+            self.subtask_status[task_id]['error'] = error
             self.subtask_status[task_id]['attempts'] = self.subtask_status[task_id].get('attempts', 0) + 1
         
         if self.master_document:
-            error_summary = result.get('error', 'Unknown error') if result else 'Unknown error'
-            attempts = result.get('iterations', 1) if result else 1
             self.master_document.mark_failed(
                 step_id=task_id,
-                error_summary=error_summary,
-                attempts=attempts,
-                script_path=result.get('script_path') if result else None
+                error_summary=error,
+                attempts=self.subtask_status.get(task_id, {}).get('attempts', 1)
             )
     
-    def review_failure(self, subtask: Dict, failure_info: Dict) -> Dict[str, Any]:
+    def review_failure(self, subtask: Dict, error: str = None, context: Dict = None) -> Dict[str, Any]:
         """Review failure and decide on action"""
-        # Build context
+        failure_info = subtask.get('last_result', {})
+        error = error or failure_info.get('error', 'Unknown error')
+        
         context_summary = f"""
-Subtask: {subtask.get('description', subtask.get('title', 'Unknown'))}
-Language: {subtask.get('language', 'python')}
-Packages: {', '.join(subtask.get('packages', []))}
-Attempts: {failure_info.get('iterations', 1)}
-Error: {failure_info.get('error', 'Unknown')}
+Subtask: {subtask.get('title', subtask.get('id', 'Unknown'))}
+Original Intent: {subtask.get('original_text', subtask.get('description', ''))[:500]}
+Expanded Plan: {subtask.get('expanded_plan', '')[:500]}
+Attempts: {subtask.get('attempts', 1)}
+Error: {error[:500]}
 """
         
-        prompt = f"""A subtask has failed. Decide the next action.
+        prompt = f"""A subtask has failed. Review and decide the next action.
 
 {context_summary}
 
-Previous script (if any): {failure_info.get('script_path', 'None')}
-
-Options:
-1. RETRY - Try again with modified approach (same tools)
+=== DECISION OPTIONS ===
+1. RETRY - Try again with modifications (only if error seems recoverable)
 2. SKIP - Mark as non-critical, continue pipeline
 3. ESCALATE - Requires human intervention
 
 Consider:
 - Has context window been exhausted? -> SKIP or ESCALATE
 - Is the error recoverable (missing package, wrong path)? -> RETRY
-- Is it a fundamental issue (data doesn't exist)? -> SKIP or ESCALATE
+- Is it a fundamental issue (data doesn't exist, wrong approach)? -> SKIP or ESCALATE
+- Has this been attempted multiple times already? -> SKIP or ESCALATE
 
 Respond in JSON:
 {{
     "decision": "RETRY|SKIP|ESCALATE",
     "reasoning": "Why this decision",
-    "modification": "If RETRY, what to change"
+    "modification": "If RETRY, what specific changes to make"
 }}"""
 
-        response = self.llm.invoke(prompt)
-        
         try:
-            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            response = self.llm.invoke(prompt)
+            
+            json_match = re.search(r'\{[\s\S]*\}', response)
             if json_match:
                 decision = json.loads(json_match.group())
                 agent_logger.log_reflection(
                     agent_name=self.agent_id,
                     task_id=subtask.get('id', 'unknown'),
-                    reflection=f"Decision: {decision.get('decision')} - {decision.get('reasoning')}"
+                    reflection=f"Decision: {decision.get('decision')} - {decision.get('reasoning', '')[:100]}"
                 )
                 return decision
-        except:
-            pass
+        except Exception as e:
+            agent_logger.log_reflection(
+                agent_name=self.agent_id,
+                task_id=subtask.get('id', 'unknown'),
+                reflection=f"Review error: {e}"
+            )
         
-        # Default to SKIP if context exhausted
-        if failure_info.get('context_status', {}).get('remaining_tokens', 10000) < 5000:
-            return {
-                "decision": "SKIP",
-                "reasoning": "Context window exhausted"
-            }
+        # Default based on attempts
+        if subtask.get('attempts', 0) >= 3:
+            return {"decision": "SKIP", "reasoning": "Max attempts reached"}
         
-        return {
-            "decision": "RETRY",
-            "reasoning": "Default retry"
-        }
-    
-    def generate_final_report(self, main_task: str, subtask_results: List[Dict]) -> str:
-        """Generate final report using master document"""
-        if self.master_document:
-            self.master_document._save()
-            md_report = self.master_document.generate_status_markdown()
-        else:
-            md_report = "No master document available"
-        
-        # Add summary
-        completed = [r for r in subtask_results if r.get('success')]
-        failed = [r for r in subtask_results if not r.get('success')]
-        
-        summary = f"""# Pipeline Execution Report
-
-**Task**: {main_task[:200]}...
-**Completed**: {len(completed)} subtasks
-**Failed**: {len(failed)} subtasks
-**Timestamp**: {datetime.now().isoformat()}
-
-## Scripts Generated
-
-"""
-        for r in completed:
-            if r.get('script_path'):
-                summary += f"- `{r['script_path']}`\n"
-        
-        summary += f"\n{md_report}"
-        
-        # Save report
-        report_path = self.project_dir / "reports" / "final_report.md"
-        report_path.parent.mkdir(parents=True, exist_ok=True)
-        report_path.write_text(summary)
-        
-        return summary
+        return {"decision": "RETRY", "reasoning": "Default retry"}
     
     def get_pipeline_status(self) -> Dict[str, Any]:
         """Get current pipeline status"""
@@ -718,5 +1004,6 @@ Respond in JSON:
             'failed': len([s for s in steps.values() if s['status'] == 'failed']),
             'pending': len([s for s in steps.values() if s['status'] == 'pending']),
             'running': len([s for s in steps.values() if s['status'] == 'running']),
+            'validated': len([s for s in steps.values() if s.get('validation_status') == 'validated']),
             'document_path': str(self.master_document.document_path)
         }

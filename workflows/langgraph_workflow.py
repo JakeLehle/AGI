@@ -7,7 +7,13 @@ Orchestrates multi-agent system with:
 - Parallel SLURM job submission for independent tasks
 - Script generation and execution paradigm
 - Living document master prompt management
-- **Reflexion Memory for loop prevention** (NEW)
+- **Reflexion Memory for loop prevention**
+
+v3.2 Updates:
+- Cluster configuration via AGI_CLUSTER environment variable
+- Conda cleanup after successful task completion
+- State checkpointing for resume capability
+- cleanup_env_on_success parameter support
 
 Key v3 architecture principles:
 - SubAgents generate scripts, submit SLURM jobs, monitor completion
@@ -20,12 +26,16 @@ Environment Variables:
 - AGI_MAX_CONTEXT_TOKENS: Max tokens per subtask (default: 60000)
 - AGI_MAX_TOOL_OUTPUT_TOKENS: Max tool output before summarization (default: 25000)
 - AGI_MIN_TOKENS_TO_CONTINUE: Min tokens to continue (default: 5000)
+- AGI_CLUSTER: Cluster profile for subtask SLURM settings
+- AGI_CLUSTER_CONFIG: Path to cluster_config.yaml
 """
 
 from typing import TypedDict, Annotated, List, Dict, Any, Optional
 from pathlib import Path
 import operator
 import os
+import re
+import json
 import uuid
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -42,7 +52,12 @@ except ImportError:
         MemorySaver = None
 
 from agents.master_agent import MasterAgent
-from agents.sub_agent import ScriptFirstSubAgentV3 as ScriptFirstSubAgent
+# Import sub-agent - try v3.2 class first, fall back to base class
+try:
+    from agents.sub_agent import ScriptFirstSubAgentV3 as ScriptFirstSubAgent
+except ImportError:
+    from agents.sub_agent import ScriptFirstSubAgent
+
 from tools.sandbox import Sandbox
 from tools.conda_tools import CondaTools
 from tools.slurm_tools import SlurmTools, SlurmConfig
@@ -54,18 +69,47 @@ from utils.context_manager import ContextManager
 # ============================================================================
 # REFLEXION MEMORY INTEGRATION
 # ============================================================================
-from utils.reflexion_integration import (
-    ReflexionState,
-    create_initial_reflexion_state,
-    handle_failure as reflexion_handle_failure,
-    check_before_retry,
-    record_solution,
-    find_similar_solutions,
-    get_memory_client,
-)
+try:
+    from utils.reflexion_integration import (
+        ReflexionState,
+        create_initial_reflexion_state,
+        handle_failure as reflexion_handle_failure,
+        check_before_retry,
+        record_solution,
+        find_similar_solutions,
+        get_memory_client,
+    )
+    REFLEXION_AVAILABLE = True
+except ImportError:
+    REFLEXION_AVAILABLE = False
+    # Provide fallback types
+    ReflexionState = Dict[str, Any]
+    def create_initial_reflexion_state():
+        return {
+            "last_error": None,
+            "last_error_type": None,
+            "last_approach": None,
+            "action": None,
+            "reason": None,
+            "attempt_count": 0,
+            "tried_approaches": [],
+            "known_solution": None,
+            "solution_confidence": 0.0,
+            "escalation_target": None,
+            "should_escalate": False,
+            "should_apply_solution": False,
+            "is_duplicate": False,
+        }
+    def get_memory_client():
+        return None
+
 
 logger = logging.getLogger(__name__)
 
+
+# ============================================================================
+# WORKFLOW STATE
+# ============================================================================
 
 class WorkflowState(TypedDict):
     """State that flows through the workflow"""
@@ -103,10 +147,18 @@ class WorkflowState(TypedDict):
     status: str
     master_decision: Dict[str, Any]
     
-    # ========== REFLEXION MEMORY STATE (NEW) ==========
+    # Reflexion Memory State
     reflexion: ReflexionState
     task_attempt_counts: Dict[str, int]  # task_id -> attempt count
+    
+    # v3.2: Additional state
+    cleanup_env_on_success: bool
+    checkpoint_info: Dict[str, Any]
 
+
+# ============================================================================
+# MAIN WORKFLOW CLASS
+# ============================================================================
 
 class MultiAgentWorkflow:
     """
@@ -118,7 +170,8 @@ class MultiAgentWorkflow:
     - Parallel SLURM job submission
     - Script generation → SLURM submit → monitor paradigm
     - Living document master prompt
-    - **Reflexion Memory for semantic duplicate detection** (NEW)
+    - Reflexion Memory for semantic duplicate detection
+    - v3.2: Cluster configuration and conda cleanup support
     """
     
     # Token limits - read from environment or use defaults
@@ -135,7 +188,8 @@ class MultiAgentWorkflow:
         use_slurm: bool = True,
         parallel_enabled: bool = True,
         slurm_config: Dict[str, Any] = None,
-        use_reflexion_memory: bool = True  # NEW: Enable/disable reflexion
+        use_reflexion_memory: bool = True,
+        cleanup_env_on_success: bool = True,  # v3.2: Cleanup conda envs after success
     ):
         self.ollama_model = ollama_model
         self.ollama_base_url = ollama_base_url
@@ -143,7 +197,8 @@ class MultiAgentWorkflow:
         self.use_slurm = use_slurm
         self.parallel_enabled = parallel_enabled
         self.slurm_config = slurm_config or {}
-        self.use_reflexion_memory = use_reflexion_memory
+        self.use_reflexion_memory = use_reflexion_memory and REFLEXION_AVAILABLE
+        self.cleanup_env_on_success = cleanup_env_on_success  # v3.2
         
         # Initialize sandbox
         self.sandbox = Sandbox(self.project_dir)
@@ -180,9 +235,9 @@ class MultiAgentWorkflow:
         # Thread lock for parallel execution
         self._lock = threading.Lock()
         
-        # ========== REFLEXION MEMORY CLIENT (NEW) ==========
+        # Reflexion Memory Client
         self.memory_client = None
-        if use_reflexion_memory:
+        if self.use_reflexion_memory:
             try:
                 self.memory_client = get_memory_client()
                 logger.info("Reflexion memory enabled")
@@ -190,12 +245,15 @@ class MultiAgentWorkflow:
                 logger.warning(f"Failed to initialize reflexion memory: {e}")
                 self.use_reflexion_memory = False
         
-        # Log token-based context limits
+        # Log configuration
         logger.info(
-            f"Token-based context limits: "
-            f"max={self.MAX_CONTEXT_TOKENS}, "
-            f"tool_output={self.MAX_TOOL_OUTPUT_TOKENS}, "
-            f"min_continue={self.MIN_TOKENS_TO_CONTINUE}"
+            f"MultiAgentWorkflow v3.2 initialized: "
+            f"tokens={self.MAX_CONTEXT_TOKENS}, "
+            f"slurm={self.use_slurm}, "
+            f"parallel={self.parallel_enabled}, "
+            f"reflexion={self.use_reflexion_memory}, "
+            f"cleanup_env={self.cleanup_env_on_success}, "
+            f"cluster={os.environ.get('AGI_CLUSTER', 'default')}"
         )
         
         # Build workflow
@@ -221,7 +279,7 @@ class MultiAgentWorkflow:
         workflow.add_node("execute_sequential", self.execute_sequential)
         workflow.add_node("wait_for_jobs", self.wait_for_parallel_jobs)
         workflow.add_node("handle_results", self.handle_results)
-        workflow.add_node("reflexion_check", self.reflexion_check)  # NEW
+        workflow.add_node("reflexion_check", self.reflexion_check)
         workflow.add_node("master_review", self.master_review)
         workflow.add_node("generate_report", self.generate_final_report)
         workflow.add_node("cleanup", self.cleanup)
@@ -249,25 +307,25 @@ class MultiAgentWorkflow:
         # After sequential execution
         workflow.add_edge("execute_sequential", "handle_results")
         
-        # After handling results - go through reflexion check first (NEW)
+        # After handling results - go through reflexion check first
         workflow.add_conditional_edges(
             "handle_results",
             self.route_after_execution,
             {
                 "next_batch": "identify_parallel",
-                "review": "reflexion_check",  # Changed: go to reflexion first
+                "review": "reflexion_check",
                 "complete": "generate_report"
             }
         )
         
-        # After reflexion check (NEW)
+        # After reflexion check
         workflow.add_conditional_edges(
             "reflexion_check",
             self.route_after_reflexion,
             {
-                "apply_solution": "execute_sequential",  # Apply known fix
-                "escalate": "generate_report",           # Give up
-                "master_review": "master_review",        # Let master decide
+                "apply_solution": "execute_sequential",
+                "escalate": "generate_report",
+                "master_review": "master_review",
             }
         )
         
@@ -304,7 +362,9 @@ class MultiAgentWorkflow:
             "env_name": env_name,
             "use_slurm": self.use_slurm,
             "parallel_enabled": self.parallel_enabled,
-            "reflexion_enabled": self.use_reflexion_memory  # NEW
+            "reflexion_enabled": self.use_reflexion_memory,
+            "cleanup_env_on_success": self.cleanup_env_on_success,  # v3.2
+            "cluster": os.environ.get('AGI_CLUSTER', 'unknown'),  # v3.2
         })
         
         return {
@@ -314,8 +374,10 @@ class MultiAgentWorkflow:
             "parallel_enabled": self.parallel_enabled,
             "agent_context_status": {},
             "running_jobs": {},
-            "reflexion": create_initial_reflexion_state(),  # NEW
-            "task_attempt_counts": {}  # NEW
+            "reflexion": create_initial_reflexion_state(),
+            "task_attempt_counts": {},
+            "cleanup_env_on_success": self.cleanup_env_on_success,  # v3.2
+            "checkpoint_info": {},  # v3.2
         }
     
     def master_decompose(self, state: WorkflowState) -> Dict:
@@ -325,12 +387,52 @@ class MultiAgentWorkflow:
             context=state.get('context', {})
         )
         
+        # v3.2: Check for existing checkpoints
+        checkpoint_info = self._check_existing_checkpoints(subtasks)
+        if checkpoint_info['has_checkpoints']:
+            agent_logger.log_workflow_event("checkpoints_found", {
+                "count": len(checkpoint_info['checkpoints']),
+                "tasks": list(checkpoint_info['checkpoints'].keys())
+            })
+            print(f"  Found {len(checkpoint_info['checkpoints'])} checkpoint(s) from previous run")
+        
         return {
             "subtasks": subtasks,
             "current_subtask_idx": 0,
             "current_subtask": None,
             "parallel_batch": [],
-            "parallel_results": []
+            "parallel_results": [],
+            "checkpoint_info": checkpoint_info,  # v3.2
+        }
+    
+    def _check_existing_checkpoints(self, subtasks: List[Dict]) -> Dict[str, Any]:
+        """Check for existing checkpoints from previous runs (v3.2)"""
+        checkpoint_dir = self.project_dir / 'temp' / 'checkpoints'
+        
+        if not checkpoint_dir.exists():
+            return {"has_checkpoints": False, "checkpoints": {}}
+        
+        checkpoints = {}
+        for subtask in subtasks:
+            task_id = subtask.get('id', '')
+            safe_id = re.sub(r'[^\w\-]', '_', task_id)[:50]
+            checkpoint_path = checkpoint_dir / f"{safe_id}_checkpoint.json"
+            
+            if checkpoint_path.exists():
+                try:
+                    with open(checkpoint_path) as f:
+                        cp = json.load(f)
+                    checkpoints[task_id] = {
+                        "status": cp.get('status'),
+                        "iteration": cp.get('iteration'),
+                        "path": str(checkpoint_path)
+                    }
+                except Exception:
+                    pass
+        
+        return {
+            "has_checkpoints": len(checkpoints) > 0,
+            "checkpoints": checkpoints
         }
     
     def identify_parallel_tasks(self, state: WorkflowState) -> Dict:
@@ -392,7 +494,7 @@ class MultiAgentWorkflow:
         for subtask in batch:
             task_id = subtask['id']
             
-            # ========== CHECK REFLEXION MEMORY BEFORE RETRY (NEW) ==========
+            # Check reflexion memory before retry
             if self.use_reflexion_memory and subtask.get('context', {}).get('retry_reason'):
                 proposed_approach = subtask.get('context', {}).get('retry_reason', '')
                 check = check_before_retry(task_id, proposed_approach)
@@ -402,7 +504,6 @@ class MultiAgentWorkflow:
                         f"Task {task_id}: Proposed approach rejected as duplicate "
                         f"(similarity: {check['similarity']:.2f})"
                     )
-                    # Modify the approach or add context
                     subtask['context'] = subtask.get('context', {})
                     subtask['context']['avoid_approach'] = check['similar_approach']
                     subtask['context']['duplicate_warning'] = True
@@ -410,7 +511,7 @@ class MultiAgentWorkflow:
             # Mark as running in master document
             self.master.master_document.mark_running(task_id)
             
-            # Create sub-agent
+            # Create sub-agent with v3.2 features
             agent = ScriptFirstSubAgent(
                 agent_id=f"agent_{task_id}",
                 sandbox=self.sandbox,
@@ -420,93 +521,51 @@ class MultiAgentWorkflow:
                 ollama_base_url=self.ollama_base_url,
                 use_slurm=True,
                 slurm_config=self.slurm_config,
-                project_root=str(self.project_dir)
+                project_root=str(self.project_dir),
+                cleanup_env_on_success=self.cleanup_env_on_success,  # v3.2
             )
             
-            # Generate script and submit (don't wait)
+            # Execute - handles its own SLURM submission via sbatch
             result = agent.execute(subtask, env_name=env_name)
             
             if result.get('job_id'):
                 running_jobs[task_id] = result['job_id']
-            
-            state['parallel_results'] = state.get('parallel_results', [])
-            state['parallel_results'].append({
-                'subtask': subtask,
-                'result': result
-            })
+            elif result.get('success'):
+                # Task completed without needing SLURM (e.g., resumed from checkpoint)
+                logger.info(f"Task {task_id} completed immediately (possibly resumed)")
         
         return {
-            "running_jobs": running_jobs
-        }
-    
-    def wait_for_parallel_jobs(self, state: WorkflowState) -> Dict:
-        """Wait for submitted SLURM jobs to complete"""
-        running_jobs = state.get('running_jobs', {})
-        
-        if not running_jobs or not self.slurm_tools:
-            return {}
-        
-        # Wait for all jobs
-        job_ids = list(running_jobs.values())
-        wait_result = self.slurm_tools.wait_for_jobs(
-            job_ids=job_ids,
-            poll_interval=self.slurm_config.get('poll_interval', 10),
-            max_attempts=self.slurm_config.get('max_poll_attempts', 720)
-        )
-        
-        # Update results with job status
-        parallel_results = state.get('parallel_results', [])
-        for item in parallel_results:
-            task_id = item['subtask']['id']
-            if task_id in running_jobs:
-                job_id = running_jobs[task_id]
-                job_status = wait_result.get('jobs', {}).get(job_id, {})
-                
-                # Get job output
-                output = self.slurm_tools.get_job_output(job_id)
-                
-                item['result']['job_status'] = job_status
-                item['result']['stdout'] = output.get('stdout', '')
-                item['result']['stderr'] = output.get('stderr', '')
-                
-                # Update success based on final status
-                if job_status.get('status') == 'COMPLETED' and job_status.get('exit_code') == '0':
-                    item['result']['success'] = True
-        
-        return {
-            "parallel_results": parallel_results,
-            "running_jobs": {}
+            "running_jobs": running_jobs,
+            "parallel_results": []
         }
     
     def execute_sequential(self, state: WorkflowState) -> Dict:
-        """Execute single task sequentially"""
+        """Execute a single task sequentially with sub-agent v3.2 features"""
         subtask = state['current_subtask']
         env_name = state['env_name']
-        
-        if not subtask:
-            return {"parallel_results": []}
-        
         task_id = subtask['id']
         
-        # ========== CHECK FOR KNOWN SOLUTIONS FIRST (NEW) ==========
+        # Check for known solutions (reflexion memory)
         if self.use_reflexion_memory:
-            # Check if we have a known solution for similar errors
             previous_error = subtask.get('context', {}).get('previous_error')
             if previous_error:
-                solutions = find_similar_solutions(previous_error)
-                if solutions and solutions[0].get('score', 0) > 0.8:
-                    logger.info(
-                        f"Task {task_id}: Found known solution "
-                        f"(score: {solutions[0]['score']:.2f})"
-                    )
-                    subtask['context'] = subtask.get('context', {})
-                    subtask['context']['suggested_solution'] = solutions[0].get('solution')
-                    subtask['context']['solution_confidence'] = solutions[0].get('score')
+                try:
+                    solutions = find_similar_solutions(previous_error)
+                    if solutions and solutions[0].get('score', 0) > 0.8:
+                        logger.info(
+                            f"Task {task_id}: Found known solution "
+                            f"(score: {solutions[0]['score']:.2f})"
+                        )
+                        subtask['context'] = subtask.get('context', {})
+                        subtask['context']['suggested_solution'] = solutions[0].get('solution')
+                        subtask['context']['solution_confidence'] = solutions[0].get('score')
+                except Exception as e:
+                    logger.warning(f"Error checking for solutions: {e}")
         
         # Mark as running
         self.master.master_document.mark_running(task_id)
         
-        # Create sub-agent
+        # Create sub-agent with v3.2 features
         agent = ScriptFirstSubAgent(
             agent_id=f"agent_{task_id}",
             sandbox=self.sandbox,
@@ -516,10 +575,11 @@ class MultiAgentWorkflow:
             ollama_base_url=self.ollama_base_url,
             use_slurm=self.use_slurm,
             slurm_config=self.slurm_config,
-            project_root=str(self.project_dir)
+            project_root=str(self.project_dir),
+            cleanup_env_on_success=self.cleanup_env_on_success,  # v3.2
         )
         
-        # Execute
+        # Execute - sub-agent handles checkpointing internally
         result = agent.execute(subtask, env_name=env_name)
         
         return {
@@ -532,6 +592,101 @@ class MultiAgentWorkflow:
                 task_id: result.get('context_status', {})
             }
         }
+    
+    def wait_for_parallel_jobs(self, state: WorkflowState) -> Dict:
+        """Wait for all parallel SLURM jobs to complete"""
+        running_jobs = state.get('running_jobs', {})
+        
+        if not running_jobs:
+            return {"parallel_results": []}
+        
+        results = []
+        poll_interval = self.slurm_config.get("poll_interval", 10)
+        max_attempts = self.slurm_config.get("max_poll_attempts", 720)
+        
+        # Create mapping of job_id -> subtask
+        job_to_subtask = {}
+        for subtask in state['parallel_batch']:
+            task_id = subtask['id']
+            if task_id in running_jobs:
+                job_to_subtask[running_jobs[task_id]] = subtask
+        
+        # Poll until all jobs complete
+        completed_jobs = set()
+        attempts = 0
+        
+        while len(completed_jobs) < len(running_jobs) and attempts < max_attempts:
+            for task_id, job_id in running_jobs.items():
+                if job_id in completed_jobs:
+                    continue
+                
+                status = self.slurm_tools.get_job_status(job_id)
+                
+                if status.get('state') in ['COMPLETED', 'FAILED', 'CANCELLED', 'TIMEOUT']:
+                    completed_jobs.add(job_id)
+                    subtask = job_to_subtask.get(job_id)
+                    
+                    if subtask:
+                        result = {
+                            "success": status.get('state') == 'COMPLETED',
+                            "job_id": job_id,
+                            "state": status.get('state'),
+                            "outputs": self._collect_outputs(subtask, job_id),
+                            "error": status.get('error') if status.get('state') != 'COMPLETED' else None
+                        }
+                        results.append({
+                            "subtask": subtask,
+                            "result": result
+                        })
+            
+            if len(completed_jobs) < len(running_jobs):
+                time.sleep(poll_interval)
+                attempts += 1
+        
+        # Handle timeout
+        for task_id, job_id in running_jobs.items():
+            if job_id not in completed_jobs:
+                subtask = job_to_subtask.get(job_id)
+                if subtask:
+                    results.append({
+                        "subtask": subtask,
+                        "result": {
+                            "success": False,
+                            "job_id": job_id,
+                            "state": "TIMEOUT",
+                            "error": "Job monitoring timed out"
+                        }
+                    })
+        
+        return {
+            "parallel_results": results,
+            "running_jobs": {}
+        }
+    
+    def _collect_outputs(self, subtask: Dict, job_id: str) -> Dict:
+        """Collect outputs from completed SLURM job"""
+        outputs = {}
+        
+        expected_outputs = subtask.get('output_files', [])
+        for output_file in expected_outputs:
+            output_path = self.project_dir / output_file
+            if output_path.exists():
+                outputs[output_file] = str(output_path)
+        
+        # Also check SLURM output logs
+        log_dir = self.project_dir / 'slurm' / 'logs'
+        stdout_file = log_dir / f"*_{job_id}.out"
+        stderr_file = log_dir / f"*_{job_id}.err"
+        
+        stdout_files = list(log_dir.glob(f"*_{job_id}.out"))
+        stderr_files = list(log_dir.glob(f"*_{job_id}.err"))
+        
+        if stdout_files:
+            outputs['stdout'] = str(stdout_files[0])
+        if stderr_files:
+            outputs['stderr'] = str(stderr_files[0])
+        
+        return outputs
     
     def handle_results(self, state: WorkflowState) -> Dict:
         """Process results from execution"""
@@ -555,306 +710,203 @@ class MultiAgentWorkflow:
                 subtask['status'] = 'completed'
                 completed.append(subtask)
                 
+                # v3.2: Log if this was a resumed task
+                if result.get('resumed'):
+                    agent_logger.log_workflow_event("task_resumed_completed", {
+                        "task_id": task_id,
+                        "was_cached": result.get('skipped', False)
+                    })
+                
                 # Update master document
-                self.master.mark_subtask_complete(task_id, result)
-                
-                # ========== RECORD SOLUTION IF WE RECOVERED FROM FAILURE (NEW) ==========
-                if self.use_reflexion_memory:
-                    previous_error = subtask.get('context', {}).get('previous_error')
-                    if previous_error:
-                        # We succeeded after a failure - record the solution
-                        approach = subtask.get('context', {}).get('retry_reason', '')
-                        if approach:
-                            try:
-                                record_solution(
-                                    task_id=task_id,
-                                    problem_pattern=previous_error[:500],
-                                    error_type=state.get('reflexion', {}).get('last_error_type', 'unknown'),
-                                    solution=approach,
-                                )
-                                logger.info(f"Task {task_id}: Recorded solution for future reuse")
-                            except Exception as e:
-                                logger.warning(f"Failed to record solution: {e}")
-                
-                # Git commit
-                git_tracker.commit_task_attempt(
-                    task_id=task_id,
-                    agent_name=f"agent_{task_id}",
-                    description=subtask.get('description', '')[:100],
-                    status="success",
-                    files_modified=[result.get('script_path', '')] + result.get('output_files', []),
-                    tools_used=['script_generator', 'slurm' if self.use_slurm else 'local'],
-                    result=f"Script: {result.get('script_path')}"
+                self.master.mark_subtask_complete(
+                    task_id,
+                    result.get('outputs', {}),
+                    result.get('report', '')
                 )
                 
-                # Log to documentation
-                doc_generator.log_change({
-                    "task_id": task_id,
-                    "description": subtask.get('description', ''),
-                    "status": "success",
-                    "script_path": result.get('script_path'),
-                    "output_files": result.get('output_files', []),
-                    "conda_env_yaml": result.get('env_yaml')
-                })
-            else:
-                subtask['status'] = 'failed'
-                failed.append(subtask)
+                # v3.2: Log cleanup status
+                if result.get('env_cleaned'):
+                    agent_logger.log_workflow_event("env_cleaned", {
+                        "task_id": task_id,
+                        "env_name": result.get('env_name')
+                    })
                 
-                # ========== STORE FAILURE IN REFLEXION MEMORY (NEW) ==========
+                # Record solution if reflexion enabled
                 if self.use_reflexion_memory:
                     try:
-                        error_msg = result.get('error', 'Unknown error')
-                        approach = subtask.get('context', {}).get('retry_reason', subtask.get('description', ''))
-                        
-                        reflexion_state = reflexion_handle_failure(
-                            task_id=task_id,
-                            error_message=error_msg,
-                            approach_tried=approach,
-                            script_path=result.get('script_path'),
-                            slurm_job_id=result.get('job_id'),
-                        )
-                        
-                        # Store reflexion state for routing
-                        state['reflexion'] = reflexion_state
-                        
-                        logger.info(
-                            f"Task {task_id}: Reflexion decision: {reflexion_state['action']} "
-                            f"(attempts: {reflexion_state['attempt_count']})"
-                        )
+                        approach = subtask.get('context', {}).get('approach_tried', '')
+                        if approach:
+                            record_solution(
+                                task_id=task_id,
+                                error_message=subtask.get('context', {}).get('previous_error', ''),
+                                solution=approach
+                            )
                     except Exception as e:
-                        logger.warning(f"Failed to record failure in memory: {e}")
-                
-                # Update master document
-                self.master.mark_subtask_failed(task_id, result)
-                
-                # Log to documentation
-                doc_generator.log_change({
-                    "task_id": task_id,
-                    "description": subtask.get('description', ''),
-                    "status": "failure",
-                    "error": result.get('error', 'Unknown'),
-                    "script_path": result.get('script_path'),
-                    "context_status": result.get('context_status', {})
-                })
-        
-        # Update subtasks list
-        updated_subtasks = []
-        for st in state['subtasks']:
-            matching = next((r for r in results if r['subtask']['id'] == st['id']), None)
-            if matching:
-                updated_subtasks.append(matching['subtask'])
+                        logger.warning(f"Failed to record solution: {e}")
+            
             else:
-                updated_subtasks.append(st)
+                # Check context status
+                context_status = result.get('context_status', {})
+                remaining_tokens = context_status.get('remaining_tokens', self.MAX_CONTEXT_TOKENS)
+                
+                if remaining_tokens < self.MIN_TOKENS_TO_CONTINUE:
+                    subtask['status'] = 'failed'
+                    subtask['failure_reason'] = 'context_exhausted'
+                    failed.append(subtask)
+                    self.master.mark_subtask_failed(
+                        task_id,
+                        "Context window exhausted",
+                        result.get('error', '')
+                    )
+                else:
+                    # Mark for retry
+                    subtask['status'] = 'pending'
+                    subtask['context'] = subtask.get('context', {})
+                    subtask['context']['previous_error'] = result.get('error')
+                    subtask['context']['approach_tried'] = result.get('approach', '')
+                
+                # v3.2: Check if checkpoint was preserved
+                if result.get('checkpoint_preserved'):
+                    agent_logger.log_workflow_event("checkpoint_preserved", {
+                        "task_id": task_id,
+                        "reason": result.get('error', 'unknown')
+                    })
+        
+        # Update subtasks in state
+        updated_subtasks = state['subtasks'].copy()
+        for subtask in updated_subtasks:
+            for item in results:
+                if item['subtask']['id'] == subtask['id']:
+                    subtask.update(item['subtask'])
         
         return {
             "subtasks": updated_subtasks,
             "completed_subtasks": completed,
             "failed_subtasks": failed,
-            "parallel_results": [],
-            "task_attempt_counts": task_attempt_counts
+            "task_attempt_counts": task_attempt_counts,
+            "parallel_results": []
         }
     
-    # ========== NEW NODE: REFLEXION CHECK ==========
     def reflexion_check(self, state: WorkflowState) -> Dict:
-        """
-        Check reflexion memory before master review.
-        
-        This node:
-        1. Checks if we've hit escalation thresholds
-        2. Looks for known solutions
-        3. Checks for duplicate approaches
-        """
+        """Check reflexion memory for failed tasks"""
         failed = state.get('failed_subtasks', [])
-        reflexion = state.get('reflexion', {})
+        reflexion_state = state.get('reflexion', create_initial_reflexion_state())
         
         if not failed or not self.use_reflexion_memory:
-            return {"reflexion": reflexion}
+            return {"reflexion": reflexion_state}
         
-        subtask = failed[-1]
-        task_id = subtask['id']
-        result = subtask.get('last_result', {})
-        error_msg = result.get('error', '')
+        # Process the first failed task
+        failed_task = failed[0]
+        task_id = failed_task['id']
+        error = failed_task.get('last_result', {}).get('error', '')
+        approach = failed_task.get('context', {}).get('approach_tried', '')
         
-        # Check reflexion decision
-        action = reflexion.get('action', 'retry')
-        
-        if action == 'escalate':
-            # Hit escalation threshold
-            logger.warning(
-                f"Task {task_id}: Reflexion engine recommends escalation - "
-                f"{reflexion.get('reason')}"
-            )
-            reflexion['should_escalate'] = True
-            
-        elif action == 'apply_solution':
-            # We have a known solution
-            solution = reflexion.get('known_solution')
-            confidence = reflexion.get('solution_confidence', 0)
-            
-            logger.info(
-                f"Task {task_id}: Applying known solution (confidence: {confidence:.2f})"
+        try:
+            # Use reflexion engine to analyze
+            result = reflexion_handle_failure(
+                task_id=task_id,
+                error_message=error,
+                approach_tried=approach
             )
             
-            # Update subtask with solution
-            subtask['status'] = 'pending'
-            subtask['context'] = subtask.get('context', {})
-            subtask['context']['retry_reason'] = solution
-            subtask['context']['from_memory'] = True
-            subtask['context']['solution_confidence'] = confidence
+            reflexion_state.update(result)
             
-            # Update in state
-            for st in state['subtasks']:
-                if st['id'] == task_id:
-                    st['status'] = 'pending'
-                    st['context'] = subtask['context']
+            agent_logger.log_workflow_event("reflexion_check", {
+                "task_id": task_id,
+                "action": result.get('action'),
+                "should_escalate": result.get('should_escalate'),
+                "should_apply_solution": result.get('should_apply_solution'),
+                "is_duplicate": result.get('is_duplicate')
+            })
             
-            reflexion['should_apply_solution'] = True
-            
-        elif action == 'reject_duplicate':
-            # Approach was a duplicate
-            logger.warning(
-                f"Task {task_id}: Proposed approach was duplicate "
-                f"(similarity: {reflexion.get('similarity_score', 0):.2f})"
-            )
-            reflexion['is_duplicate'] = True
+        except Exception as e:
+            logger.warning(f"Reflexion check failed: {e}")
+            reflexion_state['action'] = 'retry'
         
-        return {
-            "reflexion": reflexion,
-            "subtasks": state['subtasks'],
-            "current_subtask": subtask if action == 'apply_solution' else None
-        }
+        return {"reflexion": reflexion_state}
     
     def master_review(self, state: WorkflowState) -> Dict:
-        """Master reviews failures"""
+        """Master agent reviews failed tasks"""
         failed = state.get('failed_subtasks', [])
-        reflexion = state.get('reflexion', {})
         
         if not failed:
-            return {"master_decision": {"decision": "CONTINUE"}}
+            return {"master_decision": {"decision": "SKIP"}}
         
-        subtask = failed[-1]
-        result = subtask.get('last_result', {})
-        task_id = subtask['id']
+        # Get master's decision on first failed task
+        failed_task = failed[0]
         
-        # Check context status - if exhausted, force skip
-        context_status = result.get('context_status', {})
-        remaining_tokens = context_status.get('remaining_tokens', 10000)
-        
-        if remaining_tokens < self.MIN_TOKENS_TO_CONTINUE:
-            agent_logger.log_reflection(
-                agent_name="master",
-                task_id=subtask['id'],
-                reflection=f"Forcing SKIP: context exhausted ({remaining_tokens} tokens remaining)"
-            )
-            
-            subtask['status'] = 'skipped'
-            for st in state['subtasks']:
-                if st['id'] == subtask['id']:
-                    st['status'] = 'skipped'
-            
-            return {
-                "subtasks": state['subtasks'],
-                "master_decision": {
-                    "decision": "SKIP",
-                    "reasoning": f"Context window exhausted ({remaining_tokens} tokens)"
-                }
-            }
-        
-        # ========== CHECK REFLEXION RECOMMENDATION (NEW) ==========
-        if reflexion.get('should_escalate'):
-            agent_logger.log_reflection(
-                agent_name="master",
-                task_id=task_id,
-                reflection=f"Reflexion engine recommends escalation: {reflexion.get('reason')}"
-            )
-            return {
-                "master_decision": {
-                    "decision": "ESCALATE",
-                    "reasoning": reflexion.get('reason', 'Too many failed attempts')
-                }
-            }
-        
-        if reflexion.get('is_duplicate'):
-            # Need a genuinely different approach
-            agent_logger.log_reflection(
-                agent_name="master",
-                task_id=task_id,
-                reflection=f"Previous approach was duplicate, need different strategy"
-            )
-            # Add context for master to generate different approach
-            result['duplicate_warning'] = True
-            result['similar_approach'] = reflexion.get('similar_approach', '')
-        
-        # Normal master review
-        decision = self.master.review_failure(subtask, result)
-        
-        # ========== VALIDATE RETRY APPROACH AGAINST MEMORY (NEW) ==========
-        if decision['decision'] == 'RETRY' and self.use_reflexion_memory:
-            proposed = decision.get('modification', '')
-            if proposed:
-                check = check_before_retry(task_id, proposed)
-                if not check['allowed']:
-                    logger.warning(
-                        f"Task {task_id}: Master's proposed approach is too similar to previous "
-                        f"(similarity: {check['similarity']:.2f}). Requesting different approach."
-                    )
-                    # Ask master to try again with different approach
-                    result['must_avoid'] = check['similar_approach']
-                    decision = self.master.review_failure(subtask, result)
-        
-        if decision['decision'] == 'RETRY':
-            # Update subtask for retry
-            for st in state['subtasks']:
-                if st['id'] == subtask['id']:
-                    st['status'] = 'pending'
-                    st['context'] = {
-                        **st.get('context', {}),
-                        'retry_reason': decision.get('modification', ''),
-                        'previous_error': result.get('error', '')
-                    }
-        
-        elif decision['decision'] == 'SKIP':
-            for st in state['subtasks']:
-                if st['id'] == subtask['id']:
-                    st['status'] = 'skipped'
-        
-        return {
-            "subtasks": state['subtasks'],
-            "master_decision": decision
-        }
-    
-    def generate_final_report(self, state: WorkflowState) -> Dict:
-        """Generate final report"""
-        report = self.master.generate_final_report(
-            main_task=state['main_task'],
-            subtask_results=state.get('completed_subtasks', [])
+        decision = self.master.review_failure(
+            subtask=failed_task,
+            error=failed_task.get('last_result', {}).get('error', ''),
+            context=failed_task.get('context', {})
         )
         
-        # Add context usage summary
-        context_summary = "\n\n## Context Usage Summary\n\n"
-        for agent_id, status in state.get('agent_context_status', {}).items():
-            if status:
-                usage_pct = status.get('usage_percent', 0)
-                context_summary += f"- {agent_id}: {usage_pct:.1f}% context used\n"
+        agent_logger.log_workflow_event("master_review", {
+            "task_id": failed_task['id'],
+            "decision": decision.get('decision'),
+            "reason": decision.get('reason', '')
+        })
         
-        report += context_summary
+        return {"master_decision": decision}
+    
+    def generate_final_report(self, state: WorkflowState) -> Dict:
+        """Generate final execution report"""
+        completed = state.get('completed_subtasks', [])
+        failed = state.get('failed_subtasks', [])
         
-        # ========== ADD REFLEXION MEMORY SUMMARY (NEW) ==========
+        # Build report
+        report = f"""
+# AGI Pipeline Execution Report
+
+Generated: {datetime.now().isoformat()}
+Cluster: {os.environ.get('AGI_CLUSTER', 'unknown')}
+
+## Summary
+
+- **Total Subtasks**: {len(state.get('subtasks', []))}
+- **Completed**: {len(completed)}
+- **Failed**: {len(failed)}
+- **Success Rate**: {len(completed) / max(len(state.get('subtasks', [])), 1) * 100:.1f}%
+
+## Task Details
+
+"""
+        
+        for subtask in completed:
+            report += f"### ✓ {subtask['id']}\n"
+            report += f"{subtask.get('description', 'No description')[:200]}\n\n"
+        
+        for subtask in failed:
+            report += f"### ✗ {subtask['id']}\n"
+            report += f"{subtask.get('description', 'No description')[:200]}\n"
+            report += f"**Error**: {subtask.get('last_result', {}).get('error', 'Unknown')[:500]}\n\n"
+        
+        # Add reflexion memory summary
         if self.use_reflexion_memory:
             try:
-                memory_summary = "\n\n## Reflexion Memory Summary\n\n"
-                for task_id, count in state.get('task_attempt_counts', {}).items():
-                    memory_summary += f"- {task_id}: {count} attempt(s)\n"
+                task_attempt_counts = state.get('task_attempt_counts', {})
+                memory_summary = "\n## Reflexion Memory Summary\n\n"
+                memory_summary += f"Tasks with retries:\n"
+                for task_id, count in task_attempt_counts.items():
+                    if count > 1:
+                        memory_summary += f"- {task_id}: {count} attempt(s)\n"
                 
-                # Get overall stats
                 client = get_memory_client()
-                stats = client._engine.get_stats() if hasattr(client, '_engine') else {}
-                if stats:
-                    memory_summary += f"\nTotal memories stored: {stats.get('memory', {}).get('total', 'N/A')}\n"
+                if client and hasattr(client, '_engine'):
+                    stats = client._engine.get_stats()
+                    if stats:
+                        memory_summary += f"\nTotal memories stored: {stats.get('memory', {}).get('total', 'N/A')}\n"
                 
                 report += memory_summary
             except Exception as e:
                 logger.warning(f"Failed to add memory summary: {e}")
+        
+        # Save report
+        reports_dir = self.project_dir / 'reports'
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        
+        report_path = reports_dir / f"final_report_{datetime.now():%Y%m%d_%H%M%S}.md"
+        report_path.write_text(report)
         
         # Save documentation
         doc_generator.save_readme()
@@ -865,7 +917,7 @@ class MultiAgentWorkflow:
             agent_name="master",
             description="Pipeline completion",
             status="success",
-            files_modified=["reports/final_report.md", "reports/pipeline_status.md"],
+            files_modified=["reports/final_report.md"],
             tools_used=["documentation_generator"],
             result=report[:500]
         )
@@ -881,7 +933,10 @@ class MultiAgentWorkflow:
         
         # Cancel any lingering jobs
         if self.slurm_tools:
-            self.slurm_tools.cancel_all_jobs()
+            try:
+                self.slurm_tools.cancel_all_jobs()
+            except Exception as e:
+                logger.warning(f"Error cancelling jobs: {e}")
         
         return {}
     
@@ -913,7 +968,6 @@ class MultiAgentWorkflow:
         
         # Check for reviewable failures
         for f in failed:
-            # Only review if context not exhausted
             context_status = f.get('last_result', {}).get('context_status', {})
             if context_status.get('remaining_tokens', 10000) >= self.MIN_TOKENS_TO_CONTINUE:
                 return "review"
@@ -925,7 +979,6 @@ class MultiAgentWorkflow:
         
         return "complete"
     
-    # ========== NEW ROUTING FUNCTION ==========
     def route_after_reflexion(self, state: WorkflowState) -> str:
         """Route after reflexion check"""
         reflexion = state.get('reflexion', {})
@@ -990,8 +1043,10 @@ class MultiAgentWorkflow:
             "final_report": "",
             "status": "started",
             "master_decision": {},
-            "reflexion": create_initial_reflexion_state(),  # NEW
-            "task_attempt_counts": {}  # NEW
+            "reflexion": create_initial_reflexion_state(),
+            "task_attempt_counts": {},
+            "cleanup_env_on_success": self.cleanup_env_on_success,  # v3.2
+            "checkpoint_info": {},  # v3.2
         }
         
         final_state = self.app.invoke(
@@ -1000,3 +1055,7 @@ class MultiAgentWorkflow:
         )
         
         return final_state
+
+
+# Need this import for wait_for_parallel_jobs
+import time
