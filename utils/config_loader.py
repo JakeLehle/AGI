@@ -243,7 +243,7 @@ class ConfigLoader:
             'env_prefix': conda.get('env_prefix', 'agi_'),
             'default_python': conda.get('default_python', '3.10'),
             'auto_export_yaml': conda.get('auto_export_yaml', True),
-            'channels': conda.get('channels', ['defaults', 'conda-forge', 'bioconda']),
+            'channels': conda.get('channels', ['nodefaults', 'conda-forge', 'bioconda']),
             'task_specific_envs': conda.get('task_specific_envs', {}),
             'package_mapping': conda.get('package_mapping', {}),
             'pip_only_packages': conda.get('pip_only_packages', [])

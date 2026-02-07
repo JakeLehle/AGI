@@ -432,7 +432,7 @@ conda:
     yaml_dir: "envs"
   
   channels:
-    - defaults
+    - nodefaults
     - conda-forge
     - bioconda
     - pytorch  # For GPU jobs

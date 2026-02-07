@@ -159,7 +159,7 @@ class CondaTools:
                 "env_name": full_env_name,
                 "already_existed": True
             }
-        
+
         # Build create command
         create_args = [
             "create", "-n", full_env_name,

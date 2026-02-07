@@ -498,7 +498,7 @@ class ScriptFirstSubAgentV3:
     
     def _generate_env_yaml(self, subtask: Dict, env_name: str) -> str:
         packages = subtask.get('packages', [])
-        deps = ['python=3.10']
+        deps = ['python>=3.10']
         pip_pkgs = []
         
         for pkg in packages:
@@ -507,7 +507,7 @@ class ScriptFirstSubAgentV3:
             else:
                 deps.append(pkg)
         
-        lines = [f"name: {env_name}", "channels:", "  - conda-forge", "  - bioconda", "  - defaults", "dependencies:"]
+        lines = [f"name: {env_name}", "channels:", "  - conda-forge", "  - bioconda", "plotly", "  - nodefaults", "dependencies:"]
         for d in deps:
             lines.append(f"  - {d}")
         
