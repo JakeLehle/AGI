@@ -1,6 +1,9 @@
 """
 Dynamic tool creation capability.
 Allows agents to generate new tools when existing ones are insufficient.
+
+v3.2: Default model switched to qwen3-coder-next, uses parse_json_resilient
+for robust JSON extraction from LLM responses.
 """
 
 from pathlib import Path
@@ -8,26 +11,43 @@ from typing import Dict, Any
 from langchain_community.llms import Ollama
 import importlib.util
 import sys
+import json
+import re
+
+# Import resilient JSON parser (falls back to basic regex if unavailable)
+try:
+    from agents.master_agent import parse_json_resilient
+except ImportError:
+    def parse_json_resilient(text):
+        """Fallback: basic regex extraction"""
+        match = re.search(r'\{[\s\S]*\}', text)
+        if match:
+            try:
+                return json.loads(match.group())
+            except (json.JSONDecodeError, ValueError):
+                pass
+        return None
+
 
 class ToolCreator:
     """Creates new tools dynamically based on agent needs"""
-    
-    def __init__(self, ollama_model: str = "llama3.1:70b"):
+
+    def __init__(self, ollama_model: str = "qwen3-coder-next"):
         self.llm = Ollama(model=ollama_model)
         self.dynamic_tools_dir = Path("tools/dynamic_tools")
         self.dynamic_tools_dir.mkdir(parents=True, exist_ok=True)
         self.created_tools = {}
-    
+
     def should_create_tool(self, task_description: str, available_tools: list) -> Dict[str, Any]:
         """Determine if a new tool is needed"""
-        
+
         prompt = f"""
 You have these available tools:
 {', '.join(available_tools)}
 
 For this task: "{task_description}"
 
-Do you need a new tool that doesn't exist yet? 
+Do you need a new tool that doesn't exist yet?
 
 Answer with JSON:
 {{
@@ -39,24 +59,18 @@ Answer with JSON:
 
 Only answer true if the existing tools are truly insufficient.
 """
-        
+
         response = self.llm.invoke(prompt)
-        
-        # Parse response (simplified - you'd want better parsing)
-        try:
-            # Extract JSON from response
-            import json
-            import re
-            json_match = re.search(r'\{.*\}', response, re.DOTALL)
-            if json_match:
-                return json.loads(json_match.group())
-            return {"needs_new_tool": False}
-        except:
-            return {"needs_new_tool": False}
-    
+
+        # Use resilient JSON parser
+        parsed = parse_json_resilient(response)
+        if parsed and 'needs_new_tool' in parsed:
+            return parsed
+        return {"needs_new_tool": False}
+
     def create_tool(self, tool_name: str, functionality: str, context: str) -> Dict[str, Any]:
         """Generate a new tool function"""
-        
+
         prompt = f"""
 Create a Python function for this tool:
 
@@ -81,18 +95,18 @@ import json
 def my_tool(param1: str, param2: int) -> Dict[str, Any]:
     \"\"\"
     Tool description here.
-    
+
     Args:
         param1: Description
         param2: Description
-    
+
     Returns:
         Dictionary with results
     \"\"\"
     try:
         # Implementation here
         result = do_something(param1, param2)
-        
+
         return {{
             "success": True,
             "result": result
@@ -106,45 +120,45 @@ def my_tool(param1: str, param2: int) -> Dict[str, Any]:
 
 Generate ONLY the Python code, no explanation.
 """
-        
+
         code = self.llm.invoke(prompt)
-        
+
         # Clean up code (remove markdown formatting if present)
         code = code.replace("```python", "").replace("```", "").strip()
-        
+
         # Save tool to file
         tool_file = self.dynamic_tools_dir / f"{tool_name}.py"
         tool_file.write_text(code)
-        
+
         # Load the tool
         try:
             spec = importlib.util.spec_from_file_location(tool_name, tool_file)
             module = importlib.util.module_from_spec(spec)
             sys.modules[tool_name] = module
             spec.loader.exec_module(module)
-            
+
             # Get the function
             tool_func = getattr(module, tool_name)
             self.created_tools[tool_name] = tool_func
-            
+
             return {
                 "success": True,
                 "tool_name": tool_name,
                 "filepath": str(tool_file),
                 "code": code
             }
-            
+
         except Exception as e:
             return {
                 "success": False,
                 "error": f"Failed to load tool: {str(e)}",
                 "code": code
             }
-    
+
     def get_tool(self, tool_name: str):
         """Retrieve a dynamically created tool"""
         return self.created_tools.get(tool_name)
-    
+
     def list_created_tools(self) -> list:
         """List all dynamically created tools"""
         return list(self.created_tools.keys())
