@@ -1,37 +1,57 @@
-# Multi-Agent System Configuration v2
+# =============================================================================
+# Multi-Agent System Configuration v3.2
+# =============================================================================
 # Supports script-first architecture with token-based context management
+#
+# Target: ARC GPU cluster with qwen3-coder-next
+# Context: 32K tokens (OLLAMA_CONTEXT_LENGTH=32768 set in RUN script)
+# GPU: V100 (16GB VRAM)
+# =============================================================================
 
 # =============================================================================
 # Ollama Settings
 # =============================================================================
 ollama:
-  model: "llama3.1:70b"    # Use "llama3.1:8b" for CPU testing
+  model: "qwen3-coder-next"    # GPU-optimized coding model
   base_url: "http://127.0.0.1:11434"
-  # Note: context_length is now managed by context_manager, not here
-  # The model's actual context length should be >= max_tokens_per_task
-  model_context_length: 128000  # llama3.1:70b supports 128K
+  
+  # Must match OLLAMA_CONTEXT_LENGTH in RUN_AGI_PIPELINE_ARC.sh
+  # V100 (16GB) comfortably handles 32K context for qwen3-coder-next
+  # Increase to 65536 if VRAM allows and you update the RUN script to match
+  model_context_length: 32768
 
 # =============================================================================
-# Context Management (NEW in v2)
-# Replaces iteration-based limits with token-based context windows
+# Context Management (v3.2 - Sized for 32K model context)
+# =============================================================================
+# Token budget must fit within model_context_length minus overhead for
+# system prompt (~1K tokens) and response generation (~2-4K tokens).
+#
+# Budget breakdown for 32K context:
+#   ~1K   system prompt + instructions
+#   ~25K  accumulated agent context (history, tool outputs, task state)
+#   ~3K   current turn input
+#   ~3K   response generation
 # =============================================================================
 context:
   # Maximum tokens per SubAgent context window
-  # Each task gets this much "thinking space" before context exhaustion
-  max_tokens_per_task: 70000
+  # Set to ~25K to leave headroom within 32K model context
+  max_tokens_per_task: 25000
   
   # Maximum tokens for any single tool output (logs, file contents, etc.)
   # Larger outputs are automatically paginated
-  max_tool_output_tokens: 25000
+  # Sized to fit comfortably in 25K task budget with room for history
+  max_tool_output_tokens: 12000
   
   # Minimum tokens needed to attempt another iteration
   # If remaining < this, task is marked for skip/escalate
-  min_tokens_to_continue: 10000
+  min_tokens_to_continue: 3000
   
   # Target size for history summaries when truncating
-  summary_target_tokens: 2000
+  summary_target_tokens: 1500
   
-  # Token estimation: characters per token (4 is conservative for LLaMA)
+  # Token estimation: characters per token
+  # qwen3 tokenizer is slightly more efficient than llama (~3.5-4 chars/token)
+  # Using 4 as conservative estimate
   chars_per_token: 4
   
   # Enable automatic history summarization when context fills
@@ -41,17 +61,17 @@ context:
   recent_history_percent: 30
 
 # =============================================================================
-# Agent Settings (Updated for v2)
+# Agent Settings
 # =============================================================================
 agents:
-  # Legacy setting - kept for backward compatibility but NOW IGNORED
+  # Legacy setting - kept for backward compatibility
   # Context exhaustion (not iteration count) determines retry limits
-  max_retries: 12  # DEPRECATED: Use context.max_tokens_per_task instead
+  max_retries: 12
   
   timeout_seconds: 300
   enable_dynamic_tools: true
   
-  # Script-first settings (NEW in v2)
+  # Script-first settings
   script_first:
     enabled: true
     
@@ -100,7 +120,7 @@ agents:
       - ".sh"
 
 # =============================================================================
-# Master Prompt Document (NEW in v2)
+# Master Prompt Document
 # Living document that tracks pipeline state
 # =============================================================================
 master_document:
@@ -133,8 +153,11 @@ master_document:
 slurm:
   enabled: true
   
-  # Default cluster to use (can be overridden with --cluster CLI option)
-  default_cluster: "zeus"
+  # Default cluster for CPU subtasks
+  default_cluster: "arc_compute1"
+  
+  # Default cluster for GPU subtasks (auto-selected by package detection)
+  default_gpu_cluster: "arc_gpu1v100"
   
   # Polling settings
   poll_interval: 10       # Seconds between job status checks
@@ -143,7 +166,7 @@ slurm:
   # Job naming prefix
   job_prefix: "agi"
   
-  # Script-first specific settings (NEW in v2)
+  # Script submission settings
   script_submission:
     # Generate sbatch scripts (vs direct srun)
     use_sbatch: true
@@ -164,494 +187,169 @@ slurm:
     wait_timeout_seconds: 0
 
 # =============================================================================
-# Cluster Configurations
+# Cluster Configurations (Summary - full definitions in cluster_config.yaml)
+# =============================================================================
+# These are loaded from config/cluster_config.yaml at runtime.
+# The entries here are for reference and fallback only.
 # =============================================================================
 clusters:
-  # ---------------------------------------------------------------------------
-  # Zeus cluster - CPU only, high memory (192 cores, ~1TB RAM per node)
-  # ---------------------------------------------------------------------------
-  zeus:
-    name: "zeus"
-    description: "Main CPU cluster with high memory nodes"
-    
-    # Node specifications
-    nodes_total: 10
-    cores_per_node: 192
-    memory_per_node: "1000G"
+  # ARC CPU (default for subtasks)
+  arc_compute1:
+    name: "ARC Compute1"
+    description: "Default CPU partition - 65 nodes, 3-day max"
+    default_partition: "compute1"
+    default_cpus: 20
+    default_memory: "64G"
+    default_time: "1-00:00:00"
     has_gpu: false
-    
-    # Default partition and resources
+  
+  # ARC GPU (for GPU subtasks)
+  arc_gpu1v100:
+    name: "ARC GPU 1×V100"
+    description: "V100 GPU partition - 22 nodes, 3-day max"
+    default_partition: "gpu1v100"
+    default_cpus: 80
+    default_time: "1-00:00:00"
+    has_gpu: true
+    gpu_type: "v100"
+  
+  # Zeus CPU (legacy fallback)
+  zeus:
+    name: "Zeus CPU"
+    description: "Legacy high-memory CPU cluster"
     default_partition: "normal"
     default_cpus: 4
     default_memory: "16G"
     default_time: "04:00:00"
-    
-    # Partition configurations
+    has_gpu: false
     partitions:
       normal:
         max_time: "7-00:00:00"
         max_cpus: 192
         max_memory: "1000G"
-        nodes: "n1722-n1733"
-        description: "Standard compute partition"
         has_gpu: false
-      interactive:
-        max_time: "3650-00:00:00"
-        max_cpus: 192
-        max_memory: "1000G"
-        nodes: "n1734"
-        description: "Interactive/long-running jobs"
-        has_gpu: false
+
+# =============================================================================
+# Resource Profiles (Auto-select based on task keywords)
+# =============================================================================
+resource_profiles:
+  default:
+    cpus: 20
+    memory: "64G"
+    time: "1-00:00:00"
+    gpus: 0
+  
+  lightweight:
+    cpus: 4
+    memory: "16G"
+    time: "02:00:00"
+    gpus: 0
+    keywords:
+      - "download"
+      - "copy"
+      - "move"
+      - "convert"
+      - "format"
+  
+  bioinformatics:
+    cpus: 20
+    memory: "64G"
+    time: "1-00:00:00"
+    gpus: 0
+    keywords:
+      - "scanpy"
+      - "anndata"
+      - "squidpy"
+      - "popv"
+      - "spatial"
+      - "h5ad"
+      - "seurat"
+      - "bioconductor"
+  
+  heavy_compute:
+    cpus: 40
+    memory: "128G"
+    time: "2-00:00:00"
+    gpus: 0
+    keywords:
+      - "alignment"
+      - "mapping"
+      - "assembly"
+      - "star"
+      - "cellranger"
+      - "salmon"
+  
+  gpu_ml:
+    cpus: 80
+    memory: null    # No memory spec for GPU nodes
+    time: "1-00:00:00"
+    gpus: 1
+    gpu_type: "v100"
+    partition: "gpu1v100"
+    keywords:
+      - "torch"
+      - "tensorflow"
+      - "scvi"
+      - "train"
+      - "gpu"
+      - "cuda"
+      - "deep learning"
+
+# =============================================================================
+# Failure Diagnosis (Pattern-based auto-recovery)
+# =============================================================================
+failure_diagnosis:
+  patterns:
+    module_not_found:
+      regex: "ModuleNotFoundError: No module named '(.+)'"
+      action: "add_package"
+      description: "Missing Python package"
     
-    # Extra SBATCH directives for this cluster
-    sbatch_extras: []
-  
-  # ---------------------------------------------------------------------------
-  # GPU Cluster - Mixed CPU and GPU nodes (80 cores per node)
-  # ---------------------------------------------------------------------------
-  gpu_cluster:
-    name: "gpu_cluster"
-    description: "GPU cluster with V100, A100, and DGX nodes"
+    file_not_found:
+      regex: "FileNotFoundError: .*No such file or directory: '(.+)'"
+      action: "check_path"
+      description: "Missing input file"
     
-    # Default node specifications (varies by partition)
-    nodes_total: 120
-    cores_per_node: 80
-    memory_per_node: "256G"
-    has_gpu: true
+    memory_error:
+      regex: "(MemoryError|OutOfMemoryError|CUDA out of memory)"
+      action: "increase_resources"
+      description: "Insufficient memory"
     
-    # Default partition and resources
-    default_partition: "compute1"
-    default_cpus: 4
-    default_memory: "16G"
-    default_time: "04:00:00"
-    default_gpus: 0  # No GPU by default, must be explicitly requested
+    timeout:
+      regex: "(TIMEOUT|DUE TO TIME LIMIT|exceeded.*time)"
+      action: "increase_time"
+      description: "Job exceeded time limit"
     
-    # Partition configurations
-    partitions:
-      # === CPU Compute Partitions ===
-      compute1:
-        max_time: "3-00:01:00"
-        max_cpus: 80
-        max_memory: "256G"
-        nodes: "c001-c065"
-        description: "Standard CPU compute (3 day limit) - DEFAULT"
-        has_gpu: false
-        default: true
-      
-      compute2:
-        max_time: "10-00:01:00"
-        max_cpus: 80
-        max_memory: "256G"
-        nodes: "c066-c116"
-        description: "Extended CPU compute (10 day limit)"
-        has_gpu: false
-      
-      compute3:
-        max_time: "3-00:01:00"
-        max_cpus: 80
-        max_memory: "256G"
-        nodes: "c120-c127"
-        description: "Additional CPU compute"
-        has_gpu: false
-      
-      # === High Memory Partitions ===
-      bigmem:
-        max_time: "3-00:00:00"
-        max_cpus: 80
-        max_memory: "1000G"
-        nodes: "b001-b002"
-        description: "High memory nodes (~1TB RAM)"
-        has_gpu: false
-      
-      bigmem2:
-        max_time: "3-00:00:00"
-        max_cpus: 80
-        max_memory: "1500G"
-        nodes: "b003"
-        description: "Extra high memory node (~1.5TB RAM)"
-        has_gpu: false
-      
-      # === GPU Partitions - V100 ===
-      gpu1v100:
-        max_time: "3-00:01:00"
-        max_cpus: 40
-        max_memory: "256G"
-        max_gpus: 4
-        gpu_type: "v100"
-        vram_per_gpu: "32G"
-        nodes: "gpu001-gpu022"
-        description: "V100 GPUs (4x 32GB per node)"
-        has_gpu: true
-      
-      gpu2v100:
-        max_time: "3-00:00:00"
-        max_cpus: 40
-        max_memory: "256G"
-        max_gpus: 4
-        gpu_type: "v100"
-        vram_per_gpu: "32G"
-        nodes: "gpu027-gpu035"
-        description: "V100 GPUs (4x 32GB per node)"
-        has_gpu: true
-      
-      gpu4v100:
-        max_time: "3-00:00:00"
-        max_cpus: 40
-        max_memory: "256G"
-        max_gpus: 4
-        gpu_type: "v100"
-        vram_per_gpu: "32G"
-        nodes: "gpu037-gpu038"
-        description: "V100 GPUs (4x 32GB per node)"
-        has_gpu: true
-      
-      # === GPU Partitions - A100 ===
-      gpu1a100:
-        max_time: "3-00:00:00"
-        max_cpus: 64
-        max_memory: "512G"
-        max_gpus: 4
-        gpu_type: "a100"
-        vram_per_gpu: "80G"
-        nodes: "gpu039-gpu040"
-        description: "A100 GPUs (4x 80GB per node) - High performance"
-        has_gpu: true
-      
-      # === DGX A100 Nodes ===
-      dgxa100:
-        max_time: "infinite"
-        max_cpus: 128
-        max_memory: "1000G"
-        max_gpus: 8
-        gpu_type: "a100"
-        vram_per_gpu: "80G"
-        nodes: "dgx001-dgx003"
-        description: "DGX A100 nodes (8x 80GB GPUs each) - Premium"
-        has_gpu: true
-      
-      # === Testing Partition ===
-      testing:
-        max_time: "infinite"
-        max_cpus: 80
-        max_memory: "256G"
-        nodes: "c075-c078"
-        description: "Testing partition (no time limit)"
-        has_gpu: false
-      
-      # === Lab-specific Partitions ===
-      uavlab:
-        max_time: "infinite"
-        max_cpus: 80
-        max_memory: "256G"
-        nodes: "xe001"
-        description: "UAV Lab partition"
-        has_gpu: false
-      
-      uavlab2:
-        max_time: "infinite"
-        max_cpus: 80
-        max_memory: "256G"
-        max_gpus: 4
-        gpu_type: "v100"
-        nodes: "gpu041-gpu042"
-        description: "UAV Lab GPU partition"
-        has_gpu: true
-      
-      trustlab:
-        max_time: "infinite"
-        max_cpus: 80
-        max_memory: "256G"
-        nodes: "xe002"
-        description: "Trust Lab partition"
-        has_gpu: false
+    conda_error:
+      regex: "(CondaError|PackagesNotFoundError|ResolvePackageNotFound)"
+      action: "fix_environment"
+      description: "Conda environment issue"
     
-    # Extra SBATCH directives for this cluster
-    sbatch_extras: []
+    permission_error:
+      regex: "PermissionError: .*"
+      action: "check_permissions"
+      description: "File permission issue"
+    
+    slurm_error:
+      regex: "(FAILED|NODE_FAIL|PREEMPTED)"
+      action: "retry_different_node"
+      description: "SLURM node failure"
 
 # =============================================================================
-# Parallel Execution Settings (Updated for v2)
-# =============================================================================
-parallel:
-  enabled: true
-  
-  # Maximum parallel SLURM jobs to submit at once
-  max_parallel_jobs: 10
-  
-  # Thread pool size for local parallel operations
-  max_threads: 4
-  
-  # Maximum tasks to batch together
-  max_batch_size: 5
-  
-  # Strategy for identifying parallel tasks
-  # Options: "dependency_based", "all_pending", "manual"
-  parallel_strategy: "dependency_based"
-  
-  # Minimum tasks to trigger parallel mode (otherwise sequential)
-  min_tasks_for_parallel: 2
-
-# =============================================================================
-# Sandbox Settings
-# =============================================================================
-sandbox:
-  enforce_sandbox: true
-  subdirectories:
-    - data
-    - data/inputs
-    - data/outputs
-    - data/outputs/analysis
-    - scripts
-    - scripts/generated      # NEW: For auto-generated scripts
-    - logs
-    - envs
-    - reports
-    - temp
-    - slurm
-    - slurm/scripts
-    - slurm/logs
-
-# =============================================================================
-# Conda Environment Settings (Updated for v2)
-# =============================================================================
-conda:
-  env_prefix: "agi_"
-  default_python: "3.10"
-  auto_export_yaml: true
-  auto_cleanup: false
-  
-  # NEW in v2: Task-specific environments
-  task_specific_envs:
-    enabled: true
-    # Create separate env for each task (vs shared project env)
-    per_task: true
-    # Naming pattern for task envs
-    naming_pattern: "task_{task_id}_{date}"
-    # Export YAML for each task env
-    export_yaml: true
-    # YAML output directory
-    yaml_dir: "envs"
-  
-  channels:
-    - nodefaults
-    - conda-forge
-    - bioconda
-    - pytorch  # For GPU jobs
-  
-  # Package mapping: common names -> conda packages
-  # Helps with automatic environment creation
-  package_mapping:
-    scanpy: "conda-forge::scanpy"
-    squidpy: "conda-forge::squidpy"
-    anndata: "conda-forge::anndata"
-    pandas: "conda-forge::pandas"
-    numpy: "conda-forge::numpy"
-    scipy: "conda-forge::scipy"
-    matplotlib: "conda-forge::matplotlib"
-    seaborn: "conda-forge::seaborn"
-    scikit-learn: "conda-forge::scikit-learn"
-  
-  # Packages that must be installed via pip (not in conda)
-  pip_only_packages:
-    - popv
-    - popV
-    - scvi-tools
-    - cellxgene
-    - celltypist
-    - decoupler
-
-# =============================================================================
-# Logging
-# =============================================================================
-logging:
-  level: "INFO"
-  json_format: true
-  console_output: true
-  
-  # Log files
-  files:
-    - execution_log.jsonl
-    - agent_activity.jsonl
-    - slurm_jobs.jsonl
-    - errors.jsonl
-    - context_usage.jsonl    # NEW: Track token usage
-  
-  # NEW in v2: Context tracking
-  track_context_usage: true
-  log_token_estimates: true
-
-# =============================================================================
-# Git Integration
-# =============================================================================
-git:
-  auto_commit: true
-  commit_on_success: true
-  tag_failures: true
-  
-  # NEW in v2: Commit generated scripts
-  commit_scripts: true
-  commit_conda_yamls: true
-
-# =============================================================================
-# Documentation
-# =============================================================================
-documentation:
-  auto_generate_readme: true
-  update_frequency: "on_completion"
-  include_code_samples: true
-  
-  reports:
-    - task_summary
-    - environment_summary
-    - execution_log
-    - slurm_job_summary
-    - pipeline_status      # NEW: From master document
-    - context_usage        # NEW: Token usage report
-    - script_inventory     # NEW: List of generated scripts
-
-# =============================================================================
-# Workflow (Updated for v2)
+# Workflow Settings
 # =============================================================================
 workflow:
   enable_checkpointing: true
   checkpoint_frequency: "per_subtask"
-  max_execution_time_minutes: 480
+  max_execution_time_minutes: 4320   # 3 days (matching GPU partition max)
   
-  # Master document settings
   master_document:
     enabled: true
-    persist_state: true
-    resume_from_state: true  # Resume pipeline from saved state on restart
   
   subtask:
-    # DEPRECATED: max_iterations is now ignored
-    # Context exhaustion determines retry limits
-    max_iterations: 12  # IGNORED - kept for backward compatibility
-    
-    # NEW: Token-based settings (override context.* if specified)
-    # max_context_tokens: 70000  # Uncomment to override
-    # min_tokens_to_continue: 10000  # Uncomment to override
-    
-    require_final_report: true
-    report_on_failure: true
-    
-    # NEW in v2: Script-first behavior
     generate_script: true
     submit_via_slurm: true
-    verify_outputs: true
-    
-    # Failure handling
-    on_context_exhausted: "skip"  # Options: "skip", "escalate", "retry_with_summary"
-    on_unrecoverable_error: "skip"  # Options: "skip", "escalate", "abort"
-
-# =============================================================================
-# Failure Diagnosis (NEW in v2)
-# Automatic error pattern detection and recovery
-# =============================================================================
-failure_diagnosis:
-  enabled: true
   
-  # Error patterns and their recovery strategies
-  patterns:
-    missing_package:
-      regex: "ModuleNotFoundError: No module named ['\"]([\\w]+)['\"]"
-      recoverable: true
-      action: "add_package_and_retry"
-    
-    missing_file:
-      regex: "FileNotFoundError:.*['\"]([^\"']+)['\"]"
-      recoverable: true
-      action: "check_paths_and_retry"
-    
-    out_of_memory:
-      regex: "MemoryError|OutOfMemoryError|OOM"
-      recoverable: true
-      action: "increase_memory_and_retry"
-      memory_multiplier: 2.0
-    
-    gpu_memory:
-      regex: "CUDA out of memory|CUDA error"
-      recoverable: true
-      action: "reduce_batch_or_use_cpu"
-    
-    permission_error:
-      regex: "Permission denied"
-      recoverable: false
-      action: "escalate"
-    
-    timeout:
-      regex: "Timeout|exceeded time limit"
-      recoverable: true
-      action: "increase_time_and_retry"
-      time_multiplier: 2.0
-    
-    syntax_error:
-      regex: "SyntaxError|IndentationError"
-      recoverable: true
-      action: "regenerate_script"
-
-# =============================================================================
-# Web Search
-# =============================================================================
-web_search:
-  provider: "duckduckgo"
-  max_results_per_query: 10
-  rate_limit_seconds: 1.0
-  cache_results: true
-
-# =============================================================================
-# Prompt Settings
-# =============================================================================
-prompts:
-  prompts_dir: "prompts"
-  archive_prompts: true
-  naming_pattern: "prompt_{timestamp}_{task_hash}.txt"
-
-# =============================================================================
-# Resource Defaults by Task Type (NEW in v2)
-# Automatic resource selection based on task characteristics
-# =============================================================================
-resource_profiles:
-  # Default profile
-  default:
-    cpus: 4
-    memory: "16G"
-    time: "04:00:00"
-    gpus: 0
-    partition: null  # Use cluster default
-  
-  # Single-cell analysis (high memory)
-  single_cell:
-    keywords: ["scanpy", "anndata", "h5ad", "scRNA", "single-cell"]
-    cpus: 8
-    memory: "64G"
-    time: "08:00:00"
-    gpus: 0
-    partition: null
-  
-  # Deep learning (GPU required)
-  deep_learning:
-    keywords: ["torch", "tensorflow", "scvi", "popv", "neural", "model training"]
-    cpus: 8
-    memory: "64G"
-    time: "12:00:00"
-    gpus: 1
-    gpu_type: "v100"
-    partition: "gpu1v100"
-  
-  # Large-scale analysis (high memory + long time)
-  large_scale:
-    keywords: ["whole genome", "million cells", "large dataset", "batch processing"]
-    cpus: 16
-    memory: "256G"
-    time: "24:00:00"
-    gpus: 0
-    partition: "bigmem"
-  
-  # Quick tasks (minimal resources)
-  quick:
-    keywords: ["convert", "rename", "copy", "simple", "quick"]
-    cpus: 2
-    memory: "8G"
-    time: "01:00:00"
-    gpus: 0
-    partition: null
+  parallel:
+    enabled: true
+    max_parallel_jobs: 10

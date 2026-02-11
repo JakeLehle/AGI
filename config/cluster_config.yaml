@@ -1,191 +1,297 @@
 # =============================================================================
-# AGI Pipeline - Cluster Configuration
+# AGI Pipeline v3.2 - Cluster Configuration
 # =============================================================================
-# Place this file at: {AGI_ROOT}/config/cluster_config.yaml
+# 
+# PRIMARY TARGET: ARC HPC Cluster (GPU + CPU)
+# FALLBACK: Zeus CPU Cluster (preserved for backward compatibility)
 #
-# Set the cluster via environment variable in RUN_AGI_PIPELINE.sh:
-#   export AGI_CLUSTER="zeus_cpu"   # For CPU cluster
-#   export AGI_CLUSTER="gpu_v100"   # For GPU cluster
+# Architecture:
+#   - Master pipeline runs on ARC GPU node (Ollama + qwen3-coder-next)
+#   - Subtask scripts routed to GPU or CPU partitions based on task needs
+#   - AGI_CLUSTER sets DEFAULT subtask target (compute1 for CPU tasks)
+#   - AGI_GPU_CLUSTER sets GPU subtask target (gpu1v100 for GPU tasks)
+#
+# IMPORTANT - GPU NODE RULES:
+#   - Do NOT specify --mem on GPU partitions (causes allocation failures)
+#   - Use --gres=gpu:N format (not --gpus N)
+#   - Standard GPU request: --gres=gpu:1 -N 1 -n 1 -c 80
+#
 # =============================================================================
 
-default_cluster: zeus_cpu
+default_cluster: arc_compute1
+default_gpu_cluster: arc_gpu1v100
+
+# =============================================================================
+# ARC GPU PARTITIONS (for subtasks requiring GPU)
+# =============================================================================
+# NOTE: No memory directive on any GPU partition - let SLURM use defaults.
+# Specifying memory on GPU nodes causes allocation failures.
+# =============================================================================
 
 clusters:
 
   # ---------------------------------------------------------------------------
-  # Zeus CPU Cluster - Jake's high-memory CPU jobs
+  # ARC GPU 1×V100 - Primary GPU partition (22 nodes, best availability)
   # ---------------------------------------------------------------------------
-  zeus_cpu:
-    name: "Zeus CPU Cluster"
-    description: "High-memory CPU cluster (up to 192 cores, 900GB RAM)"
-    
-    slurm:
-      partition: "normal"
-      account: "jlehle"
-      nodes: 1
-      ntasks: 1
-      cpus_per_task: 40        # Default for subtasks
-      memory: "64G"            # Default for subtasks
-      time: "08:00:00"         # Default for subtasks
-    
-    # Maximum limits for this cluster
-    limits:
-      max_cpus: 192
-      max_memory: "900G"
-      max_time: "7-00:00:00"
-    
-    gpu:
-      available: false
-
-  # ---------------------------------------------------------------------------
-  # GPU V100 Cluster
-  # ---------------------------------------------------------------------------
-  gpu_v100:
-    name: "GPU Cluster (V100)"
-    description: "GPU cluster with V100 cards"
+  arc_gpu1v100:
+    name: "ARC GPU 1×V100"
+    description: "Single V100 GPU nodes - best availability for GPU tasks"
     
     slurm:
       partition: "gpu1v100"
       account: "sdz852"
       nodes: 1
       ntasks: 1
-      cpus_per_task: 10
-      # NOTE: No memory specification for this cluster
-      time: "12:00:00"
+      cpus_per_task: 80
+      # NO memory - GPU nodes must use defaults
+      time: "1-00:00:00"
     
     limits:
-      max_cpus: 40
+      max_cpus: 80
+      max_time: "3-00:01:00"
+      nodes_total: 22
+    
+    gpu:
+      available: true
+      default_count: 1
+      max_count: 1
+      type: "v100"
+      directive_format: "--gres=gpu:{count}"
+
+  # ---------------------------------------------------------------------------
+  # ARC GPU 2×V100 (9 nodes)
+  # ---------------------------------------------------------------------------
+  arc_gpu2v100:
+    name: "ARC GPU 2×V100"
+    description: "Dual V100 GPU nodes - for larger GPU workloads"
+    
+    slurm:
+      partition: "gpu2v100"
+      account: "sdz852"
+      nodes: 1
+      ntasks: 1
+      cpus_per_task: 80
+      time: "1-00:00:00"
+    
+    limits:
+      max_cpus: 80
       max_time: "3-00:00:00"
+      nodes_total: 9
+    
+    gpu:
+      available: true
+      default_count: 1
+      max_count: 2
+      type: "v100"
+      directive_format: "--gres=gpu:{count}"
+
+  # ---------------------------------------------------------------------------
+  # ARC GPU 4×V100 (2 nodes)
+  # ---------------------------------------------------------------------------
+  arc_gpu4v100:
+    name: "ARC GPU 4×V100"
+    description: "Quad V100 GPU nodes - for heavy multi-GPU workloads"
+    
+    slurm:
+      partition: "gpu4v100"
+      account: "sdz852"
+      nodes: 1
+      ntasks: 1
+      cpus_per_task: 80
+      time: "1-00:00:00"
+    
+    limits:
+      max_cpus: 80
+      max_time: "3-00:00:00"
+      nodes_total: 2
     
     gpu:
       available: true
       default_count: 1
       max_count: 4
       type: "v100"
-      # Use --gpus N format (not --gres=gpu:N)
-      directive_format: "--gpus {count}"
+      directive_format: "--gres=gpu:{count}"
 
   # ---------------------------------------------------------------------------
-  # GPU A100 Cluster
+  # ARC GPU A100 (2 nodes)
   # ---------------------------------------------------------------------------
-  gpu_a100:
-    name: "GPU Cluster (A100)"
-    description: "GPU cluster with A100 cards"
+  arc_gpu1a100:
+    name: "ARC GPU A100"
+    description: "A100 GPU nodes - highest performance single-GPU"
     
     slurm:
       partition: "gpu1a100"
       account: "sdz852"
       nodes: 1
       ntasks: 1
-      cpus_per_task: 16
-      time: "12:00:00"
+      cpus_per_task: 80
+      time: "1-00:00:00"
     
     limits:
-      max_cpus: 64
+      max_cpus: 80
       max_time: "3-00:00:00"
+      nodes_total: 2
     
     gpu:
       available: true
       default_count: 1
-      max_count: 8
+      max_count: 1
       type: "a100"
-      directive_format: "--gpus {count}"
+      directive_format: "--gres=gpu:{count}"
 
   # ---------------------------------------------------------------------------
-  # DGX A100 
+  # ARC DGX A100 (3 nodes, infinite time limit)
   # ---------------------------------------------------------------------------
-  dgx_a100:
-    name: "DGX A100"
-    description: "DGX system with A100 GPUs"
+  arc_dgxa100:
+    name: "ARC DGX A100"
+    description: "DGX A100 system - multi-GPU, no time limit"
     
     slurm:
       partition: "dgxa100"
       account: "sdz852"
       nodes: 1
       ntasks: 1
-      cpus_per_task: 32
-      time: "24:00:00"
+      cpus_per_task: 80
+      time: "3-00:00:00"
     
     limits:
       max_cpus: 128
-      max_time: "7-00:00:00"
+      max_time: "infinite"
+      nodes_total: 3
     
     gpu:
       available: true
       default_count: 1
       max_count: 8
       type: "a100"
-      directive_format: "--gpus {count}"
+      directive_format: "--gres=gpu:{count}"
 
+  # ===========================================================================
+  # ARC CPU PARTITIONS (for subtasks NOT requiring GPU)
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # ARC Compute1 - Default CPU partition (65 nodes, 3-day max)
+  # ---------------------------------------------------------------------------
+  arc_compute1:
+    name: "ARC Compute1"
+    description: "Default CPU partition - best availability, 3-day max"
+    
+    slurm:
+      partition: "compute1"
+      account: "sdz852"
+      nodes: 1
+      ntasks: 1
+      cpus_per_task: 20
+      memory: "64G"
+      time: "1-00:00:00"
+    
+    limits:
+      max_cpus: 48
+      max_time: "3-00:01:00"
+      nodes_total: 65
+    
+    gpu:
+      available: false
+
+  # ---------------------------------------------------------------------------
+  # ARC Compute2 - Extended time CPU partition (27 nodes, 10-day max)
+  # ---------------------------------------------------------------------------
+  arc_compute2:
+    name: "ARC Compute2"
+    description: "Extended time CPU partition - 10-day max for long jobs"
+    
+    slurm:
+      partition: "compute2"
+      account: "sdz852"
+      nodes: 1
+      ntasks: 1
+      cpus_per_task: 20
+      memory: "64G"
+      time: "1-00:00:00"
+    
+    limits:
+      max_cpus: 48
+      max_time: "10-00:01:00"
+      nodes_total: 27
+    
+    gpu:
+      available: false
+
+  # ---------------------------------------------------------------------------
+  # ARC Compute3 - Additional CPU partition (6 nodes, 3-day max)
+  # ---------------------------------------------------------------------------
+  arc_compute3:
+    name: "ARC Compute3"
+    description: "Additional CPU partition - 3-day max"
+    
+    slurm:
+      partition: "compute3"
+      account: "sdz852"
+      nodes: 1
+      ntasks: 1
+      cpus_per_task: 20
+      memory: "64G"
+      time: "1-00:00:00"
+    
+    limits:
+      max_cpus: 48
+      max_time: "3-00:01:00"
+      nodes_total: 6
+    
+    gpu:
+      available: false
+
+  # ===========================================================================
+  # LEGACY: Zeus CPU Cluster (preserved for backward compatibility)
+  # ===========================================================================
+
+  zeus_cpu:
+    name: "Zeus CPU Cluster"
+    description: "Legacy Zeus cluster - CPU only, high memory nodes"
+    
+    slurm:
+      partition: "normal"
+      account: "jlehle"
+      nodes: 1
+      ntasks: 1
+      cpus_per_task: 40
+      memory: "64G"
+      time: "08:00:00"
+    
+    limits:
+      max_cpus: 192
+      max_memory: "900G"
+      max_time: "7-00:00:00"
+      nodes_total: 10
+    
+    gpu:
+      available: false
 
 # =============================================================================
-# Task Presets - Resource profiles for different task types
+# GPU PACKAGE DETECTION
+# =============================================================================
+# Packages that indicate a subtask needs GPU resources.
+# Used by sub-agent to route tasks to GPU vs CPU partitions.
 # =============================================================================
 
-task_presets:
-  light:
-    cpus: 4
-    memory: "8G"
-    time: "01:00:00"
-    gpus: 0
-    
-  standard:
-    cpus: 16
-    memory: "32G"
-    time: "04:00:00"
-    gpus: 0
-    
-  heavy:
-    cpus: 40
-    memory: "128G"
-    time: "12:00:00"
-    gpus: 0
-    
-  maximum:
-    cpus: 96
-    memory: "500G"
-    time: "24:00:00"
-    gpus: 0
-
-  gpu_single:
-    cpus: 10
-    time: "08:00:00"
-    gpus: 1
-    
-  gpu_multi:
-    cpus: 20
-    time: "24:00:00"
-    gpus: 4
-
-
-# =============================================================================
-# Keyword Detection - Auto-select resources based on task description
-# =============================================================================
-
-keyword_detection:
-  gpu_required:
-    - "deep learning"
-    - "neural network"
-    - "pytorch"
-    - "tensorflow"
-    - "cuda"
-    - "gpu"
-    - "training"
-    - "embedding"
-    
-  heavy_memory:
-    - "single-cell"
-    - "scRNA"
-    - "anndata"
-    - "h5ad"
-    - "scanpy"
-    - "squidpy"
-    - "spatial"
-    - "large dataset"
-    - "genome-wide"
-    
-  light:
-    - "plot"
-    - "visualization"
-    - "summary"
-    - "report"
+gpu_packages:
+  - torch
+  - pytorch
+  - tensorflow
+  - keras
+  - jax
+  - rapids
+  - cuml
+  - cudf
+  - cugraph
+  - scvi-tools
+  - scvi
+  - scvelo
+  - cellbender
+  - flash-attn
+  - xformers
+  - bitsandbytes
+  - accelerate
+  - deepspeed
+  - triton

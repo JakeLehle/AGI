@@ -12,24 +12,41 @@ All execution artifacts (logs, outputs, reports) go to PROJECT_DIR.
 AGI_ROOT stays clean and only contains the pipeline code.
 
 v3.2 Updates:
-- Cluster configuration via AGI_CLUSTER environment variable
+- ARC cluster as primary target (GPU + CPU partitions)
+- GPU-first architecture: master on GPU node, subtasks route to CPU or GPU
+- qwen3-coder-next as default model (32K context on V100)
+- Dual cluster routing: AGI_CLUSTER (CPU) + AGI_GPU_CLUSTER (GPU subtasks)
+- Cluster configuration via cluster_config.yaml
 - Conda cleanup after successful task completion
 - State checkpointing for resume capability
 - Open-source conda channels only (no defaults/main)
 
+GPU NODE RULES (ARC):
+- Do NOT specify --mem on GPU partitions (causes allocation failures)
+- Use --gres=gpu:N format (not --gpus N)
+- Standard GPU request: --gres=gpu:1 -N 1 -n 1 -c 80
+
 Run with:
-    # Zeus cluster (CPU, default)
+    # ARC cluster (default - CPU subtasks to compute1, GPU subtasks to gpu1v100)
     python main.py --prompt-file prompts/my_task.txt --project-dir /path/to/project --slurm
 
-    # GPU cluster with specific partition
+    # Override GPU cluster target
     python main.py --prompt-file prompts/gpu_task.txt --project-dir /path/to/project \\
-        --slurm --cluster gpu_v100
+        --slurm --gpu-cluster arc_gpu1a100
+
+    # Use extended-time CPU partition for subtasks
+    python main.py --prompt-file prompts/long_task.txt --project-dir /path/to/project \\
+        --slurm --cluster arc_compute2
 
     # Resume from checkpoints
     python main.py --prompt-file prompts/task.txt --project-dir ./project --resume
 
     # Clear checkpoints and start fresh
     python main.py --prompt-file prompts/task.txt --project-dir ./project --clear-checkpoints
+
+    # Legacy zeus cluster
+    python main.py --prompt-file prompts/task.txt --project-dir ./project \\
+        --slurm --cluster zeus_cpu
 """
 
 import argparse
@@ -60,12 +77,25 @@ def load_config(config_path: str = "config/config.yaml") -> dict:
     except FileNotFoundError:
         print(f"Config file not found at {config_path}, using defaults")
         return {
-            "ollama": {"model": "llama3.1:70b", "base_url": "http://127.0.0.1:11434"},
+            "ollama": {
+                "model": "qwen3-coder-next",
+                "base_url": "http://127.0.0.1:11434",
+                "model_context_length": 32768,
+            },
+            "context": {
+                "max_tokens_per_task": 25000,
+                "max_tool_output_tokens": 12000,
+                "min_tokens_to_continue": 3000,
+            },
             "agents": {"max_retries": 12},
-            "slurm": {"enabled": False, "default_cluster": "zeus_cpu"},
+            "slurm": {
+                "enabled": False,
+                "default_cluster": "arc_compute1",
+                "default_gpu_cluster": "arc_gpu1v100",
+            },
             "parallel": {"enabled": True},
             "clusters": {},
-            "reflexion": {"enabled": True}
+            "reflexion": {"enabled": True},
         }
 
 
@@ -153,38 +183,101 @@ def validate_project_dir(project_dir: str) -> Path:
     return project_path
 
 
-def list_clusters(config: dict):
-    """List all configured clusters"""
-    clusters = config.get("clusters", {})
+def load_cluster_config(config_path: str = None) -> dict:
+    """
+    Load the full cluster configuration from cluster_config.yaml.
     
-    print("\n" + "="*70)
-    print("  Available Clusters")
-    print("="*70)
+    This is the authoritative source for SLURM partition details,
+    GPU settings, and resource limits. The clusters section in
+    config.yaml is only a summary/fallback.
+    """
+    if not config_path:
+        config_path = os.environ.get('AGI_CLUSTER_CONFIG')
     
-    default = config.get("slurm", {}).get("default_cluster", "zeus_cpu")
+    if not config_path:
+        for path in [
+            Path.cwd() / 'config' / 'cluster_config.yaml',
+            Path(__file__).parent / 'config' / 'cluster_config.yaml',
+        ]:
+            if path.exists():
+                config_path = str(path)
+                break
     
-    for name, cluster_config in clusters.items():
-        is_default = " (DEFAULT)" if name == default else ""
-        has_gpu = cluster_config.get("has_gpu", False)
-        gpu_str = " [GPU]" if has_gpu else " [CPU]"
-        
-        print(f"\n  {name}{gpu_str}{is_default}")
-        print(f"    {cluster_config.get('description', 'No description')}")
-        print(f"    Cores/Node: {cluster_config.get('cores_per_node', 'N/A')}")
-        print(f"    Memory/Node: {cluster_config.get('memory_per_node', 'N/A')}")
-        print(f"    Default Partition: {cluster_config.get('default_partition', 'N/A')}")
-        
-        # List partitions
-        partitions = cluster_config.get("partitions", {})
-        if partitions:
-            print(f"    Partitions:")
-            for pname, pconfig in partitions.items():
-                gpu_info = ""
-                if pconfig.get("has_gpu"):
-                    gpu_info = f" (GPU: {pconfig.get('max_gpus', '?')}x {pconfig.get('gpu_type', '?')})"
-                print(f"      - {pname}: {pconfig.get('description', '')[:40]}{gpu_info}")
+    if config_path and Path(config_path).exists():
+        try:
+            with open(config_path) as f:
+                return yaml.safe_load(f)
+        except Exception as e:
+            print(f"Warning: Failed to load cluster config from {config_path}: {e}")
     
-    print("\n" + "="*70 + "\n")
+    return {}
+
+
+def list_clusters(config: dict, cluster_config: dict = None):
+    """List all configured clusters from both config.yaml and cluster_config.yaml"""
+    
+    # Prefer cluster_config.yaml (full definitions) over config.yaml (summaries)
+    if cluster_config and cluster_config.get('clusters'):
+        clusters = cluster_config['clusters']
+        default_cpu = cluster_config.get('default_cluster', 'arc_compute1')
+        default_gpu = cluster_config.get('default_gpu_cluster', 'arc_gpu1v100')
+        source = "cluster_config.yaml"
+    else:
+        clusters = config.get("clusters", {})
+        default_cpu = config.get("slurm", {}).get("default_cluster", "arc_compute1")
+        default_gpu = config.get("slurm", {}).get("default_gpu_cluster", "arc_gpu1v100")
+        source = "config.yaml (summary only)"
+    
+    print(f"\n{'='*70}")
+    print(f"  Available Clusters (source: {source})")
+    print(f"{'='*70}")
+    print(f"  Default CPU cluster: {default_cpu}")
+    print(f"  Default GPU cluster: {default_gpu}")
+    
+    # Separate GPU and CPU clusters for display
+    gpu_clusters = {}
+    cpu_clusters = {}
+    
+    for name, cc in clusters.items():
+        gpu_info = cc.get('gpu', {})
+        if gpu_info.get('available', False) or cc.get('has_gpu', False):
+            gpu_clusters[name] = cc
+        else:
+            cpu_clusters[name] = cc
+    
+    if gpu_clusters:
+        print(f"\n  --- GPU Partitions ---")
+        for name, cc in gpu_clusters.items():
+            is_default = " (DEFAULT GPU)" if name == default_gpu else ""
+            slurm = cc.get('slurm', {})
+            gpu = cc.get('gpu', {})
+            desc = cc.get('description', cc.get('name', ''))
+            
+            print(f"\n  {name}{is_default}")
+            print(f"    {desc}")
+            print(f"    Partition: {slurm.get('partition', cc.get('default_partition', 'N/A'))}")
+            print(f"    CPUs: {slurm.get('cpus_per_task', cc.get('default_cpus', 'N/A'))}")
+            print(f"    Time: {slurm.get('time', cc.get('default_time', 'N/A'))}")
+            print(f"    GPU: {gpu.get('max_count', gpu.get('default_count', '?'))}× {gpu.get('type', cc.get('gpu_type', '?'))}")
+            print(f"    Nodes: {cc.get('limits', {}).get('nodes_total', 'N/A')}")
+            print(f"    NOTE: No --mem allowed on GPU partitions")
+    
+    if cpu_clusters:
+        print(f"\n  --- CPU Partitions ---")
+        for name, cc in cpu_clusters.items():
+            is_default = " (DEFAULT CPU)" if name == default_cpu else ""
+            slurm = cc.get('slurm', {})
+            desc = cc.get('description', cc.get('name', ''))
+            
+            print(f"\n  {name}{is_default}")
+            print(f"    {desc}")
+            print(f"    Partition: {slurm.get('partition', cc.get('default_partition', 'N/A'))}")
+            print(f"    CPUs: {slurm.get('cpus_per_task', cc.get('default_cpus', 'N/A'))}")
+            print(f"    Memory: {slurm.get('memory', cc.get('default_memory', 'N/A'))}")
+            print(f"    Time: {slurm.get('time', cc.get('default_time', 'N/A'))}")
+            print(f"    Nodes: {cc.get('limits', {}).get('nodes_total', 'N/A')}")
+    
+    print(f"\n{'='*70}\n")
 
 
 def check_cluster_status(sandbox: Sandbox, config: dict, cluster_name: str = None, partition: str = None):
@@ -227,37 +320,43 @@ def check_cluster_status(sandbox: Sandbox, config: dict, cluster_name: str = Non
 
 
 def print_banner(task: str, config: dict, project_dir: Path, cluster_info: dict = None,
-                 model: str = None, max_iterations: int = None, cluster_for_subtasks: str = None,
+                 model: str = None, max_iterations: int = None,
+                 cluster_for_subtasks: str = None, gpu_cluster_for_subtasks: str = None,
                  cleanup_env: bool = True):
     """Print startup banner"""
     model = model or config['ollama']['model']
     max_iterations = max_iterations or config['agents']['max_retries']
+    context_length = config.get('ollama', {}).get('model_context_length', 32768)
+    max_task_tokens = config.get('context', {}).get('max_tokens_per_task', 25000)
     
     print(f"\n{'='*70}")
-    print(f"  AGI Multi-Agent Pipeline v3.2")
+    print(f"  AGI Multi-Agent Pipeline v3.2 (ARC GPU-First)")
     print(f"{'='*70}")
-    print(f"  Model:           {model}")
-    print(f"  Max Iterations:  {max_iterations}")
-    print(f"  Project Dir:     {project_dir}")
+    print(f"  Model:            {model}")
+    print(f"  Context Window:   {context_length:,} tokens")
+    print(f"  Task Budget:      {max_task_tokens:,} tokens per subtask")
+    print(f"  Max Iterations:   {max_iterations}")
+    print(f"  Project Dir:      {project_dir}")
     
     if cluster_info:
         print(f"\n  SLURM Configuration:")
-        print(f"    Cluster:   {cluster_info.get('cluster', 'N/A')}")
-        print(f"    Partition: {cluster_info.get('partition', 'N/A')}")
+        print(f"    Cluster:    {cluster_info.get('cluster', 'N/A')}")
+        print(f"    Partition:  {cluster_info.get('partition', 'N/A')}")
         
         if cluster_info.get('gpus'):
-            print(f"    GPUs:      {cluster_info['gpus']}x {cluster_info.get('gpu_type', 'generic')}")
+            print(f"    GPUs:       {cluster_info['gpus']}× {cluster_info.get('gpu_type', 'generic')}")
         
         if cluster_info.get('nodelist'):
-            print(f"    Node(s):   {cluster_info['nodelist']}")
+            print(f"    Node(s):    {cluster_info['nodelist']}")
         
         if cluster_info.get('idle_count'):
-            print(f"    Available: {cluster_info['idle_count']} nodes")
+            print(f"    Available:  {cluster_info['idle_count']} nodes")
     
-    # v3.2 specific info
-    if cluster_for_subtasks:
-        print(f"\n  Subtask Configuration:")
-        print(f"    Cluster:       {cluster_for_subtasks}")
+    # v3.2: Subtask routing info
+    if cluster_for_subtasks or gpu_cluster_for_subtasks:
+        print(f"\n  Subtask Routing:")
+        print(f"    CPU subtasks → {cluster_for_subtasks or 'arc_compute1'}")
+        print(f"    GPU subtasks → {gpu_cluster_for_subtasks or 'arc_gpu1v100'}")
         print(f"    Cleanup Env:   {'Enabled' if cleanup_env else 'Disabled'}")
         print(f"    Checkpointing: Enabled")
     
@@ -283,16 +382,20 @@ def print_banner(task: str, config: dict, project_dir: Path, cluster_info: dict 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Multi-Agent System for Complex Task Execution (v3.2 with Cluster Config)",
+        description="Multi-Agent System for Complex Task Execution (v3.2 ARC GPU-First)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Run on zeus CPU cluster (default)
+  # Run on ARC cluster (default: CPU subtasks → compute1, GPU subtasks → gpu1v100)
   python main.py --prompt-file prompts/analysis.txt --project-dir ./project --slurm
 
-  # Run on GPU cluster
+  # Override GPU cluster for subtasks (e.g., use A100s)
   python main.py --prompt-file prompts/ml_task.txt --project-dir ./project \\
-      --slurm --cluster gpu_v100
+      --slurm --gpu-cluster arc_gpu1a100
+
+  # Use extended-time CPU partition for long subtasks
+  python main.py --prompt-file prompts/long_task.txt --project-dir ./project \\
+      --slurm --cluster arc_compute2
 
   # Resume from checkpoints
   python main.py --prompt-file prompts/task.txt --project-dir ./project --resume
@@ -300,8 +403,16 @@ Examples:
   # Clear checkpoints and start fresh
   python main.py --prompt-file prompts/task.txt --project-dir ./project --clear-checkpoints
 
-  # Disable conda cleanup (keep environments)
+  # Disable conda cleanup (keep environments for debugging)
   python main.py --prompt-file prompts/task.txt --project-dir ./project --no-cleanup-env
+
+  # Override model
+  python main.py --prompt-file prompts/task.txt --project-dir ./project \\
+      --model llama3.1:70b
+
+  # Legacy zeus cluster
+  python main.py --prompt-file prompts/task.txt --project-dir ./project \\
+      --slurm --cluster zeus_cpu
 
   # List available clusters
   python main.py --list-clusters --project-dir ./test
@@ -323,7 +434,7 @@ Examples:
     model_group.add_argument(
         "--model", "-m",
         type=str,
-        help="Ollama model to use (overrides config)"
+        help="Ollama model to use (overrides config). Default: qwen3-coder-next"
     )
     model_group.add_argument(
         "--max-iterations", "--max-retries",
@@ -341,8 +452,14 @@ Examples:
     cluster_group.add_argument(
         "--cluster",
         type=str,
-        default=os.environ.get('AGI_CLUSTER', 'zeus_cpu'),
-        help="Cluster for subtask SLURM settings (default: zeus_cpu or AGI_CLUSTER env)"
+        default=os.environ.get('AGI_CLUSTER', 'arc_compute1'),
+        help="CPU cluster for subtask SLURM settings (default: arc_compute1 or AGI_CLUSTER env)"
+    )
+    cluster_group.add_argument(
+        "--gpu-cluster",
+        type=str,
+        default=os.environ.get('AGI_GPU_CLUSTER', 'arc_gpu1v100'),
+        help="GPU cluster for subtasks requiring GPU (default: arc_gpu1v100 or AGI_GPU_CLUSTER env)"
     )
     cluster_group.add_argument(
         "--cluster-config",
@@ -353,7 +470,7 @@ Examples:
     cluster_group.add_argument(
         "--partition", "-p",
         type=str,
-        help="SLURM partition to use (e.g., 'normal', 'gpu1v100')"
+        help="SLURM partition override for master context (e.g., 'compute1', 'gpu1v100')"
     )
     cluster_group.add_argument(
         "--nodelist", "-w",
@@ -371,12 +488,18 @@ Examples:
     slurm_group.add_argument("--slurm", action="store_true", help="Enable SLURM job submission")
     slurm_group.add_argument("--no-slurm", action="store_true", help="Disable SLURM (force interactive)")
     slurm_group.add_argument("--cpus", "-c", type=int, help="CPUs per job")
-    slurm_group.add_argument("--memory", "--mem", type=str, help="Memory per job (e.g., '16G')")
-    slurm_group.add_argument("--time", "-t", type=str, help="Time limit (e.g., '04:00:00')")
+    slurm_group.add_argument(
+        "--memory", "--mem", type=str,
+        help="Memory per job (e.g., '64G'). WARNING: Do NOT use for GPU partitions"
+    )
+    slurm_group.add_argument("--time", "-t", type=str, help="Time limit (e.g., '1-00:00:00')")
     
     # GPU options
     gpu_group = parser.add_argument_group('GPU Options')
-    gpu_group.add_argument("--gpus", "-G", type=int, default=0, help="Number of GPUs to request")
+    gpu_group.add_argument(
+        "--gpus", "-G", type=int, default=0,
+        help="Number of GPUs to request (uses --gres=gpu:N format)"
+    )
     gpu_group.add_argument("--gpu-type", type=str, help="GPU type (e.g., 'v100', 'a100')")
     
     # Sub-agent options (v3.2)
@@ -417,7 +540,9 @@ Examples:
     
     args = parser.parse_args()
     
-    # Load configuration
+    # =========================================================================
+    # LOAD CONFIGURATION
+    # =========================================================================
     config = load_config(args.config)
     
     # Apply command-line overrides
@@ -427,6 +552,9 @@ Examples:
         config['agents']['max_retries'] = min(args.max_iterations, 12)
     if args.ollama_url:
         config['ollama']['base_url'] = args.ollama_url
+    
+    # Load full cluster definitions from cluster_config.yaml
+    full_cluster_config = load_cluster_config(args.cluster_config)
     
     # Validate and setup project directory
     project_dir = validate_project_dir(args.project_dir)
@@ -442,16 +570,17 @@ Examples:
         "project_dir": str(project_dir),
         "model": config['ollama']['model'],
         "max_retries": config['agents']['max_retries'],
-        "cluster": args.cluster
+        "cluster": args.cluster,
+        "gpu_cluster": args.gpu_cluster,
     })
     # =========================================================================
     
     # Initialize sandbox
     sandbox = Sandbox(project_dir)
     
-    # Handle --list-clusters
+    # Handle --list-clusters (now uses full cluster_config.yaml)
     if args.list_clusters:
-        list_clusters(config)
+        list_clusters(config, full_cluster_config)
         sys.exit(0)
     
     # Handle --cluster-status
@@ -467,20 +596,23 @@ Examples:
     # SET CLUSTER ENVIRONMENT VARIABLES FOR SUB-AGENT (v3.2)
     # =========================================================================
     # The sub-agent reads these environment variables directly to determine
-    # cluster settings for sbatch generation.
+    # cluster settings for sbatch generation. Two clusters are set:
+    #   AGI_CLUSTER     → default target for CPU subtasks
+    #   AGI_GPU_CLUSTER → target for subtasks that need GPU resources
     
-    cluster_for_subtasks = args.cluster or os.environ.get('AGI_CLUSTER', 'zeus_cpu')
+    cluster_for_subtasks = args.cluster  # Already defaults to arc_compute1
+    gpu_cluster_for_subtasks = args.gpu_cluster  # Already defaults to arc_gpu1v100
+    
     os.environ['AGI_CLUSTER'] = cluster_for_subtasks
+    os.environ['AGI_GPU_CLUSTER'] = gpu_cluster_for_subtasks
     
     # Set cluster config path
     cluster_config_path = args.cluster_config
     if not cluster_config_path:
-        # Try to find config file
-        possible_paths = [
+        for p in [
             Path.cwd() / 'config' / 'cluster_config.yaml',
             Path(__file__).parent / 'config' / 'cluster_config.yaml',
-        ]
-        for p in possible_paths:
+        ]:
             if p.exists():
                 cluster_config_path = str(p)
                 break
@@ -488,19 +620,32 @@ Examples:
     if cluster_config_path:
         os.environ['AGI_CLUSTER_CONFIG'] = cluster_config_path
     
-    print(f"  Cluster for subtasks: {cluster_for_subtasks}")
+    print(f"  Subtask CPU cluster:  {cluster_for_subtasks}")
+    print(f"  Subtask GPU cluster:  {gpu_cluster_for_subtasks}")
     if cluster_config_path:
-        print(f"  Cluster config: {cluster_config_path}")
+        print(f"  Cluster config:       {cluster_config_path}")
     # =========================================================================
     
-    # Determine cluster to use (for master job context)
-    cluster_name = args.cluster or config.get("slurm", {}).get("default_cluster", "zeus_cpu")
-    
-    # Get cluster config
-    cluster_config = config.get("clusters", {}).get(cluster_name, {})
+    # Resolve cluster info for the master job context
+    # Try full cluster_config.yaml first, fall back to config.yaml summaries
+    cluster_name = cluster_for_subtasks
+    if full_cluster_config and full_cluster_config.get('clusters', {}).get(cluster_name):
+        cc = full_cluster_config['clusters'][cluster_name]
+        cluster_config_entry = {
+            "name": cc.get('name', cluster_name),
+            "description": cc.get('description', ''),
+            "default_partition": cc.get('slurm', {}).get('partition', 'compute1'),
+            "default_cpus": cc.get('slurm', {}).get('cpus_per_task', 20),
+            "default_memory": cc.get('slurm', {}).get('memory', '64G'),
+            "default_time": cc.get('slurm', {}).get('time', '1-00:00:00'),
+            "has_gpu": cc.get('gpu', {}).get('available', False),
+            "gpu_type": cc.get('gpu', {}).get('type'),
+        }
+    else:
+        cluster_config_entry = config.get("clusters", {}).get(cluster_name, {})
     
     # Determine partition
-    partition = args.partition or cluster_config.get("default_partition", "normal")
+    partition = args.partition or cluster_config_entry.get("default_partition", "compute1")
     
     # Determine SLURM usage
     use_slurm = False
@@ -537,35 +682,39 @@ Examples:
     if args.no_cleanup_env:
         cleanup_env = False
     
-    # Build SLURM config
+    # =========================================================================
+    # BUILD SLURM JOB CONFIG
+    # =========================================================================
+    # Check if the target cluster is a GPU cluster (no --mem allowed)
+    is_gpu_cluster = cluster_config_entry.get("has_gpu", False)
+    
+    # Memory: NEVER set for GPU clusters (causes allocation failures on ARC)
+    if is_gpu_cluster:
+        job_memory = None
+        if args.memory:
+            print(f"WARNING: --memory ignored for GPU cluster '{cluster_name}' (causes allocation failures)")
+    else:
+        job_memory = args.memory or cluster_config_entry.get("default_memory", "64G")
+    
     slurm_job_config = {
         "cluster": cluster_name,
         "partition": partition,
-        "cpus": args.cpus or cluster_config.get("default_cpus", 4),
-        "memory": args.memory or cluster_config.get("default_memory", "16G"),
-        "time": args.time or cluster_config.get("default_time", "04:00:00"),
+        "cpus": args.cpus or cluster_config_entry.get("default_cpus", 20),
+        "memory": job_memory,
+        "time": args.time or cluster_config_entry.get("default_time", "1-00:00:00"),
         "gpus": args.gpus,
-        "gpu_type": args.gpu_type,
+        "gpu_type": args.gpu_type or cluster_config_entry.get("gpu_type"),
         "nodelist": args.nodelist,
         "exclude_nodes": args.exclude,
         "max_parallel_jobs": args.max_parallel or config.get("parallel", {}).get("max_parallel_jobs", 10),
         "poll_interval": config.get("slurm", {}).get("poll_interval", 10),
         "max_poll_attempts": config.get("slurm", {}).get("max_poll_attempts", 720),
-        # v3.2: Sub-agent options
+        # v3.2: Dual cluster routing + sub-agent options
+        "cluster_for_subtasks": cluster_for_subtasks,
+        "gpu_cluster_for_subtasks": gpu_cluster_for_subtasks,
         "cleanup_env_on_success": cleanup_env,
         "enable_checkpoints": True,
-        "cluster_for_subtasks": cluster_for_subtasks,
     }
-    
-    # Validate GPU request
-    if args.gpus and args.gpus > 0:
-        partition_config = cluster_config.get("partitions", {}).get(partition, {})
-        if not partition_config.get("has_gpu"):
-            gpu_partitions = [p for p, c in cluster_config.get("partitions", {}).items() if c.get("has_gpu")]
-            print(f"ERROR: Partition '{partition}' does not have GPUs.")
-            if gpu_partitions:
-                print(f"Available GPU partitions: {', '.join(gpu_partitions)}")
-            sys.exit(1)
     
     # =========================================================================
     # HANDLE CHECKPOINT MANAGEMENT (v3.2)
@@ -583,7 +732,7 @@ Examples:
         checkpoint_files = list(checkpoint_dir.glob('*_checkpoint.json'))
         if checkpoint_files:
             print(f"  Found {len(checkpoint_files)} checkpoint(s) - will resume")
-            for cp in checkpoint_files[:5]:  # Show first 5
+            for cp in checkpoint_files[:5]:
                 print(f"    - {cp.name}")
             if len(checkpoint_files) > 5:
                 print(f"    ... and {len(checkpoint_files) - 5} more")
@@ -624,26 +773,28 @@ Examples:
     context["cluster"] = cluster_name
     context["partition"] = partition
     context["parallel_enabled"] = parallel_enabled
-    context["cluster_for_subtasks"] = cluster_for_subtasks  # v3.2
+    context["cluster_for_subtasks"] = cluster_for_subtasks
+    context["gpu_cluster_for_subtasks"] = gpu_cluster_for_subtasks
     
     # Prepare cluster info for banner
     cluster_info = {
         "cluster": cluster_name,
         "partition": partition,
         "gpus": args.gpus or 0,
-        "gpu_type": args.gpu_type or cluster_config.get("partitions", {}).get(partition, {}).get("gpu_type"),
+        "gpu_type": args.gpu_type or cluster_config_entry.get("gpu_type"),
         "nodelist": args.nodelist,
-        "idle_count": slurm_status.get("idle_count") if slurm_status else None
+        "idle_count": slurm_status.get("idle_count") if slurm_status else None,
     }
     
     # Print banner
     print_banner(
-        main_task, config, project_dir, 
+        main_task, config, project_dir,
         cluster_info if use_slurm else None,
         model=args.model,
         max_iterations=args.max_iterations,
         cluster_for_subtasks=cluster_for_subtasks,
-        cleanup_env=cleanup_env
+        gpu_cluster_for_subtasks=gpu_cluster_for_subtasks,
+        cleanup_env=cleanup_env,
     )
     
     # Dry run
@@ -653,24 +804,29 @@ Examples:
         print("\nContext:", json.dumps(context, indent=2))
         print("\nExecution Mode:", "SLURM" if use_slurm else "Interactive")
         print("Model:", config['ollama']['model'])
+        print("Context Window:", config.get('ollama', {}).get('model_context_length', 32768))
+        print("Task Token Budget:", config.get('context', {}).get('max_tokens_per_task', 25000))
         print("Max Iterations:", config['agents']['max_retries'])
         print("Cluster:", cluster_name)
         print("Partition:", partition)
         if args.gpus:
-            print("GPUs:", args.gpus, args.gpu_type or "")
+            print("GPUs:", args.gpus, f"(--gres=gpu:{args.gpus})", args.gpu_type or "")
         print("Parallel:", "Enabled" if parallel_enabled else "Disabled")
-        print("\n--- v3.2 Settings ---")
-        print("Cluster for Subtasks:", cluster_for_subtasks)
+        print("\n--- v3.2 Subtask Routing ---")
+        print("CPU Subtasks →", cluster_for_subtasks)
+        print("GPU Subtasks →", gpu_cluster_for_subtasks)
         print("Cleanup Env:", "Enabled" if cleanup_env else "Disabled")
         print("Checkpointing:", "Enabled")
         print("Resume Mode:", "Yes" if args.resume else "No")
-        print("\nSLURM Config:", json.dumps(slurm_job_config, indent=2))
+        print("\nSLURM Config:", json.dumps(slurm_job_config, indent=2, default=str))
         print("\nProject structure:")
         print(sandbox.get_directory_tree())
         print("\nProject Isolation:")
-        print(f"  Logs will go to: {project_dir}/logs/")
-        print(f"  Reports will go to: {project_dir}/reports/")
-        print(f"  Checkpoints in: {project_dir}/temp/checkpoints/")
+        print(f"  Logs will go to:      {project_dir}/logs/")
+        print(f"  Reports will go to:   {project_dir}/reports/")
+        print(f"  Checkpoints in:       {project_dir}/temp/checkpoints/")
+        print(f"  SLURM scripts in:     {project_dir}/slurm/scripts/")
+        print(f"  SLURM logs in:        {project_dir}/slurm/logs/")
         sys.exit(0)
     
     # Initialize workflow
@@ -684,7 +840,7 @@ Examples:
             parallel_enabled=parallel_enabled,
             slurm_config=slurm_job_config,
             use_reflexion_memory=config.get('reflexion', {}).get('enabled', True),
-            cleanup_env_on_success=cleanup_env,  # v3.2
+            cleanup_env_on_success=cleanup_env,
         )
     except Exception as e:
         print(f"Error initializing workflow: {e}")
@@ -698,15 +854,15 @@ Examples:
         result = workflow.run(
             main_task=main_task,
             context=context,
-            thread_id=args.thread_id
+            thread_id=args.thread_id,
         )
         
         print(f"\n{'='*70}")
         print(f"  Execution Complete!")
         print(f"{'='*70}")
-        print(f"  Status: {result.get('status', 'unknown')}")
+        print(f"  Status:    {result.get('status', 'unknown')}")
         print(f"  Completed: {len(result.get('completed_subtasks', []))} subtasks")
-        print(f"  Failed: {len(result.get('failed_subtasks', []))} subtasks")
+        print(f"  Failed:    {len(result.get('failed_subtasks', []))} subtasks")
         print(f"\n  Report saved to: {project_dir}/reports/")
         print(f"{'='*70}\n")
         
@@ -718,7 +874,6 @@ Examples:
             
     except KeyboardInterrupt:
         print("\n\nInterrupted by user. Cleaning up...")
-        # Checkpoints are preserved automatically by sub-agents
         print(f"  Checkpoints preserved in: {checkpoint_dir}")
         print("  Resume with: --resume flag")
         sys.exit(130)
