@@ -6,7 +6,7 @@
 # FALLBACK: Zeus CPU Cluster (preserved for backward compatibility)
 #
 # Architecture:
-#   - Master pipeline runs on ARC GPU node (Ollama + qwen3-coder-next)
+#   - Master pipeline runs on ARC GPU node (Ollama + qwen3-coder-next:latest)
 #   - Subtask scripts routed to GPU or CPU partitions based on task needs
 #   - AGI_CLUSTER sets DEFAULT subtask target (compute1 for CPU tasks)
 #   - AGI_GPU_CLUSTER sets GPU subtask target (gpu1v100 for GPU tasks)

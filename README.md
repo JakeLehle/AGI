@@ -66,7 +66,7 @@ AGI orchestrates multiple AI agents to decompose complex research tasks, generat
 
 ## Token Budget
 
-All token limits are sized for **qwen3-coder-next** with a 32K context window:
+All token limits are sized for **qwen3-coder-next:latest** with a 32K context window:
 
 | Parameter | Value | Purpose |
 |-----------|-------|---------|
@@ -230,7 +230,7 @@ Local LLMs frequently produce malformed JSON. The pipeline uses `parse_json_resi
 4. **Trailing garbage strip** — Remove text after last valid `}`
 5. **Brace balancing** — Force-close truncated JSON (missing closing braces)
 
-This handles the most common failure modes from qwen3-coder-next and similar local models.
+This handles the most common failure modes from qwen3-coder-next:latest and similar local models.
 
 ## Installation
 
@@ -254,7 +254,7 @@ conda activate AGI
 pip install -r requirements.txt
 
 # Pull Ollama models
-ollama pull qwen3-coder-next     # Default coding LLM (v3.2)
+ollama pull qwen3-coder-next:latest     # Default coding LLM (v3.2)
 ollama pull nomic-embed-text     # Embeddings for reflexion memory
 
 # Create data directory
@@ -288,7 +288,7 @@ conda activate AGI
 python main.py \
     --prompt-file /path/to/prompt.md \
     --project-dir /path/to/project \
-    --model qwen3-coder-next
+    --model qwen3-coder-next:latest
 ```
 
 ### CPU-Only Submission (Zeus)
@@ -304,7 +304,7 @@ sbatch setup/RUN_AGI_PIPELINE_CPU.sh
 |----------|---------|-------------|
 | `AGI_CLUSTER` | `arc_compute1` | CPU partition for subtask jobs |
 | `AGI_GPU_CLUSTER` | `arc_gpu1v100` | GPU partition for subtask jobs |
-| `OLLAMA_MODEL` | `qwen3-coder-next` | LLM model for all agents |
+| `OLLAMA_MODEL` | `qwen3-coder-next:latest` | LLM model for all agents |
 | `OLLAMA_CONTEXT_LENGTH` | `32768` | Model context window |
 | `AGI_MAX_CONTEXT_TOKENS` | `25000` | Per-subtask token budget |
 | `AGI_MAX_TOOL_OUTPUT_TOKENS` | `12000` | Max tool output tokens |
@@ -397,13 +397,13 @@ The master agent preserves detailed prompt context through a 3-phase decompositi
 
 ### v3.2 (Current)
 - **ARC dual-cluster architecture**: 8 ARC partitions + zeus fallback with automatic GPU/CPU routing
-- **qwen3-coder-next default**: Optimized token budgets (25K/12K/3K) for 32K context window
+- **qwen3-coder-next:latest default**: Optimized token budgets (25K/12K/3K) for 32K context window
 - **GPU-aware parallel batching**: GPU tasks capped at `max_parallel_gpu_jobs` to prevent partition saturation
 - **Resilient JSON parsing**: 5-strategy `parse_json_resilient()` handles code fences, truncated output, brace balancing
 - **Decomposition timeout infrastructure**: 3-tier timeouts (5min/step, 30min/total, 2min/validation)
 - **Transition logging**: All 5 workflow routing points emit structured events
 - **GPU metadata tagging**: `detect_requires_gpu()` scans packages/keywords per subtask
-- **Config defaults aligned**: All files use consistent 25K/12K/3K, qwen3-coder-next, arc_compute1
+- **Config defaults aligned**: All files use consistent 25K/12K/3K, qwen3-coder-next:latest, arc_compute1
 
 ### v3.1
 - Reflexion Memory integration (Mem0 + Qdrant)

@@ -2,7 +2,7 @@
 LangGraph Workflow - Script-First Architecture with Reflexion Memory
 
 Orchestrates multi-agent system with:
-- Token-based context limits (configurable, default 25K for qwen3-coder-next) instead of iteration counts
+- Token-based context limits (configurable, default 25K for qwen3-coder-next:latest) instead of iteration counts
 - Each subtask gets its own persistent context window
 - Parallel SLURM job submission for independent tasks
 - Script generation and execution paradigm
@@ -14,7 +14,7 @@ v3.2 Updates:
 - Conda cleanup after successful task completion
 - State checkpointing for resume capability
 - cleanup_env_on_success parameter support
-- Default model: qwen3-coder-next (32K context)
+- Default model: qwen3-coder-next:latest (32K context)
 - Token budget: 25K/12K/3K (context/tool output/min continue)
 - Transition logging at every routing decision
 - GPU-aware parallel batching (separate GPU/CPU tasks)
@@ -178,7 +178,7 @@ class MultiAgentWorkflow:
     - v3.2: Cluster configuration, conda cleanup, GPU-aware batching
     """
 
-    # Token limits sized for qwen3-coder-next @ 32K context
+    # Token limits sized for qwen3-coder-next:latest @ 32K context
     # Read from environment or use defaults matching config.yaml
     MAX_CONTEXT_TOKENS = int(os.environ.get('AGI_MAX_CONTEXT_TOKENS', 25000))
     MAX_TOOL_OUTPUT_TOKENS = int(os.environ.get('AGI_MAX_TOOL_OUTPUT_TOKENS', 12000))
@@ -186,7 +186,7 @@ class MultiAgentWorkflow:
 
     def __init__(
         self,
-        ollama_model: str = "qwen3-coder-next",
+        ollama_model: str = "qwen3-coder-next:latest",
         ollama_base_url: str = "http://127.0.0.1:11434",
         max_retries: int = 12,  # Kept for backward compat, but token-based now
         project_dir: str = None,

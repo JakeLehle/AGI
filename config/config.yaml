@@ -3,7 +3,7 @@
 # =============================================================================
 # Supports script-first architecture with token-based context management
 #
-# Target: ARC GPU cluster with qwen3-coder-next
+# Target: ARC GPU cluster with qwen3-coder-next:latest
 # Context: 32K tokens (OLLAMA_CONTEXT_LENGTH=32768 set in RUN script)
 # GPU: V100 (16GB VRAM)
 # =============================================================================
@@ -12,11 +12,11 @@
 # Ollama Settings
 # =============================================================================
 ollama:
-  model: "qwen3-coder-next"    # GPU-optimized coding model
+  model: "qwen3-coder-next:latest"    # GPU-optimized coding model
   base_url: "http://127.0.0.1:11434"
   
   # Must match OLLAMA_CONTEXT_LENGTH in RUN_AGI_PIPELINE_ARC.sh
-  # V100 (16GB) comfortably handles 32K context for qwen3-coder-next
+  # V100 (16GB) comfortably handles 32K context for qwen3-coder-next:latest
   # Increase to 65536 if VRAM allows and you update the RUN script to match
   model_context_length: 32768
 

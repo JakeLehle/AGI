@@ -14,7 +14,7 @@ AGI_ROOT stays clean and only contains the pipeline code.
 v3.2 Updates:
 - ARC cluster as primary target (GPU + CPU partitions)
 - GPU-first architecture: master on GPU node, subtasks route to CPU or GPU
-- qwen3-coder-next as default model (32K context on V100)
+- qwen3-coder-next:latest as default model (32K context on V100)
 - Dual cluster routing: AGI_CLUSTER (CPU) + AGI_GPU_CLUSTER (GPU subtasks)
 - Cluster configuration via cluster_config.yaml
 - Conda cleanup after successful task completion
@@ -78,7 +78,7 @@ def load_config(config_path: str = "config/config.yaml") -> dict:
         print(f"Config file not found at {config_path}, using defaults")
         return {
             "ollama": {
-                "model": "qwen3-coder-next",
+                "model": "qwen3-coder-next:latest",
                 "base_url": "http://127.0.0.1:11434",
                 "model_context_length": 32768,
             },
@@ -434,7 +434,7 @@ Examples:
     model_group.add_argument(
         "--model", "-m",
         type=str,
-        help="Ollama model to use (overrides config). Default: qwen3-coder-next"
+        help="Ollama model to use (overrides config). Default: qwen3-coder-next:latest"
     )
     model_group.add_argument(
         "--max-iterations", "--max-retries",
