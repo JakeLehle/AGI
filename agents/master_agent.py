@@ -488,7 +488,7 @@ class MasterAgent:
     v3.2 token budget sized for qwen3-coder-next:latest (32K context):
       - MAX_CONTEXT_TOKENS:       25,000  (leaves ~7K for system prompt + response)
       - STEP_EXPAND_TIMEOUT:         300  (5 min per step expansion LLM call)
-      - TOTAL_DECOMPOSITION_TIMEOUT: 1800 (30 min for entire decomposition)
+      - TOTAL_DECOMPOSITION_TIMEOUT: 21600 (30 min for entire decomposition)
     """
 
     # ── Token budget (must match sub_agent.py / config.yaml) ──────────────
@@ -496,7 +496,7 @@ class MasterAgent:
 
     # ── Timeout guards ────────────────────────────────────────────────────
     STEP_EXPAND_TIMEOUT = 300       # seconds per _expand_step LLM call
-    TOTAL_DECOMPOSITION_TIMEOUT = 1800  # seconds for entire decompose_task
+    TOTAL_DECOMPOSITION_TIMEOUT = 21600  # seconds for entire decompose_task
     REVIEW_TIMEOUT = 120            # seconds for review_failure LLM call
 
     def __init__(
