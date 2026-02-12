@@ -9,8 +9,8 @@ Loads settings from config/config.yaml and provides easy access to:
 - Resource profiles
 
 v3.2 Updates:
-- Token defaults sized for qwen3-coder-next (32K context): 25K/12K/3K
-- Default model: qwen3-coder-next
+- Token defaults sized for qwen3-coder-next:latest (32K context): 25K/12K/3K
+- Default model: qwen3-coder-next:latest
 - Default cluster: arc_compute1 (ARC dual-cluster architecture)
 - Default GPU cluster: arc_gpu1v100
 
@@ -36,7 +36,7 @@ from dataclasses import dataclass
 class ContextSettings:
     """Token-based context management settings.
 
-    Defaults sized for qwen3-coder-next @ 32K context window:
+    Defaults sized for qwen3-coder-next:latest @ 32K context window:
       25K context budget  (leaves ~7K for system prompt + response)
       12K tool output     (fits in 25K budget with history)
        3K min to continue (at least one more exchange)
@@ -186,7 +186,7 @@ class ConfigLoader:
     def get_context_settings(self) -> ContextSettings:
         """Get context management settings as typed object.
 
-        Defaults are sized for qwen3-coder-next @ 32K context.
+        Defaults are sized for qwen3-coder-next:latest @ 32K context.
         """
         ctx = self._config.get('context', {})
         return ContextSettings(
@@ -232,11 +232,11 @@ class ConfigLoader:
     def get_ollama_settings(self) -> Dict[str, Any]:
         """Get Ollama LLM settings.
 
-        v3.2: Default model switched to qwen3-coder-next with 32K context.
+        v3.2: Default model switched to qwen3-coder-next:latest with 32K context.
         """
         ollama = self._config.get('ollama', {})
         return {
-            'model': ollama.get('model', 'qwen3-coder-next'),
+            'model': ollama.get('model', 'qwen3-coder-next:latest'),
             'base_url': ollama.get('base_url', 'http://127.0.0.1:11434'),
             'model_context_length': ollama.get('model_context_length', 32768),
         }

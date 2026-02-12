@@ -7,7 +7,7 @@ Features:
 - GPU NODE RULES: No --mem on GPU partitions, --gres=gpu:N format
 - CONDA CLEANUP: Removes environment after success (YAML preserved)
 - STATE CHECKPOINTING: Resume from where you left off
-- TOKEN BUDGET: Sized for qwen3-coder-next 32K context window
+- TOKEN BUDGET: Sized for qwen3-coder-next:latest 32K context window
 - PROPER SLURM: Jobs appear in squeue, uses sbatch correctly
 - OPEN-SOURCE CHANNELS: conda-forge, bioconda only (no defaults/main)
 
@@ -357,13 +357,13 @@ class ScriptFirstSubAgentV3:
     """
     Complete SubAgent with dual cluster routing, cleanup, and resume.
     
-    Token budget sized for qwen3-coder-next (32K context):
+    Token budget sized for qwen3-coder-next:latest (32K context):
       - MAX_CONTEXT_TOKENS:    25,000  (leaves ~7K for system prompt + response)
       - MAX_TOOL_OUTPUT_TOKENS: 12,000 (fits in 25K budget with history)
       - MIN_TOKENS_FOR_RETRY:   3,000  (at least one more exchange)
     """
     
-    # Token limits sized for qwen3-coder-next @ 32K context
+    # Token limits sized for qwen3-coder-next:latest @ 32K context
     MAX_CONTEXT_TOKENS = 25_000
     MAX_TOOL_OUTPUT_TOKENS = 12_000
     MIN_TOKENS_FOR_RETRY = 3_000
@@ -377,7 +377,7 @@ class ScriptFirstSubAgentV3:
         sandbox=None,
         conda_tools=None,
         slurm_tools=None,
-        ollama_model: str = "qwen3-coder-next",
+        ollama_model: str = "qwen3-coder-next:latest",
         ollama_base_url: str = "http://127.0.0.1:11434",
         use_slurm: bool = True,
         slurm_config: Dict[str, Any] = None,
@@ -408,7 +408,7 @@ class ScriptFirstSubAgentV3:
         self.checkpoint_dir = self.project_root / 'temp' / 'checkpoints'
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
-        # Context management (token budget for qwen3-coder-next 32K)
+        # Context management (token budget for qwen3-coder-next:latest 32K)
         self.context_mgr = ContextManager(
             max_context_tokens=self.MAX_CONTEXT_TOKENS,
             max_tool_output_tokens=self.MAX_TOOL_OUTPUT_TOKENS,

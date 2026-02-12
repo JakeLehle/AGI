@@ -2,7 +2,7 @@
 Dynamic tool creation capability.
 Allows agents to generate new tools when existing ones are insufficient.
 
-v3.2: Default model switched to qwen3-coder-next, uses parse_json_resilient
+v3.2: Default model switched to qwen3-coder-next:latest, uses parse_json_resilient
 for robust JSON extraction from LLM responses.
 """
 
@@ -32,7 +32,7 @@ except ImportError:
 class ToolCreator:
     """Creates new tools dynamically based on agent needs"""
 
-    def __init__(self, ollama_model: str = "qwen3-coder-next"):
+    def __init__(self, ollama_model: str = "qwen3-coder-next:latest"):
         self.llm = Ollama(model=ollama_model)
         self.dynamic_tools_dir = Path("tools/dynamic_tools")
         self.dynamic_tools_dir.mkdir(parents=True, exist_ok=True)

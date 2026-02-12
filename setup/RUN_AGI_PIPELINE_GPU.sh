@@ -5,7 +5,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=10
-#SBATCH --gpus=1
+#SBATCH --gres=gpu:1
 #SBATCH --time=3-00:00:00
 #SBATCH --output=slurm_logs/agi_%j.out
 #SBATCH --error=slurm_logs/agi_%j.err
@@ -54,16 +54,16 @@ AGI_GPU_CLUSTER="${AGI_GPU_CLUSTER:-arc_gpu1v100}"
 # ============================================================================
 
 # Prompt file (relative or absolute path)
-PROMPT_FILE="${PROMPT_FILE:-/master/jlehle/WORKING/slide-TCR-seq-working/prompts/2026-01-29_prompt_1.md}"
+PROMPT_FILE="${PROMPT_FILE:-/work/sdz852/WORKING/slide-TCR-seq-working/prompts/2026-01-29_prompt_1.md}"
 
 # Project directory (where outputs go - separate from AGI code)
-PROJECT_DIR="${PROJECT_DIR:-/master/jlehle/WORKING/slide-TCR-seq-working}"
+PROJECT_DIR="${PROJECT_DIR:-/work/sdz852/WORKING/slide-TCR-seq-working}"
 
 # AGI repository root (the code)
-AGI_ROOT="${AGI_ROOT:-/master/jlehle/WORKING/AGI}"
+AGI_ROOT="${AGI_ROOT:-/work/sdz852/WORKING/AGI}"
 
 # AGI data directory (reflexion memory storage)
-AGI_DATA_DIR="${AGI_DATA_DIR:-/master/jlehle/agi_data}"
+AGI_DATA_DIR="${AGI_DATA_DIR:-/work/sdz852/agi_data}"
 
 # Conda environment for AGI pipeline
 CONDA_ENV="${CONDA_ENV:-AGI}"
@@ -73,9 +73,9 @@ CONDA_ENV="${CONDA_ENV:-AGI}"
 # ============================================================================
 
 # Ollama model for task execution (coding-optimized model for GPU)
-OLLAMA_MODEL="${OLLAMA_MODEL:-qwen3-coder-next}"
+OLLAMA_MODEL="${OLLAMA_MODEL:-qwen3-coder-next:latest}"
 
-# Ollama context window - qwen3-coder-next benefits from large context
+# Ollama context window - qwen3-coder-next:latest benefits from large context
 OLLAMA_CONTEXT_LENGTH="${OLLAMA_CONTEXT_LENGTH:-32768}"
 
 # Embedding model for reflexion memory
@@ -184,6 +184,7 @@ if command -v module &> /dev/null; then
     module load git 2>/dev/null && echo "    Loaded git module" || true
     module load anaconda3 2>/dev/null && echo "    Loaded anaconda3 module" || true
     module load cudatoolkit 2>/dev/null && echo "    Loaded cudatoolkit module" || true
+    module load ollama 2>/dev/null && echo "     Loaded ollama module" || true
 fi
 
 # Initialize conda

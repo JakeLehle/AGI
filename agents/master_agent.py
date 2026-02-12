@@ -14,8 +14,8 @@ Key improvements over v3.1:
 - Better handling of code snippets and implementation hints in prompts
 
 v3.2 Updates:
-- Token budget sized for qwen3-coder-next (32K context → 25K working limit)
-- Default model switched to qwen3-coder-next
+- Token budget sized for qwen3-coder-next:latest (32K context → 25K working limit)
+- Default model switched to qwen3-coder-next:latest
 - Multi-strategy JSON parsing with cleanup for malformed LLM output
 - Per-step and total decomposition timeout to prevent pipeline freezes
 - requires_gpu flag auto-detected from packages for dual cluster routing
@@ -103,7 +103,7 @@ def parse_json_resilient(text: str) -> Optional[Dict]:
     Multi-strategy JSON extraction from LLM output.
 
     Handles the common failure modes of smaller local models like
-    qwen3-coder-next:
+    qwen3-coder-next:latest:
       1. Clean JSON inside a ```json ... ``` code fence
       2. Clean JSON inside a ``` ... ``` code fence (no language tag)
       3. First { ... } blob via greedy regex
@@ -485,7 +485,7 @@ class MasterAgent:
     4. ASSIGN: Hand off validated plans to sub-agents
     5. TRACK: Maintain the master prompt document
 
-    v3.2 token budget sized for qwen3-coder-next (32K context):
+    v3.2 token budget sized for qwen3-coder-next:latest (32K context):
       - MAX_CONTEXT_TOKENS:       25,000  (leaves ~7K for system prompt + response)
       - STEP_EXPAND_TIMEOUT:         300  (5 min per step expansion LLM call)
       - TOTAL_DECOMPOSITION_TIMEOUT: 1800 (30 min for entire decomposition)
@@ -502,7 +502,7 @@ class MasterAgent:
     def __init__(
         self,
         sandbox=None,
-        ollama_model: str = "qwen3-coder-next",
+        ollama_model: str = "qwen3-coder-next:latest",
         ollama_base_url: str = "http://127.0.0.1:11434",
         **kwargs
     ):
