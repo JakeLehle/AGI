@@ -5,7 +5,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=10
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gres/gpu:1
 #SBATCH --time=3-00:00:00
 #SBATCH --output=slurm_logs/agi_%j.out
 #SBATCH --error=slurm_logs/agi_%j.err
@@ -233,7 +233,7 @@ echo ">>> Setting environment variables..."
 # Ollama
 export OLLAMA_HOST="http://127.0.0.1:11434"
 export OLLAMA_BASE_URL="http://127.0.0.1:11434"
-export OLLAMA_MODELS="${HOME}/.ollama/models"
+export OLLAMA_MODELS="/work/sdz852/ollama/models"
 export OLLAMA_KEEP_ALIVE="10m"
 export OLLAMA_CONTEXT_LENGTH="${OLLAMA_CONTEXT_LENGTH}"
 
