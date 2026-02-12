@@ -75,7 +75,7 @@ CONDA_ENV="${CONDA_ENV:-AGI}"
 # Ollama model for task execution (coding-optimized model for GPU)
 OLLAMA_MODEL="${OLLAMA_MODEL:-qwen3-coder-next:latest}"
 
-# Ollama context window - qwen3-coder-next:latest benefits from large context
+# Ollama context window - qwen3-coder-next benefits from large context
 OLLAMA_CONTEXT_LENGTH="${OLLAMA_CONTEXT_LENGTH:-32768}"
 
 # Embedding model for reflexion memory
@@ -85,12 +85,12 @@ EMBEDDING_MODEL="${EMBEDDING_MODEL:-nomic-embed-text}"
 USE_REFLEXION_MEMORY="${USE_REFLEXION_MEMORY:-true}"
 
 # ============================================================================
-# CONTEXT LIMITS (v3 Architecture)
+# CONTEXT LIMITS (v3.2 Architecture)
 # ============================================================================
 
-MAX_CONTEXT_TOKENS="${MAX_CONTEXT_TOKENS:-60000}"
-MAX_TOOL_OUTPUT_TOKENS="${MAX_TOOL_OUTPUT_TOKENS:-25000}"
-MIN_TOKENS_TO_CONTINUE="${MIN_TOKENS_TO_CONTINUE:-5000}"
+MAX_CONTEXT_TOKENS="${MAX_CONTEXT_TOKENS:-25000}"
+MAX_TOOL_OUTPUT_TOKENS="${MAX_TOOL_OUTPUT_TOKENS:-12000}"
+MIN_TOKENS_TO_CONTINUE="${MIN_TOKENS_TO_CONTINUE:-3000}"
 
 # ============================================================================
 # SUBTASK RESOURCE OVERRIDES (Optional)
@@ -233,13 +233,14 @@ echo ">>> Setting environment variables..."
 # Ollama
 export OLLAMA_HOST="http://127.0.0.1:11434"
 export OLLAMA_BASE_URL="http://127.0.0.1:11434"
-export OLLAMA_MODELS="/work/sdz852/ollama/models"
+export OLLAMA_MODELS="${OLLAMA_MODELS:-/work/sdz852/ollama/models}"
 export OLLAMA_KEEP_ALIVE="10m"
 export OLLAMA_CONTEXT_LENGTH="${OLLAMA_CONTEXT_LENGTH}"
 
 # AGI paths
 export AGI_DATA_DIR="${AGI_DATA_DIR}"
 export PYTHONPATH="${AGI_ROOT}:${PYTHONPATH}"
+echo "    PYTHONPATH=${PYTHONPATH}"
 
 # Context limits
 export AGI_MAX_CONTEXT_TOKENS="${MAX_CONTEXT_TOKENS}"

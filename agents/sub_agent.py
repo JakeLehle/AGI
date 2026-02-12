@@ -369,7 +369,7 @@ class ScriptFirstSubAgentV3:
     MIN_TOKENS_FOR_RETRY = 3_000
     
     JOB_POLL_INTERVAL = 30
-    JOB_TIMEOUT = 14400  # 4 hours
+    JOB_TIMEOUT = 259200  # 3 days in seconds (matches SLURM wall time)
     
     def __init__(
         self,

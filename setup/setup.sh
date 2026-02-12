@@ -1,37 +1,52 @@
 #!/bin/bash
-
 # =============================================================================
-# AGI Multi-Agent Pipeline - Project Directory Setup
+# AGI Multi-Agent Pipeline v3.2 - Project Directory Setup
 # =============================================================================
-# This script initializes a project directory for the AGI multi-agent system.
-# It creates the expected folder structure, initializes git, and sets up
-# proper .gitignore for tracking only configuration/scripts (not data/logs).
+# Initializes a NEW project directory for the AGI multi-agent system.
+# Run this from inside the empty (or existing) project directory.
+#
+# What it does:
+#   1. Creates the expected folder structure
+#   2. Copies RUN and CLEAN scripts from the AGI repo (with paths filled in)
+#   3. Creates project.yaml with v3.2 defaults
+#   4. Creates .gitignore
+#   5. Generates a project README.md
+#   6. Optionally initializes a Git repository
 #
 # Usage:
-#   chmod +x setup.sh
-#   ./setup.sh              # Full setup
-#   ./setup.sh --no-git     # Skip git initialization
-#   ./setup.sh --verify     # Verify directory structure
+#   # Auto-detect AGI repo (works when script is in AGI/setup/):
+#   bash /path/to/AGI/setup/setup.sh
+#
+#   # Explicit AGI root:
+#   bash setup.sh --agi-root /work/sdz852/WORKING/AGI
+#
+#   # Full setup with force overwrite:
+#   bash /path/to/AGI/setup/setup.sh --force
+#
+#   # Verify existing project:
+#   bash setup.sh --verify
 # =============================================================================
 
-set -e  # Exit on error
+set -e
 
-# Colors for output
+# ─── Colors ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# Configuration
+# ─── Defaults ─────────────────────────────────────────────────────────────────
 ENV_NAME="AGI"
 PROJECT_NAME=$(basename "$(pwd)")
+PROJECT_DIR="$(pwd)"
+AGI_ROOT=""
+SKIP_GIT=false
+VERIFY_ONLY=false
+FORCE=false
 
-# -----------------------------------------------------------------------------
-# Helper Functions
-# -----------------------------------------------------------------------------
-
+# ─── Helpers ──────────────────────────────────────────────────────────────────
 print_header() {
     echo ""
     echo -e "${BLUE}==============================================================================${NC}"
@@ -39,33 +54,18 @@ print_header() {
     echo -e "${BLUE}==============================================================================${NC}"
     echo ""
 }
+print_success() { echo -e "  ${GREEN}✓${NC} $1"; }
+print_warning() { echo -e "  ${YELLOW}⚠${NC} $1"; }
+print_error()   { echo -e "  ${RED}✗${NC} $1"; }
+print_info()    { echo -e "  ${CYAN}→${NC} $1"; }
 
-print_success() {
-    echo -e "${GREEN}✓${NC} $1"
-}
-
-print_warning() {
-    echo -e "${YELLOW}⚠${NC} $1"
-}
-
-print_error() {
-    echo -e "${RED}✗${NC} $1"
-}
-
-print_info() {
-    echo -e "${CYAN}→${NC} $1"
-}
-
-# -----------------------------------------------------------------------------
-# Parse Arguments
-# -----------------------------------------------------------------------------
-
-SKIP_GIT=false
-VERIFY_ONLY=false
-FORCE=false
-
+# ─── Parse Arguments ─────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --agi-root)
+            AGI_ROOT="$2"
+            shift 2
+            ;;
         --no-git)
             SKIP_GIT=true
             shift
@@ -79,51 +79,76 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --help|-h)
-            echo "Usage: ./setup.sh [OPTIONS]"
+            echo "Usage: bash setup.sh [OPTIONS]"
             echo ""
-            echo "Initializes a project directory for the AGI multi-agent pipeline."
+            echo "Initializes a project directory for the AGI multi-agent pipeline v3.2."
+            echo "Run from inside your project directory."
             echo ""
             echo "Options:"
-            echo "  --no-git      Skip Git repository initialization"
-            echo "  --verify      Only verify the directory structure"
-            echo "  --force, -f   Overwrite existing files without prompting"
-            echo "  --help, -h    Show this help message"
+            echo "  --agi-root PATH   Path to the AGI repository (auto-detected if omitted)"
+            echo "  --no-git          Skip Git repository initialization"
+            echo "  --verify          Only verify the directory structure"
+            echo "  --force, -f       Overwrite existing files without prompting"
+            echo "  --help, -h        Show this help message"
             echo ""
-            echo "Project: ${PROJECT_NAME}"
+            echo "Examples:"
+            echo "  mkdir my-project && cd my-project"
+            echo "  bash /work/sdz852/WORKING/AGI/setup/setup.sh"
+            echo ""
             exit 0
             ;;
         *)
-            echo "Unknown option: $1"
-            echo "Use --help for usage information"
+            echo "Unknown option: $1 (use --help)"
             exit 1
             ;;
     esac
 done
 
-# -----------------------------------------------------------------------------
-# Verification Only
-# -----------------------------------------------------------------------------
+# ─── Auto-detect AGI_ROOT ────────────────────────────────────────────────────
+# If this script lives at AGI/setup/setup.sh, we can find AGI_ROOT automatically.
+if [ -z "$AGI_ROOT" ]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    CANDIDATE="$(dirname "$SCRIPT_DIR")"
+    if [ -f "$CANDIDATE/main.py" ] && [ -d "$CANDIDATE/agents" ]; then
+        AGI_ROOT="$CANDIDATE"
+    fi
+fi
 
+# Validate AGI_ROOT
+if [ -n "$AGI_ROOT" ] && [ ! -f "$AGI_ROOT/main.py" ]; then
+    echo -e "${RED}ERROR: AGI_ROOT ($AGI_ROOT) does not contain main.py${NC}"
+    echo "  Provide the correct path with: --agi-root /path/to/AGI"
+    exit 1
+fi
+
+# ─── Safety: don't run inside the AGI repo itself ─────────────────────────────
+if [ -n "$AGI_ROOT" ]; then
+    REAL_PROJECT="$(cd "$PROJECT_DIR" && pwd -P)"
+    REAL_AGI="$(cd "$AGI_ROOT" && pwd -P)"
+    if [ "$REAL_PROJECT" = "$REAL_AGI" ]; then
+        echo -e "${RED}ERROR: You're inside the AGI repository, not a project directory.${NC}"
+        echo "  Create a new directory first:"
+        echo "    mkdir ../my-project && cd ../my-project"
+        echo "    bash ${BASH_SOURCE[0]}"
+        exit 1
+    fi
+fi
+
+# =============================================================================
+# VERIFICATION ONLY
+# =============================================================================
 if [ "$VERIFY_ONLY" = true ]; then
     print_header "Verifying Project Structure: ${PROJECT_NAME}"
-    
+
     expected_dirs=(
-        "agents"
-        "config"
-        "data/inputs"
-        "data/outputs"
-        "logs"
-        "prompts"
-        "reports"
-        "scripts"
-        "slurm/logs"
-        "slurm/scripts"
-        "temp"
-        "tools/dynamic_tools"
-        "utils"
-        "workflows"
+        "agents" "config" "conda_env"
+        "data/inputs" "data/outputs"
+        "envs" "logs" "prompts" "reports" "scripts"
+        "slurm/logs" "slurm/scripts" "slurm_logs"
+        "temp/checkpoints"
+        "tools/dynamic_tools" "utils" "workflows"
     )
-    
+
     all_present=true
     for dir in "${expected_dirs[@]}"; do
         if [ -d "$dir" ]; then
@@ -133,110 +158,100 @@ if [ "$VERIFY_ONLY" = true ]; then
             all_present=false
         fi
     done
-    
+
     echo ""
     if [ "$all_present" = true ]; then
         print_success "All required directories present"
     else
-        print_error "Some directories are missing - run setup.sh to create them"
-        exit 1
+        print_error "Some directories missing — re-run setup.sh to create them"
     fi
-    
-    # Check for git
+
+    echo ""
+    for f in project.yaml RUN_AGI_PIPELINE_GPU.sh RUN_AGI_PIPELINE_CPU.sh CLEAN_PROJECT.sh; do
+        if [ -f "$f" ]; then
+            print_success "$f"
+        else
+            print_warning "$f (missing)"
+        fi
+    done
+
     echo ""
     if [ -d ".git" ]; then
-        print_success "Git repository initialized"
-        echo "  Remote: $(git remote get-url origin 2>/dev/null || echo 'none')"
-        echo "  Branch: $(git branch --show-current 2>/dev/null || echo 'unknown')"
+        print_success "Git initialized (branch: $(git branch --show-current 2>/dev/null || echo '?'))"
     else
-        print_warning "Git repository not initialized"
+        print_warning "Git not initialized"
     fi
-    
-    # Check for project metadata
-    if [ -f "project.yaml" ]; then
-        print_success "Project metadata file exists"
-    else
-        print_warning "project.yaml not found"
-    fi
-    
+
     exit 0
 fi
 
-# -----------------------------------------------------------------------------
-# Main Setup
-# -----------------------------------------------------------------------------
+# =============================================================================
+# MAIN SETUP
+# =============================================================================
+print_header "AGI Pipeline v3.2 — Project Setup"
 
-print_header "AGI Pipeline - Project Setup"
-
-echo -e "Project Name:  ${CYAN}${PROJECT_NAME}${NC}"
-echo -e "Location:      ${CYAN}$(pwd)${NC}"
-echo ""
-echo "This script will:"
-echo "  1. Create AGI pipeline directory structure"
-echo "  2. Create project metadata file (project.yaml)"
-echo "  3. Set up .gitignore (tracks config/prompts/scripts, ignores data/logs)"
-if [ "$SKIP_GIT" = false ]; then
-    echo "  4. Initialize Git repository"
+echo -e "  Project:   ${CYAN}${PROJECT_NAME}${NC}"
+echo -e "  Location:  ${CYAN}${PROJECT_DIR}${NC}"
+if [ -n "$AGI_ROOT" ]; then
+    echo -e "  AGI Root:  ${CYAN}${AGI_ROOT}${NC}"
+else
+    echo -e "  AGI Root:  ${YELLOW}not detected (script templates will be skipped)${NC}"
 fi
+echo ""
+echo "  This script will:"
+echo "    1. Create directory structure"
+echo "    2. Copy RUN + CLEAN scripts from AGI repo"
+echo "    3. Create project.yaml (v3.2 defaults)"
+echo "    4. Create .gitignore"
+echo "    5. Generate project README.md"
+[ "$SKIP_GIT" = false ] && echo "    6. Initialize Git repository"
 echo ""
 
 if [ "$FORCE" = false ]; then
-    read -p "Continue? [Y/n] " -n 1 -r
+    read -p "  Continue? [Y/n] " -n 1 -r
     echo
     if [[ ! $REPLY =~ ^[Yy]?$ ]]; then
-        echo "Setup cancelled."
+        echo "  Cancelled."
         exit 0
     fi
 fi
 
-# -----------------------------------------------------------------------------
-# Step 1: Create Directory Structure
-# -----------------------------------------------------------------------------
-
+# =============================================================================
+# Step 1: Directory Structure
+# =============================================================================
 print_header "Step 1: Creating Directory Structure"
 
-# Define directories
-# These are organized by purpose:
-#   - Pipeline infrastructure (agents, tools, workflows, utils)
-#   - Configuration (config, prompts, scripts)
-#   - Data I/O (data/inputs, data/outputs) - IGNORED by git
-#   - Logging (logs) - IGNORED by git
-#   - Reports (reports) - IGNORED by git (generated outputs)
-#   - SLURM (slurm/scripts tracked, slurm/logs ignored)
-#   - Temporary (temp) - IGNORED by git
-
 directories=(
-    # Pipeline infrastructure
+    # Pipeline infrastructure (Python packages)
     "agents"
     "tools"
     "tools/dynamic_tools"
     "workflows"
     "utils"
-    
-    # Configuration - TRACKED
+
+    # Configuration — TRACKED
     "config"
     "prompts"
     "scripts"
-    
-    # Data I/O - IGNORED
+    "scripts/example_reference_scripts"
+    "conda_env"
+
+    # Data I/O — IGNORED
     "data/inputs"
     "data/outputs"
-    
-    # Logging - IGNORED
+
+    # Runtime artifacts — IGNORED
     "logs"
-    
-    # Reports - IGNORED (generated)
     "reports"
-    
+    "envs"
+
     # SLURM
     "slurm/scripts"
     "slurm/logs"
-    
-    # Temporary - IGNORED
-    "temp"
-    
-    # Environment exports - TRACKED
-    "envs"
+    "slurm_logs"
+
+    # Temporary / checkpoints — IGNORED
+    "temp/checkpoints"
 )
 
 for dir in "${directories[@]}"; do
@@ -248,53 +263,95 @@ for dir in "${directories[@]}"; do
     fi
 done
 
-# Create __init__.py files for Python packages
-python_packages=("agents" "tools" "workflows" "utils")
-for package in "${python_packages[@]}"; do
-    init_file="${package}/__init__.py"
-    if [ ! -f "$init_file" ]; then
-        touch "$init_file"
-        print_info "Created: $init_file"
-    fi
+# __init__.py for Python packages
+for pkg in agents tools workflows utils; do
+    init="${pkg}/__init__.py"
+    [ ! -f "$init" ] && touch "$init" && print_info "Created: $init"
 done
 
-# Create .gitkeep files ONLY for tracked empty directories
-# (config, prompts, scripts, slurm/scripts, envs)
-tracked_empty_dirs=("config" "prompts" "scripts" "slurm/scripts" "envs")
-for dir in "${tracked_empty_dirs[@]}"; do
-    gitkeep="${dir}/.gitkeep"
-    if [ ! -f "$gitkeep" ]; then
-        touch "$gitkeep"
-    fi
+# .gitkeep for tracked empty directories
+for dir in config prompts scripts slurm/scripts conda_env; do
+    gk="${dir}/.gitkeep"
+    [ ! -f "$gk" ] && touch "$gk"
 done
 
 print_success "Directory structure created"
 
-# -----------------------------------------------------------------------------
-# Step 2: Create Project Metadata
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Step 2: Copy Scripts from AGI Repo
+# =============================================================================
+print_header "Step 2: Copying Pipeline Scripts"
 
-print_header "Step 2: Creating Project Metadata"
+copy_and_patch() {
+    local src="$1"
+    local dst="$2"
+    local desc="$3"
+
+    if [ ! -f "$src" ]; then
+        print_warning "Source not found: $src"
+        return
+    fi
+
+    if [ -f "$dst" ] && [ "$FORCE" = false ]; then
+        print_success "Exists: $dst (use --force to overwrite)"
+        return
+    fi
+
+    cp "$src" "$dst"
+
+    # Patch the PROMPT_FILE, PROJECT_DIR, AGI_ROOT, AGI_DATA_DIR placeholders
+    # to point at this project. Uses | delimiter to avoid / escaping issues.
+    sed -i "s|PROMPT_FILE=\"\${PROMPT_FILE:-[^}]*}\"|PROMPT_FILE=\"\${PROMPT_FILE:-${PROJECT_DIR}/prompts/YOUR_PROMPT.md}\"|" "$dst" 2>/dev/null || true
+    sed -i "s|PROJECT_DIR=\"\${PROJECT_DIR:-[^}]*}\"|PROJECT_DIR=\"\${PROJECT_DIR:-${PROJECT_DIR}}\"|" "$dst" 2>/dev/null || true
+    sed -i "s|AGI_ROOT=\"\${AGI_ROOT:-[^}]*}\"|AGI_ROOT=\"\${AGI_ROOT:-${AGI_ROOT}}\"|" "$dst" 2>/dev/null || true
+
+    print_success "Copied: $desc → $dst"
+}
+
+if [ -n "$AGI_ROOT" ]; then
+    copy_and_patch \
+        "$AGI_ROOT/setup/RUN_AGI_PIPELINE_GPU.sh" \
+        "RUN_AGI_PIPELINE_GPU.sh" \
+        "GPU pipeline script"
+
+    copy_and_patch \
+        "$AGI_ROOT/setup/RUN_AGI_PIPELINE_CPU.sh" \
+        "RUN_AGI_PIPELINE_CPU.sh" \
+        "CPU pipeline script"
+
+    # CLEAN_PROJECT.sh — straight copy, no patching needed
+    if [ -f "$AGI_ROOT/setup/CLEAN_PROJECT.sh" ]; then
+        if [ ! -f "CLEAN_PROJECT.sh" ] || [ "$FORCE" = true ]; then
+            cp "$AGI_ROOT/setup/CLEAN_PROJECT.sh" "CLEAN_PROJECT.sh"
+            print_success "Copied: CLEAN_PROJECT.sh"
+        else
+            print_success "Exists: CLEAN_PROJECT.sh"
+        fi
+    fi
+else
+    print_warning "AGI_ROOT not detected — skipping script copy"
+    print_info "Re-run with: bash /path/to/AGI/setup/setup.sh"
+fi
+
+# =============================================================================
+# Step 3: Project Metadata (project.yaml)
+# =============================================================================
+print_header "Step 3: Creating project.yaml"
 
 PROJECT_YAML="project.yaml"
 
-if [ -f "$PROJECT_YAML" ] && [ "$FORCE" = false ]; then
-    print_warning "project.yaml already exists"
-    read -p "Overwrite? [y/N] " -n 1 -r
+should_create() {
+    [ ! -f "$1" ] && return 0
+    [ "$FORCE" = true ] && return 0
+    read -p "  $1 exists. Overwrite? [y/N] " -n 1 -r
     echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        print_info "Keeping existing project.yaml"
-    else
-        CREATE_PROJECT_YAML=true
-    fi
-else
-    CREATE_PROJECT_YAML=true
-fi
+    [[ $REPLY =~ ^[Yy]$ ]]
+}
 
-if [ "$CREATE_PROJECT_YAML" = true ] || [ ! -f "$PROJECT_YAML" ]; then
+if should_create "$PROJECT_YAML"; then
     cat > "$PROJECT_YAML" << EOF
 # =============================================================================
-# AGI Pipeline Project Configuration
+# AGI Pipeline Project Configuration — v3.2
 # =============================================================================
 # Project: ${PROJECT_NAME}
 # Created: $(date -I)
@@ -306,16 +363,17 @@ project:
   created: "$(date -I)"
   version: "0.1.0"
 
-# Environment settings
+# Environment
 environment:
   conda_env: "${ENV_NAME}"
   python_version: "3.10"
 
-# Ollama model settings
+# Ollama model (v3.2: qwen3-coder-next on GPU, llama3.1:70b on CPU-only)
 ollama:
-  model: "llama3.1:70b"
+  model: "qwen3-coder-next:latest"
   fallback_model: "llama3.1:8b"
-  base_url: "http://localhost:11434"
+  base_url: "http://127.0.0.1:11434"
+  context_length: 32768
 
 # Agent settings
 agents:
@@ -323,92 +381,63 @@ agents:
   timeout_seconds: 300
   enable_dynamic_tools: true
 
-# Workflow settings
+# Workflow
 workflow:
   enable_checkpointing: true
   checkpoint_frequency: "per_subtask"
-  max_execution_time_minutes: 60
+  max_execution_time_minutes: 4320    # 3 days
 
-# SLURM settings (HPC)
+# SLURM (v3.2: ARC dual-cluster architecture)
 slurm:
-  default_partition: "compute2"
-  gpu_partition: "gpu1v100"
-  default_time: "08:00:00"
-  default_nodes: 1
-  default_cpus: 40
+  default_cluster: "arc_compute1"
+  default_gpu_cluster: "arc_gpu1v100"
+  poll_interval: 30
+  max_poll_attempts: 8640             # 3 days @ 30s
+  default_time: "1-00:00:00"
+  default_cpus: 20
 
 # Logging
 logging:
   level: "INFO"
   json_format: true
   console_output: true
-
-# Documentation
-documentation:
-  auto_generate_readme: true
-  update_frequency: "on_completion"
 EOF
     print_success "Created project.yaml"
+else
+    print_success "Keeping existing project.yaml"
 fi
 
-# -----------------------------------------------------------------------------
-# Step 3: Create .gitignore
-# -----------------------------------------------------------------------------
-
-print_header "Step 3: Creating .gitignore"
+# =============================================================================
+# Step 4: .gitignore
+# =============================================================================
+print_header "Step 4: Creating .gitignore"
 
 GITIGNORE=".gitignore"
 
-if [ -f "$GITIGNORE" ] && [ "$FORCE" = false ]; then
-    print_warning ".gitignore already exists"
-    read -p "Overwrite? [y/N] " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        print_info "Keeping existing .gitignore"
-        CREATE_GITIGNORE=false
-    else
-        CREATE_GITIGNORE=true
-    fi
-else
-    CREATE_GITIGNORE=true
-fi
-
-if [ "$CREATE_GITIGNORE" = true ]; then
+if should_create "$GITIGNORE"; then
     cat > "$GITIGNORE" << 'EOF'
 # =============================================================================
 # AGI Pipeline .gitignore
-# =============================================================================
-# Philosophy: Track configuration, prompts, and scripts.
-#             Ignore data, logs, outputs, and temporary files.
+# Track: config, prompts, scripts, conda_env specs
+# Ignore: data, logs, reports, temp, runtime artifacts
 # =============================================================================
 
-# -----------------------------------------------------------------------------
-# DATA - Never track data files (potentially large, sensitive)
-# -----------------------------------------------------------------------------
+# ── Data (large, sensitive) ──────────────────────────────────────────────────
 data/
 !data/.gitkeep
 
-# -----------------------------------------------------------------------------
-# LOGS - Never track log files
-# -----------------------------------------------------------------------------
+# ── Logs ─────────────────────────────────────────────────────────────────────
 logs/
 *.log
 *.jsonl
-
-# SLURM job output logs (but keep script templates)
 slurm/logs/
-*.out
-*.err
+slurm_logs/
 
-# -----------------------------------------------------------------------------
-# OUTPUTS & REPORTS - Generated files, don't track
-# -----------------------------------------------------------------------------
+# ── Reports & runtime state ─────────────────────────────────────────────────
 reports/
 !reports/.gitkeep
 
-# -----------------------------------------------------------------------------
-# TEMPORARY FILES
-# -----------------------------------------------------------------------------
+# ── Temp / checkpoints ──────────────────────────────────────────────────────
 temp/
 *.tmp
 *.temp
@@ -417,14 +446,11 @@ temp/
 *.swo
 *~
 
-# -----------------------------------------------------------------------------
-# PYTHON
-# -----------------------------------------------------------------------------
+# ── Python ───────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
-.Python
 *.egg-info/
 .eggs/
 dist/
@@ -432,56 +458,25 @@ build/
 .pytest_cache/
 .coverage
 htmlcov/
-
-# Virtual environments (use conda instead)
 venv/
 .venv/
-env/
 
-# -----------------------------------------------------------------------------
-# DATABASE & STATE FILES
-# -----------------------------------------------------------------------------
+# ── Database & state ────────────────────────────────────────────────────────
 *.db
 *.sqlite
 *.sqlite3
-workflow_state.db
 
-# -----------------------------------------------------------------------------
-# ENVIRONMENT EXPORTS - Keep these for reproducibility
-# -----------------------------------------------------------------------------
-# Note: envs/ folder IS tracked for environment.yml exports
-# But ignore actual conda env installations
+# ── Conda env installs (but keep spec files) ────────────────────────────────
 envs/*/
 
-# -----------------------------------------------------------------------------
-# DYNAMIC TOOLS - Track the generated tools for reproducibility
-# -----------------------------------------------------------------------------
-# tools/dynamic_tools/ IS tracked
-
-# -----------------------------------------------------------------------------
-# IDE & EDITOR
-# -----------------------------------------------------------------------------
+# ── IDE / OS ─────────────────────────────────────────────────────────────────
 .idea/
 .vscode/
 *.sublime-*
-.spyderproject
-.spyproject
-
-# -----------------------------------------------------------------------------
-# OS FILES
-# -----------------------------------------------------------------------------
 .DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
 Thumbs.db
-desktop.ini
 
-# -----------------------------------------------------------------------------
-# SECRETS & CREDENTIALS - Never track these
-# -----------------------------------------------------------------------------
+# ── Secrets ──────────────────────────────────────────────────────────────────
 .env
 .env.*
 *.pem
@@ -489,25 +484,18 @@ desktop.ini
 secrets/
 credentials/
 
-# -----------------------------------------------------------------------------
-# LARGE FILES & MODELS
-# -----------------------------------------------------------------------------
+# ── Large files / models ────────────────────────────────────────────────────
 *.h5
 *.hdf5
 *.pkl
 *.pickle
-*.joblib
-*.model
-*.ckpt
 *.pt
 *.pth
 models/
 
-# Bioinformatics specific large files
+# ── Bioinformatics ──────────────────────────────────────────────────────────
 *.fastq
 *.fastq.gz
-*.fq
-*.fq.gz
 *.bam
 *.sam
 *.vcf
@@ -516,10 +504,7 @@ models/
 *.gtf
 *.gff
 
-# -----------------------------------------------------------------------------
-# EXPLICITLY TRACKED (override ignores above)
-# -----------------------------------------------------------------------------
-# These patterns ensure key files are tracked even if parent folders are ignored
+# ── Explicitly tracked (override ignores) ────────────────────────────────────
 !.gitkeep
 !config/
 !config/**
@@ -529,233 +514,190 @@ models/
 !scripts/**
 !slurm/scripts/
 !slurm/scripts/**
+!conda_env/
+!conda_env/**
 !envs/*.yml
 !envs/*.yaml
-!environment.yml
 !project.yaml
-!setup.sh
+!*.sh
 !README.md
-!QUICKSTART.md
 !requirements.txt
 EOF
     print_success "Created .gitignore"
+else
+    print_success "Keeping existing .gitignore"
 fi
 
-# -----------------------------------------------------------------------------
-# Step 4: Create README template
-# -----------------------------------------------------------------------------
-
-print_header "Step 4: Creating README"
+# =============================================================================
+# Step 5: README.md
+# =============================================================================
+print_header "Step 5: Creating README.md"
 
 README="README.md"
 
-if [ ! -f "$README" ] || [ "$FORCE" = true ]; then
-    cat > "$README" << EOF
-# ${PROJECT_NAME}
+if should_create "$README"; then
+    cat > "$README" << 'READMEEOF'
+# PROJECT_NAME_PLACEHOLDER
 
-> AGI Multi-Agent Pipeline Project
-
-## Overview
-
-This project uses the AGI multi-agent automation system for [describe your project].
+> AGI Multi-Agent Pipeline Project (v3.2)
 
 ## Quick Start
 
-\`\`\`bash
-# 1. Activate environment
-conda activate ${ENV_NAME}
+```bash
+# 1. Activate the AGI environment
+conda activate AGI
 
-# 2. (On HPC) Get a compute node
-srun --partition=compute2 -N 1 -n 1 -c 40 --time=08:00:00 --pty bash
+# 2. Write your master prompt
+vi prompts/my_analysis.md
 
-# 3. Start Ollama (if using local LLM)
-ollama serve > /dev/null 2>&1 &
+# 3. Update RUN_AGI_PIPELINE_GPU.sh with your prompt path
+#    (setup.sh fills in PROJECT_DIR and AGI_ROOT automatically)
+vi RUN_AGI_PIPELINE_GPU.sh
 
-# 4. Run a task
-python main.py --task "Your task description" --project-dir .
-\`\`\`
+# 4. Submit to the GPU queue
+sbatch RUN_AGI_PIPELINE_GPU.sh
+
+# 5. Monitor
+tail -f slurm_logs/agi_*.out
+squeue -u $USER
+```
 
 ## Directory Structure
 
-\`\`\`
-${PROJECT_NAME}/
-├── agents/              # Agent definitions
-├── config/              # Configuration files (tracked)
+```
+PROJECT/
+├── agents/                  # Agent __init__.py (pipeline infra)
+├── conda_env/               # Conda environment YAML specs (tracked)
+├── config/                  # Configuration files (tracked)
 ├── data/
-│   ├── inputs/          # Input data (NOT tracked)
-│   └── outputs/         # Output data (NOT tracked)
-├── envs/                # Environment exports (tracked)
-├── logs/                # Execution logs (NOT tracked)
-├── prompts/             # Task prompts (tracked)
-├── reports/             # Generated reports (NOT tracked)
-├── scripts/             # Utility scripts (tracked)
+│   ├── inputs/              # Input data (NOT tracked)
+│   └── outputs/             # Output data (NOT tracked)
+├── envs/                    # Auto-generated step env specs (ignored)
+├── logs/                    # Agent + Ollama logs (ignored)
+├── prompts/                 # Master prompt .md files (tracked)
+├── reports/                 # Pipeline status reports (ignored)
+├── scripts/                 # User + generated scripts (tracked)
+│   └── example_reference_scripts/
 ├── slurm/
-│   ├── logs/            # SLURM job logs (NOT tracked)
-│   └── scripts/         # SLURM submission scripts (tracked)
-├── temp/                # Temporary files (NOT tracked)
+│   ├── logs/                # Subtask SLURM logs (ignored)
+│   └── scripts/             # Generated sbatch scripts (ignored)
+├── slurm_logs/              # Master job stdout/stderr (ignored)
+├── temp/
+│   └── checkpoints/         # Step checkpoint JSONs (ignored)
 ├── tools/
-│   └── dynamic_tools/   # Dynamically created tools (tracked)
-├── utils/               # Utility modules
-├── workflows/           # LangGraph workflows
-├── project.yaml         # Project configuration
-└── README.md            # This file
-\`\`\`
+│   └── dynamic_tools/       # Agent-created tools (tracked)
+├── utils/                   # Utility __init__.py
+├── workflows/               # Workflow __init__.py
+├── project.yaml             # Project config (tracked)
+├── RUN_AGI_PIPELINE_GPU.sh  # GPU submission script (tracked)
+├── RUN_AGI_PIPELINE_CPU.sh  # CPU submission script (tracked)
+├── CLEAN_PROJECT.sh         # Cleanup script (tracked)
+└── README.md
+```
+
+## Pipeline Scripts
+
+| Script | Purpose |
+|--------|---------|
+| `RUN_AGI_PIPELINE_GPU.sh` | Submit master pipeline to GPU node (recommended) |
+| `RUN_AGI_PIPELINE_CPU.sh` | Submit to CPU-only cluster (zeus) |
+| `CLEAN_PROJECT.sh` | Remove stale logs, checkpoints, reports for fresh run |
+| `CLEAN_PROJECT.sh --dry-run` | Preview what would be cleaned |
 
 ## Configuration
 
-Edit \`project.yaml\` to customize:
-- Ollama model settings
-- Agent retry limits
-- SLURM partition defaults
-- Logging preferences
+Edit `project.yaml` to customize model, SLURM defaults, and timeouts.
+Edit the RUN scripts to change cluster targets or resource requests.
 
-## Usage
+## Cleanup Between Runs
 
-### Running Tasks
+```bash
+bash CLEAN_PROJECT.sh          # Interactive — shows what will be removed
+bash CLEAN_PROJECT.sh --yes    # Skip confirmation
+bash CLEAN_PROJECT.sh --dry-run  # Preview only
+```
 
-\`\`\`bash
-# Interactive task
-python main.py --task "Analyze data in data/inputs/" --project-dir .
-
-# From prompt file
-python main.py --prompt-file prompts/my_analysis.txt --project-dir .
-
-# SLURM submission
-python main.py --task "Long running analysis" --project-dir . --slurm
-\`\`\`
-
-### Adding Prompts
-
-Create prompt files in \`prompts/\` directory:
-
-\`\`\`bash
-# prompts/analyze_samples.txt
-Analyze the RNA-seq samples in data/inputs/ and generate a summary report.
-Focus on differential expression between treatment groups.
-\`\`\`
+This removes logs, checkpoints, reports, generated prompts, and env specs.
+It preserves your master prompts, scripts, data, and configuration.
 
 ## Notes
 
-- Data files are NOT tracked in git (too large, potentially sensitive)
-- Logs are NOT tracked (generated during execution)
-- Configuration, prompts, and scripts ARE tracked for reproducibility
-- Environment exports in \`envs/\` ARE tracked
+- Data files are NOT tracked (too large / sensitive)
+- Logs and reports are NOT tracked (regenerated each run)
+- Prompts, scripts, and config ARE tracked for reproducibility
+- Conda env specs in `conda_env/` ARE tracked
+READMEEOF
 
----
+    # Replace placeholder with actual project name
+    sed -i "s/PROJECT_NAME_PLACEHOLDER/${PROJECT_NAME}/" "$README"
 
-*Generated by AGI Pipeline setup.sh on $(date -I)*
-EOF
     print_success "Created README.md"
 else
-    print_info "README.md already exists, skipping"
+    print_success "Keeping existing README.md"
 fi
 
-# -----------------------------------------------------------------------------
-# Step 5: Initialize Git Repository
-# -----------------------------------------------------------------------------
-
+# =============================================================================
+# Step 6: Git Repository
+# =============================================================================
 if [ "$SKIP_GIT" = false ]; then
-    print_header "Step 5: Initializing Git Repository"
-    
+    print_header "Step 6: Initializing Git Repository"
+
     if [ -d ".git" ]; then
-        print_warning "Git repository already initialized"
-        print_info "Remote: $(git remote get-url origin 2>/dev/null || echo 'none configured')"
+        print_warning "Git already initialized"
+        print_info "Remote: $(git remote get-url origin 2>/dev/null || echo 'none')"
     else
         git init
-        
-        # Set the initial branch name to main
         git branch -M main 2>/dev/null || true
-        
-        # Stage all tracked files
         git add .
-        
-        # Initial commit with project name
-        git commit -m "Initial commit: ${PROJECT_NAME} - AGI Pipeline project setup
+        git commit -m "Initial commit: ${PROJECT_NAME} — AGI Pipeline v3.2 project
 
-Project: ${PROJECT_NAME}
-Created: $(date -I)
-
-Directory structure initialized with:
-- Agent infrastructure (agents/, tools/, workflows/, utils/)
-- Configuration (config/, prompts/, scripts/)
-- Data directories (data/inputs/, data/outputs/) [gitignored]
-- Logging (logs/) [gitignored]
-- SLURM support (slurm/scripts/, slurm/logs/)
-
-Tracked items:
-- Configuration files (config/, project.yaml)
-- Prompts (prompts/)
-- Scripts (scripts/, slurm/scripts/)
-- Environment exports (envs/*.yml)
-- Dynamic tools (tools/dynamic_tools/)
-
-Ignored items:
-- All data files (data/)
-- Log files (logs/, *.log, *.jsonl)
-- Reports (reports/)
-- Temporary files (temp/)
-- SLURM job output (slurm/logs/)"
-        
-        print_success "Git repository initialized"
-        print_info "Branch: main"
-        print_info "Initial commit created"
-        
+Directory structure with dual-cluster SLURM support (ARC).
+Includes RUN scripts, cleanup script, and project config."
+        print_success "Git initialized (branch: main)"
         echo ""
-        echo "To add a remote origin:"
-        echo "  git remote add origin git@github.com:USERNAME/${PROJECT_NAME}.git"
-        echo "  git push -u origin main"
+        echo "    To add a remote:"
+        echo "    git remote add origin git@github.com:USERNAME/${PROJECT_NAME}.git"
+        echo "    git push -u origin main"
     fi
 else
-    print_header "Step 5: Skipping Git (--no-git)"
-    print_info "Run 'git init' later to initialize repository"
+    print_header "Step 6: Skipping Git (--no-git)"
+    print_info "Run 'git init' later if needed"
 fi
 
-# -----------------------------------------------------------------------------
-# Final Summary
-# -----------------------------------------------------------------------------
-
+# =============================================================================
+# Summary
+# =============================================================================
 print_header "Setup Complete!"
 
-echo -e "Project:     ${CYAN}${PROJECT_NAME}${NC}"
-echo -e "Location:    ${CYAN}$(pwd)${NC}"
-echo -e "Environment: ${CYAN}${ENV_NAME}${NC}"
-echo ""
-echo "Directory structure:"
-echo ""
-echo "  TRACKED (committed to git):"
-echo "    config/         - Configuration files"
-echo "    prompts/        - Task prompt files"
-echo "    scripts/        - Utility scripts"
-echo "    slurm/scripts/  - SLURM job templates"
-echo "    envs/*.yml      - Environment exports"
-echo "    tools/          - Pipeline tools"
-echo "    project.yaml    - Project settings"
-echo ""
-echo "  NOT TRACKED (gitignored):"
-echo "    data/           - Input/output data"
-echo "    logs/           - Execution logs"
-echo "    reports/        - Generated reports"
-echo "    temp/           - Temporary files"
-echo "    slurm/logs/     - SLURM job output"
-echo ""
-echo "Next steps:"
-echo ""
-echo "  1. Edit project.yaml with your project description"
-echo ""
-echo "  2. Add your input data to data/inputs/"
-echo ""
-echo "  3. Create a prompt file:"
-echo "     ${YELLOW}echo 'Your task description' > prompts/my_task.txt${NC}"
-echo ""
-echo "  4. Run the pipeline:"
-echo "     ${YELLOW}conda activate ${ENV_NAME}${NC}"
-echo "     ${YELLOW}python main.py --prompt-file prompts/my_task.txt --project-dir .${NC}"
-echo ""
-if [ "$SKIP_GIT" = false ] && [ -d ".git" ]; then
-    echo "  5. Push to GitHub:"
-    echo "     ${YELLOW}git remote add origin git@github.com:USERNAME/${PROJECT_NAME}.git${NC}"
-    echo "     ${YELLOW}git push -u origin main${NC}"
-    echo ""
+echo -e "  Project:     ${CYAN}${PROJECT_NAME}${NC}"
+echo -e "  Location:    ${CYAN}${PROJECT_DIR}${NC}"
+if [ -n "$AGI_ROOT" ]; then
+    echo -e "  AGI Root:    ${CYAN}${AGI_ROOT}${NC}"
 fi
+echo ""
+echo -e "  ${GREEN}TRACKED${NC} (committed to git):"
+echo "    config/           prompts/          scripts/"
+echo "    conda_env/        slurm/scripts/    project.yaml"
+echo "    RUN_*.sh          CLEAN_PROJECT.sh  README.md"
+echo ""
+echo -e "  ${YELLOW}IGNORED${NC} (gitignored):"
+echo "    data/             logs/             reports/"
+echo "    temp/             slurm_logs/       slurm/logs/"
+echo "    envs/step_*.yml"
+echo ""
+echo "  Next steps:"
+echo ""
+echo "    1. Add your input data to ${CYAN}data/inputs/${NC}"
+echo ""
+echo "    2. Write your master prompt:"
+echo -e "       ${YELLOW}vi prompts/my_analysis.md${NC}"
+echo ""
+echo "    3. Update the prompt path in your RUN script:"
+echo -e "       ${YELLOW}vi RUN_AGI_PIPELINE_GPU.sh${NC}"
+echo "       (look for PROMPT_FILE near the top)"
+echo ""
+echo "    4. Submit:"
+echo -e "       ${YELLOW}sbatch RUN_AGI_PIPELINE_GPU.sh${NC}"
+echo ""
 
 print_success "Happy automating!"

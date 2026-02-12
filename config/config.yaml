@@ -160,8 +160,8 @@ slurm:
   default_gpu_cluster: "arc_gpu1v100"
   
   # Polling settings
-  poll_interval: 10       # Seconds between job status checks
-  max_poll_attempts: 720  # Max attempts (2 hours at 10s intervals)
+  poll_interval: 30       # Seconds between job status checks
+  max_poll_attempts: 8640  # 8640 × 30s = 3 days coverage
   
   # Job naming prefix
   job_prefix: "agi"

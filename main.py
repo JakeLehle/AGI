@@ -48,7 +48,6 @@ Run with:
     python main.py --prompt-file prompts/task.txt --project-dir ./project \\
         --slurm --cluster zeus_cpu
 """
-
 import argparse
 import yaml
 from pathlib import Path
@@ -58,6 +57,15 @@ import hashlib
 import sys
 import os
 import shutil
+
+# =============================================================================
+# Ensure AGI repo root is on Python path regardless of launch context.
+# When launched via sbatch, PYTHONPATH may not propagate correctly,
+# which causes 'from memory.reflexion_memory import ...' to fail.
+# =============================================================================
+_agi_root = str(Path(__file__).resolve().parent)
+if _agi_root not in sys.path:
+    sys.path.insert(0, _agi_root)
 
 from workflows.langgraph_workflow import MultiAgentWorkflow
 from tools.sandbox import Sandbox
