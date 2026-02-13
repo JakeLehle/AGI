@@ -11,20 +11,37 @@
 #SBATCH --error=slurm_logs/agi_%j.err
 
 ###############################################################################
-# AGI Multi-Agent Pipeline v3.2 - ARC GPU Submission Script
+# AGI Multi-Agent Pipeline v3.2.1 - ARC GPU Submission Script
 #
 # Runs the MASTER PIPELINE on an ARC GPU node for fast LLM inference.
 # Subtask scripts are submitted to CPU or GPU partitions as needed.
 #
+# MODEL RESOLUTION CHAIN (v3.2.1):
+# ---------------------------------
+# The model used by every component is resolved via a 4-level priority chain.
+# This RUN script participates at TWO levels:
+#
+#   Level 1 (CLI):  --model "${OLLAMA_MODEL}" passed to main.py
+#   Level 2 (env):  export OLLAMA_MODEL  (read by sub-agents, subprocesses)
+#   Level 3 (file): config/config.yaml → ollama.model
+#   Level 4 (code): FALLBACK_MODEL in utils/model_config.py
+#
+# To override the model for a single run without editing this file:
+#   sbatch --export=ALL,OLLAMA_MODEL=llama3.1:70b setup/RUN_AGI_PIPELINE_GPU.sh
+#
+# The default below (qwen3-coder:32b) is chosen because:
+#   - Weights ≈ 20 GiB (Q4_K_M) → fits on V100S-32GB with room for KV cache
+#   - qwen3-coder-next ≈ 48 GiB → requires CPU offload, causes Ollama 500 errors
+#
 # Usage:
 #   # Default (gpu1v100 for master, compute1 for CPU subtasks)
-#   sbatch setup/RUN_AGI_PIPELINE_ARC.sh
+#   sbatch setup/RUN_AGI_PIPELINE_GPU.sh
 #
 #   # Override subtask cluster target
-#   sbatch --export=AGI_CLUSTER=arc_compute2 setup/RUN_AGI_PIPELINE_ARC.sh
+#   sbatch --export=ALL,AGI_CLUSTER=arc_compute2 setup/RUN_AGI_PIPELINE_GPU.sh
 #
 #   # Override model
-#   sbatch --export=OLLAMA_MODEL=llama3.1:70b setup/RUN_AGI_PIPELINE_ARC.sh
+#   sbatch --export=ALL,OLLAMA_MODEL=llama3.1:70b setup/RUN_AGI_PIPELINE_GPU.sh
 #
 ###############################################################################
 
@@ -69,13 +86,26 @@ AGI_DATA_DIR="${AGI_DATA_DIR:-/work/sdz852/agi_data}"
 CONDA_ENV="${CONDA_ENV:-AGI}"
 
 # ============================================================================
-# MODEL CONFIGURATION
+# MODEL CONFIGURATION (v3.2.1 — resolution chain level 1 + 2)
+# ============================================================================
+# OLLAMA_MODEL serves double duty:
+#   1. Passed as --model to main.py  → resolve_model() level 1 (explicit CLI)
+#   2. Exported as env var           → resolve_model() level 2 (env fallback)
+#
+# This means sub-agents and subprocesses that don't receive --model directly
+# can still pick up the correct model from the environment.
+#
+# To override for a single run:
+#   sbatch --export=ALL,OLLAMA_MODEL=llama3.1:70b setup/RUN_AGI_PIPELINE_GPU.sh
+#
+# Selection criteria for V100S-32GB:
+#   qwen3-coder:32b  ≈ 20 GiB weights → fits with ~10 GiB for 32K KV cache ✓
+#   qwen3-coder-next ≈ 48 GiB weights → CPU offload required, 500 errors   ✗
 # ============================================================================
 
-# Ollama model for task execution (coding-optimized model for GPU)
-OLLAMA_MODEL="${OLLAMA_MODEL:-qwen3-coder-next:latest}"
+OLLAMA_MODEL="${OLLAMA_MODEL:-qwen3-coder:32b}"
 
-# Ollama context window - qwen3-coder-next benefits from large context
+# Ollama context window — must match config.yaml → ollama.model_context_length
 OLLAMA_CONTEXT_LENGTH="${OLLAMA_CONTEXT_LENGTH:-32768}"
 
 # Embedding model for reflexion memory
@@ -143,7 +173,7 @@ fi
 # ============================================================================
 
 echo "============================================================================"
-echo "  AGI Multi-Agent Pipeline v3.2 (ARC GPU)"
+echo "  AGI Multi-Agent Pipeline v3.2.1 (ARC GPU)"
 echo "============================================================================"
 echo "  Job ID:              ${SLURM_JOB_ID:-local}"
 echo "  Node:                $(hostname)"
@@ -237,6 +267,10 @@ export OLLAMA_MODELS="${OLLAMA_MODELS:-/work/sdz852/ollama/models}"
 export OLLAMA_KEEP_ALIVE="10m"
 export OLLAMA_CONTEXT_LENGTH="${OLLAMA_CONTEXT_LENGTH}"
 
+# v3.2.1: Export OLLAMA_MODEL so resolve_model() picks it up at level 2 (env)
+# for any component that doesn't receive it via CLI --model.
+export OLLAMA_MODEL="${OLLAMA_MODEL}"
+
 # AGI paths
 export AGI_DATA_DIR="${AGI_DATA_DIR}"
 export PYTHONPATH="${AGI_ROOT}:${PYTHONPATH}"
@@ -265,7 +299,7 @@ export AGI_SUBTASK_GPUS="${SUBTASK_GPUS}"
 echo "    AGI_CLUSTER=${AGI_CLUSTER}"
 echo "    AGI_GPU_CLUSTER=${AGI_GPU_CLUSTER}"
 echo "    AGI_CLUSTER_CONFIG=${AGI_CLUSTER_CONFIG}"
-echo "    OLLAMA_CONTEXT_LENGTH=${OLLAMA_CONTEXT_LENGTH}"
+echo "    OLLAMA_MODEL=${OLLAMA_MODEL}"
 
 # Display cluster info
 echo ""
@@ -275,29 +309,26 @@ import yaml
 import os
 
 config_path = os.environ.get('AGI_CLUSTER_CONFIG')
-cpu_cluster = os.environ.get('AGI_CLUSTER', 'arc_compute1')
-gpu_cluster = os.environ.get('AGI_GPU_CLUSTER', 'arc_gpu1v100')
+cluster_name = os.environ.get('AGI_CLUSTER', 'arc_compute1')
 
 if config_path and os.path.exists(config_path):
     with open(config_path) as f:
         config = yaml.safe_load(f)
-    
-    for label, name in [("CPU Subtasks", cpu_cluster), ("GPU Subtasks", gpu_cluster)]:
-        cluster = config.get('clusters', {}).get(name, {})
-        slurm = cluster.get('slurm', {})
-        gpu = cluster.get('gpu', {})
-        
-        print(f"    [{label}] → {name}")
-        print(f"      Partition:   {slurm.get('partition', 'N/A')}")
-        print(f"      Account:     {slurm.get('account', 'N/A')}")
-        print(f"      Default CPUs: {slurm.get('cpus_per_task', 'N/A')}")
-        print(f"      Default Mem:  {slurm.get('memory', 'N/A')}")
-        print(f"      Default Time: {slurm.get('time', 'N/A')}")
-        if gpu.get('available'):
-            print(f"      GPU:         Yes ({gpu.get('default_count', 1)}x {gpu.get('type', 'GPU')})")
-        else:
-            print(f"      GPU:         No")
-        print()
+
+    cluster = config.get('clusters', {}).get(cluster_name, {})
+    slurm = cluster.get('slurm', {})
+    gpu = cluster.get('gpu', {})
+
+    print(f"    Name:        {cluster.get('name', 'Unknown')}")
+    print(f"    Partition:   {slurm.get('partition', 'N/A')}")
+    print(f"    Account:     {slurm.get('account', 'N/A')}")
+    print(f"    Default CPUs: {slurm.get('cpus_per_task', 'N/A')}")
+    print(f"    Default Mem:  {slurm.get('memory', 'N/A')}")
+    print(f"    Default Time: {slurm.get('time', 'N/A')}")
+    if gpu.get('available'):
+        print(f"    GPU:         Yes ({gpu.get('default_count', 1)}x {gpu.get('type', 'GPU')})")
+    else:
+        print(f"    GPU:         No")
 else:
     print(f"    Config not found, will use defaults")
 PYEOF
@@ -317,7 +348,7 @@ else
     ollama serve > "${OLLAMA_LOG}" 2>&1 &
     OLLAMA_PID=$!
     echo "    Started Ollama (PID: ${OLLAMA_PID})"
-    
+
     MAX_WAIT=120
     WAITED=0
     while ! curl -s http://127.0.0.1:11434/api/tags > /dev/null 2>&1; do
@@ -389,7 +420,10 @@ echo ""
 
 cd "${AGI_ROOT}"
 
-# Pass cluster config to main.py
+# v3.2.1: --model passes OLLAMA_MODEL as level 1 (explicit CLI) to main.py.
+# main.py calls resolve_model(args.model, config) which returns this value
+# directly since it's non-None. The exported env var serves as level 2
+# fallback for any subprocess that doesn't receive --model.
 python main.py \
     --prompt-file "${PROMPT_FILE}" \
     --project-dir "${PROJECT_DIR}" \
@@ -421,8 +455,9 @@ echo "  Job Complete"
 echo "============================================================================"
 echo "  End Time:       $(date)"
 echo "  Exit Code:      ${PIPELINE_EXIT_CODE}"
-echo "  CPU Cluster:    ${AGI_CLUSTER}"
+echo "  Cluster:        ${AGI_CLUSTER}"
 echo "  GPU Cluster:    ${AGI_GPU_CLUSTER}"
+echo "  Model:          ${OLLAMA_MODEL}"
 echo ""
 echo "  Outputs:        ${PROJECT_DIR}/"
 echo "  Checkpoints:    ${PROJECT_DIR}/temp/checkpoints/"
