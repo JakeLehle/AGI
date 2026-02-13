@@ -1,23 +1,51 @@
 # =============================================================================
-# Multi-Agent System Configuration v3.2
+# Multi-Agent System Configuration v3.2.1
 # =============================================================================
 # Supports script-first architecture with token-based context management
 #
-# Target: ARC GPU cluster with qwen3-coder-next:latest
+# Target: ARC GPU cluster
 # Context: 32K tokens (OLLAMA_CONTEXT_LENGTH=32768 set in RUN script)
-# GPU: V100 (16GB VRAM)
+# GPU: V100S-32GB
+#
+# MODEL RESOLUTION CHAIN (v3.2.1):
+# ---------------------------------
+# Every component resolves its model via utils.model_config.resolve_model().
+# This file is level 3 in the priority chain:
+#
+#   1. CLI --model flag           (highest — overrides everything)
+#   2. OLLAMA_MODEL env var       (set by RUN scripts / sbatch --export)
+#   3. ► THIS FILE: ollama.model  (project default)
+#   4. FALLBACK_MODEL constant    (utils/model_config.py — last resort)
+#
+# To change the model:
+#   Per-run:     sbatch --export=OLLAMA_MODEL=llama3.1:70b ...
+#   Per-project: edit ollama.model below
+#   System-wide: edit FALLBACK_MODEL in utils/model_config.py
+#
+# Same chain applies to ollama.base_url via resolve_base_url().
 # =============================================================================
 
 # =============================================================================
 # Ollama Settings
 # =============================================================================
 ollama:
-  model: "qwen3-coder-next:latest"    # GPU-optimized coding model
+  # Project default model — level 3 in the resolution chain.
+  # Overridden by CLI --model (level 1) or OLLAMA_MODEL env var (level 2).
+  #
+  # Selection criteria for V100S-32GB:
+  #   - Model weights (Q4_K_M) must fit mostly on GPU (<30 GiB)
+  #   - Must leave room for KV cache at full context length
+  #   - qwen3-coder:32b  ≈ 20 GiB weights → fits with ~10 GiB for 32K KV cache
+  #   - qwen3-coder-next ≈ 48 GiB → requires CPU offload, causes 500 errors
+  model: "qwen3-coder:32b"
+
+  # Ollama API endpoint — level 3 in the resolution chain.
+  # Overridden by CLI --ollama-url (level 1) or OLLAMA_HOST env var (level 2).
   base_url: "http://127.0.0.1:11434"
-  
-  # Must match OLLAMA_CONTEXT_LENGTH in RUN_AGI_PIPELINE_ARC.sh
-  # V100 (16GB) comfortably handles 32K context for qwen3-coder-next:latest
-  # Increase to 65536 if VRAM allows and you update the RUN script to match
+
+  # Must match OLLAMA_CONTEXT_LENGTH in the RUN script.
+  # V100S-32GB comfortably handles 32K context for qwen3-coder:32b.
+  # Increase to 65536 if VRAM allows and you update the RUN script to match.
   model_context_length: 32768
 
 # =============================================================================
@@ -36,27 +64,27 @@ context:
   # Maximum tokens per SubAgent context window
   # Set to ~25K to leave headroom within 32K model context
   max_tokens_per_task: 25000
-  
+
   # Maximum tokens for any single tool output (logs, file contents, etc.)
   # Larger outputs are automatically paginated
   # Sized to fit comfortably in 25K task budget with room for history
   max_tool_output_tokens: 12000
-  
+
   # Minimum tokens needed to attempt another iteration
   # If remaining < this, task is marked for skip/escalate
   min_tokens_to_continue: 3000
-  
+
   # Target size for history summaries when truncating
   summary_target_tokens: 1500
-  
+
   # Token estimation: characters per token
   # qwen3 tokenizer is slightly more efficient than llama (~3.5-4 chars/token)
   # Using 4 as conservative estimate
   chars_per_token: 4
-  
+
   # Enable automatic history summarization when context fills
   auto_summarize: true
-  
+
   # Percentage of context to keep as recent history (rest gets summarized)
   recent_history_percent: 30
 
@@ -67,36 +95,36 @@ agents:
   # Legacy setting - kept for backward compatibility
   # Context exhaustion (not iteration count) determines retry limits
   max_retries: 12
-  
+
   timeout_seconds: 300
   enable_dynamic_tools: true
-  
+
   # Script-first settings
   script_first:
     enabled: true
-    
+
     # Always generate scripts (vs interactive completion)
     always_generate_script: true
-    
+
     # Script output directory (relative to project)
     scripts_dir: "scripts"
-    
+
     # Add standard headers to generated scripts
     add_script_headers: true
-    
+
     # Verify outputs exist after script execution
     verify_outputs: true
-    
+
     # Maximum script generation attempts per task
     max_script_generations: 5
-  
+
   # Supported languages for script generation
   supported_languages:
     - python
     - r
     - bash
     - perl
-  
+
   # Language detection keywords
   language_detection:
     python:
@@ -125,19 +153,19 @@ agents:
 # =============================================================================
 master_document:
   enabled: true
-  
+
   # State persistence file (JSON)
   state_file: "reports/master_prompt_state.json"
-  
+
   # Human-readable status (Markdown)
   status_file: "reports/pipeline_status.md"
-  
+
   # Auto-save after each step completion/failure
   auto_save: true
-  
+
   # Include in final report
   include_in_report: true
-  
+
   # Track these fields per step
   track_fields:
     - script_path
@@ -152,37 +180,37 @@ master_document:
 # =============================================================================
 slurm:
   enabled: true
-  
+
   # Default cluster for CPU subtasks
   default_cluster: "arc_compute1"
-  
+
   # Default cluster for GPU subtasks (auto-selected by package detection)
   default_gpu_cluster: "arc_gpu1v100"
-  
+
   # Polling settings
   poll_interval: 30       # Seconds between job status checks
   max_poll_attempts: 8640  # 8640 × 30s = 3 days coverage
-  
+
   # Job naming prefix
   job_prefix: "agi"
-  
+
   # Script submission settings
   script_submission:
     # Generate sbatch scripts (vs direct srun)
     use_sbatch: true
-    
+
     # Save sbatch scripts for debugging/resubmission
     save_sbatch_scripts: true
-    
+
     # Directory for sbatch scripts
     sbatch_dir: "slurm/scripts"
-    
+
     # Directory for job logs
     logs_dir: "slurm/logs"
-    
+
     # Wait for job completion (vs fire-and-forget)
     wait_for_completion: true
-    
+
     # Timeout for waiting (0 = use max_poll_attempts * poll_interval)
     wait_timeout_seconds: 0
 
@@ -202,7 +230,7 @@ clusters:
     default_memory: "64G"
     default_time: "1-00:00:00"
     has_gpu: false
-  
+
   # ARC GPU (for GPU subtasks)
   arc_gpu1v100:
     name: "ARC GPU 1×V100"
@@ -212,7 +240,7 @@ clusters:
     default_time: "1-00:00:00"
     has_gpu: true
     gpu_type: "v100"
-  
+
   # Zeus CPU (legacy fallback)
   zeus:
     name: "Zeus CPU"
@@ -238,7 +266,7 @@ resource_profiles:
     memory: "64G"
     time: "1-00:00:00"
     gpus: 0
-  
+
   lightweight:
     cpus: 4
     memory: "16G"
@@ -250,7 +278,7 @@ resource_profiles:
       - "move"
       - "convert"
       - "format"
-  
+
   bioinformatics:
     cpus: 20
     memory: "64G"
@@ -265,7 +293,7 @@ resource_profiles:
       - "h5ad"
       - "seurat"
       - "bioconductor"
-  
+
   heavy_compute:
     cpus: 40
     memory: "128G"
@@ -278,7 +306,7 @@ resource_profiles:
       - "star"
       - "cellranger"
       - "salmon"
-  
+
   gpu_ml:
     cpus: 80
     memory: null    # No memory spec for GPU nodes
@@ -304,32 +332,32 @@ failure_diagnosis:
       regex: "ModuleNotFoundError: No module named '(.+)'"
       action: "add_package"
       description: "Missing Python package"
-    
+
     file_not_found:
       regex: "FileNotFoundError: .*No such file or directory: '(.+)'"
       action: "check_path"
       description: "Missing input file"
-    
+
     memory_error:
       regex: "(MemoryError|OutOfMemoryError|CUDA out of memory)"
       action: "increase_resources"
       description: "Insufficient memory"
-    
+
     timeout:
       regex: "(TIMEOUT|DUE TO TIME LIMIT|exceeded.*time)"
       action: "increase_time"
       description: "Job exceeded time limit"
-    
+
     conda_error:
       regex: "(CondaError|PackagesNotFoundError|ResolvePackageNotFound)"
       action: "fix_environment"
       description: "Conda environment issue"
-    
+
     permission_error:
       regex: "PermissionError: .*"
       action: "check_permissions"
       description: "File permission issue"
-    
+
     slurm_error:
       regex: "(FAILED|NODE_FAIL|PREEMPTED)"
       action: "retry_different_node"
@@ -342,14 +370,14 @@ workflow:
   enable_checkpointing: true
   checkpoint_frequency: "per_subtask"
   max_execution_time_minutes: 4320   # 3 days (matching GPU partition max)
-  
+
   master_document:
     enabled: true
-  
+
   subtask:
     generate_script: true
     submit_via_slurm: true
-  
+
   parallel:
     enabled: true
     max_parallel_jobs: 10

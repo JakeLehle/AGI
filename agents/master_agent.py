@@ -1,7 +1,7 @@
 """
-Master Agent v3.2 - Comprehensive Task Decomposition with Validation
+Master Agent v3.2.1 - Comprehensive Task Decomposition with Validation
 
-The master agent now follows a 3-phase approach:
+The master agent follows a 3-phase approach:
 1. EXTRACTION: Parse the detailed prompt and extract EVERY step exactly as written
 2. EXPANSION: Expand each step into a comprehensive execution plan
 3. VALIDATION: Verify each plan captures the original step's full intent
@@ -14,12 +14,24 @@ Key improvements over v3.1:
 - Better handling of code snippets and implementation hints in prompts
 
 v3.2 Updates:
-- Token budget sized for qwen3-coder-next:latest (32K context → 25K working limit)
-- Default model switched to qwen3-coder-next:latest
+- Token budget sized for 32K context → 25K working limit
 - Multi-strategy JSON parsing with cleanup for malformed LLM output
-- Per-step and total decomposition timeout to prevent pipeline freezes
 - requires_gpu flag auto-detected from packages for dual cluster routing
 - GPU package detection list aligned with sub_agent.py (18 packages)
+
+v3.2.1 Updates:
+- REMOVED all artificial timeouts (STEP_EXPAND_TIMEOUT, TOTAL_DECOMPOSITION_TIMEOUT,
+  REVIEW_TIMEOUT). The 3-day SLURM node window is the only hard limit.
+- REMOVED SIGALRM-based invoke_with_timeout — broken in worker threads and caused
+  silent fallback to no-timeout, leading to infinite hangs on Ollama 500 errors.
+- REPLACED with invoke_resilient() from utils.llm_invoke: exponential backoff retry
+  with Ollama health checks. Survives transient 500 errors from memory pressure.
+- Model selection is now fully modular via utils.model_config.resolve_model().
+  No hardcoded model names in agent code. Resolution priority:
+    1. Explicit parameter (from workflow/CLI --model)
+    2. OLLAMA_MODEL environment variable (set in RUN scripts)
+    3. config.yaml → ollama.model
+    4. Single fallback constant in utils/model_config.py
 
 The master prompt serves as a living document that:
 1. Contains all pipeline steps with status
@@ -32,7 +44,6 @@ from typing import Dict, Any, List, Optional, Tuple
 from pathlib import Path
 import re
 import json
-import signal
 from datetime import datetime
 
 try:
@@ -42,56 +53,8 @@ except ImportError:
 
 from utils.logging_config import agent_logger
 from utils.context_manager import ContextManager
-
-
-# =============================================================================
-# TIMEOUT HELPERS
-# =============================================================================
-
-class LLMTimeoutError(Exception):
-    """Raised when an LLM call exceeds the allowed time."""
-    pass
-
-
-def _timeout_handler(signum, frame):
-    raise LLMTimeoutError("LLM call timed out")
-
-
-def invoke_with_timeout(llm, prompt: str, timeout_seconds: int = 300) -> str:
-    """
-    Invoke an LLM with a timeout guard.
-
-    Uses SIGALRM on Unix. Falls back to no-timeout on platforms that lack it
-    (Windows) or when called from a non-main thread (signal only works in main).
-
-    Args:
-        llm: LangChain LLM instance
-        prompt: The prompt string
-        timeout_seconds: Max seconds to wait (default 5 min)
-
-    Returns:
-        The LLM response string
-
-    Raises:
-        LLMTimeoutError: If the call exceeds timeout_seconds
-    """
-    use_signal = hasattr(signal, 'SIGALRM')
-    if use_signal:
-        try:
-            # Only works in the main thread
-            old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
-            signal.alarm(timeout_seconds)
-        except ValueError:
-            # "signal only works in main thread"
-            use_signal = False
-
-    try:
-        response = llm.invoke(prompt)
-        return response
-    finally:
-        if use_signal:
-            signal.alarm(0)  # Cancel the alarm
-            signal.signal(signal.SIGALRM, old_handler)
+from utils.llm_invoke import invoke_resilient, LLMInvocationError
+from utils.model_config import resolve_model, resolve_base_url
 
 
 # =============================================================================
@@ -102,8 +65,7 @@ def parse_json_resilient(text: str) -> Optional[Dict]:
     """
     Multi-strategy JSON extraction from LLM output.
 
-    Handles the common failure modes of smaller local models like
-    qwen3-coder-next:latest:
+    Handles the common failure modes of smaller local models:
       1. Clean JSON inside a ```json ... ``` code fence
       2. Clean JSON inside a ``` ... ``` code fence (no language tag)
       3. First { ... } blob via greedy regex
@@ -115,7 +77,7 @@ def parse_json_resilient(text: str) -> Optional[Dict]:
     if not text or not text.strip():
         return None
 
-    # --- Strategy 1: ```json ... ``` code fence ----
+    # --- Strategy 1: ```json ... ``` code fence ---
     fence_match = re.search(r'```json\s*\n?([\s\S]*?)```', text)
     if fence_match:
         try:
@@ -126,120 +88,71 @@ def parse_json_resilient(text: str) -> Optional[Dict]:
     # --- Strategy 2: ``` ... ``` code fence (no language tag) ---
     fence_match2 = re.search(r'```\s*\n?([\s\S]*?)```', text)
     if fence_match2:
-        candidate = fence_match2.group(1).strip()
-        if candidate.startswith('{'):
-            try:
-                return json.loads(candidate)
-            except json.JSONDecodeError:
-                pass
+        try:
+            return json.loads(fence_match2.group(1).strip())
+        except json.JSONDecodeError:
+            pass
 
-    # --- Strategy 3: First { ... } via greedy regex ---
+    # --- Strategy 3: First { ... } blob ---
     brace_match = re.search(r'\{[\s\S]*\}', text)
     if brace_match:
-        candidate = brace_match.group()
         try:
-            return json.loads(candidate)
+            return json.loads(brace_match.group(0))
         except json.JSONDecodeError:
-            # --- Strategy 4: Strip trailing garbage after last valid } ---
-            # Walk backwards to find the matching closing brace
-            cleaned = _balance_braces(candidate)
-            if cleaned:
-                try:
-                    return json.loads(cleaned)
-                except json.JSONDecodeError:
-                    pass
+            pass
 
-    # --- Strategy 5: Truncated JSON — force-close open braces ---
+    # --- Strategy 4: Truncated JSON — brace balancing ---
     first_brace = text.find('{')
     if first_brace >= 0:
-        fragment = text[first_brace:]
-        # Remove any trailing non-JSON text after last }
-        last_brace = fragment.rfind('}')
-        if last_brace >= 0:
-            fragment = fragment[:last_brace + 1]
-        # Count open vs close braces and force-close
-        open_count = fragment.count('{') - fragment.count('}')
-        if open_count > 0:
-            fragment = fragment.rstrip().rstrip(',') + '}' * open_count
+        candidate = text[first_brace:]
+        open_braces = 0
+        for i, ch in enumerate(candidate):
+            if ch == '{':
+                open_braces += 1
+            elif ch == '}':
+                open_braces -= 1
+            if open_braces == 0:
+                try:
+                    return json.loads(candidate[:i + 1])
+                except json.JSONDecodeError:
+                    break
+
+        # Try adding missing closing braces
+        if open_braces > 0:
+            patched = candidate + ('}' * open_braces)
             try:
-                return json.loads(fragment)
+                return json.loads(patched)
+            except json.JSONDecodeError:
+                pass
+
+    # --- Strategy 5: Strip trailing garbage ---
+    if first_brace >= 0:
+        candidate = text[first_brace:]
+        # Find the last } and try parsing up to there
+        last_brace = candidate.rfind('}')
+        if last_brace >= 0:
+            try:
+                return json.loads(candidate[:last_brace + 1])
             except json.JSONDecodeError:
                 pass
 
     return None
 
 
-def _balance_braces(text: str) -> Optional[str]:
-    """
-    Walk the string tracking brace depth; return the substring from the first
-    opening brace to the position where depth returns to 0.
-    """
-    depth = 0
-    start = None
-    in_string = False
-    escape_next = False
-
-    for i, ch in enumerate(text):
-        if escape_next:
-            escape_next = False
-            continue
-        if ch == '\\' and in_string:
-            escape_next = True
-            continue
-        if ch == '"' and not escape_next:
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-
-        if ch == '{':
-            if start is None:
-                start = i
-            depth += 1
-        elif ch == '}':
-            depth -= 1
-            if depth == 0 and start is not None:
-                return text[start:i + 1]
-
-    return None
-
-
 # =============================================================================
-# GPU PACKAGE DETECTION
+# GPU DETECTION HELPER
 # =============================================================================
 
-# Must stay in sync with sub_agent.py GPU_PACKAGES list
-GPU_PACKAGES = {
-    'torch', 'pytorch', 'tensorflow', 'keras', 'jax', 'cupy',
-    'rapids', 'cuml', 'cudf', 'cugraph', 'dask-cuda',
-    'nvidia', 'cuda', 'cudnn', 'tensorrt',
-    'scvi', 'scvi-tools', 'cellbender', 'deepcell',
-}
+def detect_requires_gpu(packages: List[str], task_text: str) -> bool:
+    """Detect if a task requires GPU based on packages and description.
 
-
-def detect_requires_gpu(packages: List[str], text: str = "") -> bool:
+    v3.2: Aligned with sub_agent.py GPU package detection (18 packages).
     """
-    Determine whether a subtask requires GPU resources.
-
-    Checks the explicit package list first (fast, reliable), then falls
-    back to scanning free text for GPU keywords.
-
-    Args:
-        packages: List of package names from expansion
-        text: Combined description + expanded_plan text for fallback scan
-
-    Returns:
-        True if the task should be routed to a GPU cluster
-    """
-    # Check explicit package list
-    for pkg in packages:
-        if pkg.lower() in GPU_PACKAGES:
-            return True
-
-    # Fallback: scan text for GPU-related keywords
-    text_lower = text.lower()
+    text_lower = (task_text + ' ' + ' '.join(packages)).lower()
     gpu_keywords = [
-        'gpu', 'cuda', 'torch.', 'tensorflow', 'keras.',
+        'torch', 'pytorch', 'tensorflow', 'keras', 'jax',
+        'rapids', 'cuml', 'cudf', 'cugraph', 'cupy',
+        'gpu', 'cuda', 'scvi', 'scvi-tools', 'cellbender',
         'nvidia', '.to(device)', 'scvi.model', 'cellbender',
     ]
     return any(kw in text_lower for kw in gpu_keywords)
@@ -352,11 +265,13 @@ class MasterPromptDocument:
         }
         if step_id in self.steps:
             self.steps[step_id]['validation_status'] = status
-        self._save()
+            self._save()
 
     def _save(self):
-        """Save state to JSON file"""
+        """Save state to JSON and markdown"""
         self.last_updated = datetime.now()
+
+        # JSON state
         state = {
             'original_prompt': self.original_prompt,
             'steps': self.steps,
@@ -371,34 +286,43 @@ class MasterPromptDocument:
         with open(self.document_path, 'w') as f:
             json.dump(state, f, indent=2, default=str)
 
-        # Also save markdown version
-        md = self.generate_status_markdown()
-        self.markdown_path.write_text(md)
+        # Markdown status
+        markdown = self._generate_markdown()
+        with open(self.markdown_path, 'w') as f:
+            f.write(markdown)
 
-    def generate_status_markdown(self) -> str:
-        """Generate markdown status document"""
+    def _generate_markdown(self) -> str:
+        """Generate human-readable markdown status report"""
         lines = [
-            "# Pipeline Status",
-            f"\nLast Updated: {self.last_updated.isoformat()}",
+            "# Pipeline Status Report",
+            f"\nGenerated: {self.last_updated.strftime('%Y-%m-%d %H:%M:%S')}",
             f"\n## Summary",
-            f"- Total Steps: {len(self.steps)}",
-            f"- Completed: {len([s for s in self.steps.values() if s['status'] == 'completed'])}",
-            f"- Failed: {len([s for s in self.steps.values() if s['status'] == 'failed'])}",
-            f"- Pending: {len([s for s in self.steps.values() if s['status'] == 'pending'])}",
-            f"- Running: {len([s for s in self.steps.values() if s['status'] == 'running'])}",
-            "\n## Steps\n"
         ]
+
+        total = len(self.steps)
+        completed = sum(1 for s in self.steps.values() if s['status'] == 'completed')
+        failed = sum(1 for s in self.steps.values() if s['status'] == 'failed')
+        pending = sum(1 for s in self.steps.values() if s['status'] == 'pending')
+        running = sum(1 for s in self.steps.values() if s['status'] == 'running')
+
+        lines.append(f"\n| Status | Count |")
+        lines.append(f"|--------|-------|")
+        lines.append(f"| Total | {total} |")
+        lines.append(f"| ✅ Completed | {completed} |")
+        lines.append(f"| ❌ Failed | {failed} |")
+        lines.append(f"| ⏳ Pending | {pending} |")
+        lines.append(f"| 🔄 Running | {running} |")
+
+        lines.append(f"\n## Steps\n")
 
         for step_id in self.step_order:
             step = self.steps.get(step_id, {})
             status_icon = {
-                'completed': '✅',
-                'failed': '❌',
-                'running': '🔄',
-                'pending': '⏳'
+                'completed': '✅', 'failed': '❌',
+                'pending': '⏳', 'running': '🔄'
             }.get(step.get('status', 'pending'), '⏳')
 
-            validation = '✓' if step.get('validation_status') == 'validated' else '?'
+            validation = step.get('validation_status', 'pending')
 
             lines.append(f"### {status_icon} {step.get('title', step_id)} [{validation}]")
             lines.append(f"\n**Status**: {step.get('status', 'pending')}")
@@ -476,7 +400,7 @@ class MasterPromptDocument:
 
 class MasterAgent:
     """
-    Master agent v3.2 with comprehensive task decomposition.
+    Master agent v3.2.1 with comprehensive task decomposition.
 
     Key responsibilities:
     1. EXTRACT: Parse ALL steps from the detailed prompt
@@ -485,28 +409,37 @@ class MasterAgent:
     4. ASSIGN: Hand off validated plans to sub-agents
     5. TRACK: Maintain the master prompt document
 
-    v3.2 token budget sized for qwen3-coder-next:latest (32K context):
-      - MAX_CONTEXT_TOKENS:       25,000  (leaves ~7K for system prompt + response)
-      - STEP_EXPAND_TIMEOUT:         300  (5 min per step expansion LLM call)
-      - TOTAL_DECOMPOSITION_TIMEOUT: 21600 (30 min for entire decomposition)
+    v3.2.1 — No artificial timeouts. The 3-day SLURM node window is the
+    only hard limit. LLM calls use invoke_resilient() with exponential
+    backoff retry to survive transient Ollama 500 errors.
+
+    Model resolution (no hardcoded model names):
+      Constructor accepts ollama_model=None by default. Actual model is
+      resolved via utils.model_config.resolve_model() with priority:
+        1. Explicit parameter (from workflow/CLI)
+        2. OLLAMA_MODEL environment variable (from RUN script)
+        3. config.yaml → ollama.model
+        4. Fallback constant in utils/model_config.py
+
+    Token budget (must match sub_agent.py / config.yaml):
+      - MAX_CONTEXT_TOKENS: 25,000  (leaves ~7K for system prompt + response)
     """
 
     # ── Token budget (must match sub_agent.py / config.yaml) ──────────────
     MAX_CONTEXT_TOKENS = 25_000
 
-    # ── Timeout guards ────────────────────────────────────────────────────
-    STEP_EXPAND_TIMEOUT = 300       # seconds per _expand_step LLM call
-    TOTAL_DECOMPOSITION_TIMEOUT = 21600  # seconds for entire decompose_task
-    REVIEW_TIMEOUT = 120            # seconds for review_failure LLM call
-
     def __init__(
         self,
         sandbox=None,
-        ollama_model: str = "qwen3-coder-next:latest",
-        ollama_base_url: str = "http://127.0.0.1:11434",
+        ollama_model: str = None,
+        ollama_base_url: str = None,
         **kwargs
     ):
-        self.llm = OllamaLLM(model=ollama_model, base_url=ollama_base_url)
+        resolved_model = resolve_model(ollama_model)
+        resolved_url = resolve_base_url(ollama_base_url)
+
+        self.llm = OllamaLLM(model=resolved_model, base_url=resolved_url)
+        self.ollama_base_url = resolved_url
         self.agent_id = "master"
         self.sandbox = sandbox
 
@@ -599,62 +532,63 @@ class MasterAgent:
             step_match = None
             step_title = None
 
-            # Pattern 1: Numbered steps "1. ", "1) ", "1:"
-            numbered = re.match(r'^\s*(\d+)[.):]\s*(.+)', line)
+            # Pattern 1: Numbered steps "1. ", "1) ", "Step 1:"
+            numbered = re.match(
+                r'^\s*(?:(?:Step\s+)?(\d+)[\.\):\-]\s+(.+)|(\d+)\.\s+(.+))',
+                line, re.IGNORECASE
+            )
             if numbered:
-                step_match = numbered
-                step_title = numbered.group(2).strip()
+                step_match = True
+                num = numbered.group(1) or numbered.group(3)
+                step_title = (numbered.group(2) or numbered.group(4)).strip()
 
-            # Pattern 2: "Step N:" or "Task N:"
-            step_keyword = re.match(r'^\s*(?:Step|Task|Phase)\s*(\d+)[:\s]*(.+)?', line, re.IGNORECASE)
-            if step_keyword and not step_match:
-                step_match = step_keyword
-                step_title = step_keyword.group(2).strip() if step_keyword.group(2) else f"Step {step_keyword.group(1)}"
+            # Pattern 2: Checkboxes "- [ ] ", "- [x] "
+            if not step_match:
+                checkbox = re.match(r'^\s*[\-\*]\s*\[[ xX]\]\s+(.+)', line)
+                if checkbox:
+                    step_match = True
+                    step_title = checkbox.group(1).strip()
 
-            # Pattern 3: Markdown headers "## Step", "### 1."
-            header = re.match(r'^#{1,4}\s*(?:Step\s*)?(\d+)?[.:\s]*(.+)?', line)
-            if header and not step_match:
-                # Only treat as step if it looks like a task header
-                header_text = header.group(2) or ""
-                if any(kw in header_text.lower() for kw in ['step', 'task', 'phase', 'stage', 'part']):
-                    step_match = header
-                    step_title = header_text.strip()
+            # Pattern 3: Headers "## Step 1", "### Task:"
+            if not step_match:
+                header = re.match(r'^\s*#{2,4}\s+(?:Step\s+\d+[:\-\s]*)?(.+)', line)
+                if header:
+                    title = header.group(1).strip()
+                    # Only treat as step if it looks like a task
+                    if len(title) > 10 or any(kw in title.lower() for kw in
+                        ['create', 'build', 'run', 'analyze', 'process', 'generate',
+                         'setup', 'install', 'download', 'prepare', 'filter', 'merge',
+                         'cluster', 'annotate', 'align', 'quality', 'normalize']):
+                        step_match = True
+                        step_title = title
 
-            # Pattern 4: Checkbox items "- [ ]", "- [x]"
-            checkbox = re.match(r'^\s*[-*]\s*\[([x\s])\]\s*(.+)', line, re.IGNORECASE)
-            if checkbox and not step_match:
-                step_match = checkbox
-                step_title = checkbox.group(2).strip()
+            # Pattern 4: Keyword bullets "- First,", "- Next,", "- Finally,"
+            if not step_match:
+                keyword = re.match(
+                    r'^\s*[\-\*]\s+((?:First|Next|Then|After|Finally|Subsequently|Lastly)[,:\s]+.+)',
+                    line, re.IGNORECASE
+                )
+                if keyword:
+                    step_match = True
+                    step_title = keyword.group(1).strip()
 
-            # Pattern 5: Bold/emphasized items that look like steps
-            bold_step = re.match(r'^\s*[-*]?\s*\*\*(.+?)\*\*[:\s]*(.+)?', line)
-            if bold_step and not step_match:
-                title_text = bold_step.group(1).strip()
-                # Check if it looks like a step
-                if any(kw in title_text.lower() for kw in ['step', 'task', 'create', 'implement', 'setup', 'configure', 'run', 'analyze']):
-                    step_match = bold_step
-                    step_title = title_text + (f": {bold_step.group(2)}" if bold_step.group(2) else "")
-
-            # If we found a new step
-            if step_match:
-                # Save previous step if exists
+            if step_match and step_title:
+                # Save previous step
                 if current_step is not None:
                     current_step['full_text'] = '\n'.join(current_content).strip()
                     current_step['code_hints'] = current_code_blocks.copy()
                     extracted.append(current_step)
 
-                # Start new step
                 step_number += 1
                 current_step = {
                     'step_number': step_number,
-                    'title': step_title[:200] if step_title else f"Step {step_number}",
+                    'title': step_title[:200],
                     'full_text': '',
                     'code_hints': [],
                     'line_start': i
                 }
                 current_content = [line]
                 current_code_blocks = []
-
             elif current_step is not None:
                 # Continue building current step content
                 current_content.append(line)
@@ -692,7 +626,10 @@ class MasterAgent:
 
         # Detect language
         task_lower = task.lower()
-        python_indicators = ['python', 'scanpy', 'squidpy', 'anndata', 'pandas', '.py', 'popv', 'h5ad', 'numpy', 'scipy']
+        python_indicators = [
+            'python', 'scanpy', 'squidpy', 'anndata', 'pandas',
+            '.py', 'popv', 'h5ad', 'numpy', 'scipy'
+        ]
         r_indicators = ['seurat', 'singlecell', 'bioconductor', '.R', 'r script']
 
         python_score = sum(1 for ind in python_indicators if ind in task_lower)
@@ -769,7 +706,9 @@ class MasterAgent:
     # PHASE 2: DETAILED EXPANSION
     # =========================================================================
 
-    def _expand_step(self, step: Dict[str, Any], context: Dict[str, Any], all_steps: List[Dict]) -> Dict[str, Any]:
+    def _expand_step(
+        self, step: Dict[str, Any], context: Dict[str, Any], all_steps: List[Dict]
+    ) -> Dict[str, Any]:
         """
         Expand a single extracted step into a detailed execution plan.
 
@@ -781,7 +720,8 @@ class MasterAgent:
         - Code structure suggestions
         - Success criteria
 
-        v3.2: Uses invoke_with_timeout + parse_json_resilient for robustness.
+        v3.2.1: Uses invoke_resilient with exponential backoff retry.
+        No artificial timeouts — will retry through transient Ollama 500 errors.
         """
         step_text = step.get('full_text', step.get('title', ''))
         code_hints = step.get('code_hints', [])
@@ -842,11 +782,15 @@ Create a COMPREHENSIVE execution plan that:
 IMPORTANT: Your expanded_plan should be DETAILED and COMPREHENSIVE. Do not summarize - expand and clarify. Include ALL details from the user's original step description."""
 
         try:
-            response = invoke_with_timeout(
-                self.llm, prompt, timeout_seconds=self.STEP_EXPAND_TIMEOUT
+            response = invoke_resilient(
+                self.llm,
+                prompt,
+                ollama_base_url=self.ollama_base_url,
+                max_retries=20,
+                initial_backoff=30.0,
             )
 
-            # v3.2: Multi-strategy JSON parsing
+            # Multi-strategy JSON parsing
             expanded = parse_json_resilient(response)
             if expanded:
                 return {
@@ -861,11 +805,11 @@ IMPORTANT: Your expanded_plan should be DETAILED and COMPREHENSIVE. Do not summa
                     reflection=f"All JSON parse strategies failed. Response length: {len(response)}"
                 )
 
-        except LLMTimeoutError:
+        except LLMInvocationError as e:
             agent_logger.log_reflection(
                 agent_name=self.agent_id,
                 task_id=f"expand_step_{step.get('step_number', '?')}",
-                reflection=f"LLM call timed out after {self.STEP_EXPAND_TIMEOUT}s"
+                reflection=f"LLM invocation failed after all retries: {e}"
             )
         except Exception as e:
             agent_logger.log_reflection(
@@ -913,18 +857,24 @@ IMPORTANT: Your expanded_plan should be DETAILED and COMPREHENSIVE. Do not summa
         issues = []
 
         # Check 1: Key terms from original should appear in expanded
-        common_words = {'the', 'a', 'an', 'is', 'are', 'to', 'for', 'of', 'and', 'or', 'in', 'on', 'with', 'this', 'that'}
+        common_words = {
+            'the', 'a', 'an', 'is', 'are', 'to', 'for', 'of',
+            'and', 'or', 'in', 'on', 'with', 'this', 'that'
+        }
         original_words = set(re.findall(r'\b\w{4,}\b', original_text)) - common_words
         expanded_words = set(re.findall(r'\b\w{4,}\b', expanded_plan + ' ' + expanded_title))
 
         missing_key_terms = []
         for word in original_words:
             if len(word) > 5 and word not in expanded_words:
-                if any(indicator in word for indicator in ['file', 'data', 'output', 'input', 'cell', 'gene', 'cluster']):
+                if any(indicator in word for indicator in
+                       ['file', 'data', 'output', 'input', 'cell', 'gene', 'cluster']):
                     missing_key_terms.append(word)
 
         if len(missing_key_terms) > 3:
-            issues.append(f"Missing key terms from original: {', '.join(missing_key_terms[:5])}")
+            issues.append(
+                f"Missing key terms from original: {', '.join(missing_key_terms[:5])}"
+            )
 
         # Check 2: Code hints should be reflected
         code_hints = original_step.get('code_hints', [])
@@ -933,7 +883,10 @@ IMPORTANT: Your expanded_plan should be DETAILED and COMPREHENSIVE. Do not summa
             functions = re.findall(r'(\w+)\s*\(', code_hint_text)
             mentioned_functions = sum(1 for f in functions if f in expanded_plan)
             if functions and mentioned_functions < len(functions) / 2:
-                issues.append(f"Code hints not fully incorporated (found {mentioned_functions}/{len(functions)} functions)")
+                issues.append(
+                    f"Code hints not fully incorporated "
+                    f"(found {mentioned_functions}/{len(functions)} functions)"
+                )
 
         # Check 3: Expansion should be substantial
         if len(expanded.get('expanded_plan', '')) < len(original_text) * 0.5:
@@ -961,7 +914,9 @@ IMPORTANT: Your expanded_plan should be DETAILED and COMPREHENSIVE. Do not summa
     # MAIN DECOMPOSITION METHOD
     # =========================================================================
 
-    def decompose_task(self, main_task: str, context: Dict[str, Any] = None) -> List[Dict[str, Any]]:
+    def decompose_task(
+        self, main_task: str, context: Dict[str, Any] = None
+    ) -> List[Dict[str, Any]]:
         """
         Comprehensive task decomposition with extraction, expansion, and validation.
 
@@ -970,10 +925,10 @@ IMPORTANT: Your expanded_plan should be DETAILED and COMPREHENSIVE. Do not summa
         2. Expand each step into a detailed execution plan
         3. Validate each plan against the original
 
-        v3.2: Wrapped with total decomposition timeout.
+        v3.2.1: No artificial timeouts. Each LLM call uses invoke_resilient()
+        which retries with exponential backoff through transient failures.
+        The only hard limit is the 3-day SLURM node window.
         """
-        decomp_start = datetime.now()
-
         # Initialize document
         self.initialize_document(main_task)
 
@@ -988,7 +943,10 @@ IMPORTANT: Your expanded_plan should be DETAILED and COMPREHENSIVE. Do not summa
                 agent_logger.log_reflection(
                     agent_name=self.agent_id,
                     task_id="decompose",
-                    reflection=f"Skipping {len(completed)} completed steps, {len(pending)} pending"
+                    reflection=(
+                        f"Skipping {len(completed)} completed steps, "
+                        f"{len(pending)} pending"
+                    )
                 )
 
                 # Return pending steps for re-execution
@@ -1000,14 +958,19 @@ IMPORTANT: Your expanded_plan should be DETAILED and COMPREHENSIVE. Do not summa
         if context:
             for key, value in context.items():
                 if isinstance(value, list):
-                    extracted_context[key] = list(set(extracted_context.get(key, []) + value))
+                    extracted_context[key] = list(
+                        set(extracted_context.get(key, []) + value)
+                    )
                 elif value:
                     extracted_context[key] = value
 
         agent_logger.log_reflection(
             agent_name=self.agent_id,
             task_id="decompose",
-            reflection=f"Extracted context: {len(extracted_context.get('packages', []))} packages, {len(extracted_context.get('input_files', []))} inputs"
+            reflection=(
+                f"Extracted context: {len(extracted_context.get('packages', []))} packages, "
+                f"{len(extracted_context.get('input_files', []))} inputs"
+            )
         )
 
         # =====================================================================
@@ -1015,6 +978,8 @@ IMPORTANT: Your expanded_plan should be DETAILED and COMPREHENSIVE. Do not summa
         # =====================================================================
         print("\n  Phase 1: Extracting steps from prompt...")
         extracted_steps = self._extract_steps_from_prompt(main_task)
+
+        # Store in master document
         self.master_document.extracted_steps = extracted_steps
 
         agent_logger.log_reflection(
@@ -1025,35 +990,18 @@ IMPORTANT: Your expanded_plan should be DETAILED and COMPREHENSIVE. Do not summa
         print(f"    Found {len(extracted_steps)} steps")
 
         # =====================================================================
-        # PHASE 2: EXPANSION
+        # PHASE 2: EXPANSION (no artificial timeout — retries handle failures)
         # =====================================================================
         print("\n  Phase 2: Expanding each step into detailed plans...")
         subtasks = []
 
         for i, step in enumerate(extracted_steps):
-            # v3.2: Check total decomposition timeout
-            elapsed = (datetime.now() - decomp_start).total_seconds()
-            if elapsed > self.TOTAL_DECOMPOSITION_TIMEOUT:
-                agent_logger.log_reflection(
-                    agent_name=self.agent_id,
-                    task_id="decompose",
-                    reflection=f"Total decomposition timeout ({self.TOTAL_DECOMPOSITION_TIMEOUT}s) reached at step {i+1}/{len(extracted_steps)}"
-                )
-                print(f"    ⚠️ Decomposition timeout reached, creating basic expansions for remaining {len(extracted_steps) - i} steps")
-                # Create basic expansions for remaining steps
-                for j in range(i, len(extracted_steps)):
-                    remaining_step = extracted_steps[j]
-                    step_id = f"step_{j+1}"
-                    basic_subtask = self._create_basic_subtask(
-                        remaining_step, step_id, j, extracted_context
-                    )
-                    subtasks.append(basic_subtask)
-                    self._register_subtask_in_document(basic_subtask)
-                break
+            print(
+                f"    Expanding step {i+1}/{len(extracted_steps)}: "
+                f"{step.get('title', 'Unknown')[:50]}..."
+            )
 
-            print(f"    Expanding step {i+1}/{len(extracted_steps)}: {step.get('title', 'Unknown')[:50]}...")
-
-            # Expand the step
+            # Expand the step (invoke_resilient handles retries internally)
             expansion_result = self._expand_step(step, extracted_context, extracted_steps)
             expanded = expansion_result.get('expanded', {})
 
@@ -1063,7 +1011,10 @@ IMPORTANT: Your expanded_plan should be DETAILED and COMPREHENSIVE. Do not summa
             validation = self._validate_expansion(step, expanded)
 
             if validation['status'] == 'needs_revision':
-                print(f"      ⚠️ Validation issues: {', '.join(validation['issues'][:2])}")
+                print(
+                    f"      ⚠️ Validation issues: "
+                    f"{', '.join(validation['issues'][:2])}"
+                )
                 agent_logger.log_reflection(
                     agent_name=self.agent_id,
                     task_id=f"validate_step_{i+1}",
@@ -1075,10 +1026,12 @@ IMPORTANT: Your expanded_plan should be DETAILED and COMPREHENSIVE. Do not summa
             # Create subtask with full context
             step_id = f"step_{i+1}"
 
-            # v3.2: Merge packages from expansion with context packages
-            step_packages = expanded.get('packages', extracted_context.get('packages', []))
+            # Merge packages from expansion with context packages
+            step_packages = expanded.get(
+                'packages', extracted_context.get('packages', [])
+            )
 
-            # v3.2: Auto-detect GPU requirement
+            # Auto-detect GPU requirement
             combined_text = (
                 expanded.get('expanded_plan', '') + ' ' +
                 step.get('full_text', '') + ' ' +
@@ -1088,15 +1041,23 @@ IMPORTANT: Your expanded_plan should be DETAILED and COMPREHENSIVE. Do not summa
 
             subtask = {
                 'id': step_id,
-                'title': expanded.get('expanded_title', step.get('title', f'Step {i+1}')),
-                'description': expanded.get('expanded_plan', step.get('full_text', '')),
+                'title': expanded.get(
+                    'expanded_title', step.get('title', f'Step {i+1}')
+                ),
+                'description': expanded.get(
+                    'expanded_plan', step.get('full_text', '')
+                ),
                 'original_text': step.get('full_text', ''),
                 'expanded_plan': expanded.get('expanded_plan', ''),
                 'language': extracted_context.get('language', 'python'),
                 'packages': step_packages,
                 'imports_needed': expanded.get('imports_needed', []),
-                'input_files': expanded.get('input_files', extracted_context.get('input_files', [])),
-                'output_files': expanded.get('output_files', extracted_context.get('output_files', [])),
+                'input_files': expanded.get(
+                    'input_files', extracted_context.get('input_files', [])
+                ),
+                'output_files': expanded.get(
+                    'output_files', extracted_context.get('output_files', [])
+                ),
                 'key_operations': expanded.get('key_operations', []),
                 'code_approach': expanded.get('code_approach', ''),
                 'code_hints': step.get('code_hints', []),
@@ -1104,7 +1065,7 @@ IMPORTANT: Your expanded_plan should be DETAILED and COMPREHENSIVE. Do not summa
                 'dependencies': expanded.get('dependencies', []),
                 'validation_status': validation['status'],
                 'validation_issues': validation.get('issues', []),
-                'requires_gpu': requires_gpu,  # v3.2: GPU routing flag
+                'requires_gpu': requires_gpu,
                 'status': 'pending',
                 'attempts': 0
             }
@@ -1123,7 +1084,10 @@ IMPORTANT: Your expanded_plan should be DETAILED and COMPREHENSIVE. Do not summa
         agent_logger.log_task_start(
             agent_name=self.agent_id,
             task_id="decomposition",
-            description=f"Decomposed into {len(subtasks)} subtasks with validation ({gpu_count} GPU)",
+            description=(
+                f"Decomposed into {len(subtasks)} subtasks with validation "
+                f"({gpu_count} GPU)"
+            ),
             attempt=1
         )
 
@@ -1147,7 +1111,7 @@ IMPORTANT: Your expanded_plan should be DETAILED and COMPREHENSIVE. Do not summa
     def _create_basic_subtask(
         self, step: Dict, step_id: str, index: int, context: Dict
     ) -> Dict[str, Any]:
-        """Create a basic subtask without LLM expansion (used on timeout)."""
+        """Create a basic subtask without LLM expansion (used as fallback)."""
         step_text = step.get('full_text', step.get('title', ''))
         step_packages = context.get('packages', [])
         requires_gpu = detect_requires_gpu(step_packages, step_text)
@@ -1168,8 +1132,8 @@ IMPORTANT: Your expanded_plan should be DETAILED and COMPREHENSIVE. Do not summa
             'code_hints': step.get('code_hints', []),
             'success_criteria': 'Step completes without error',
             'dependencies': [],
-            'validation_status': 'timeout_fallback',
-            'validation_issues': ['Expansion skipped due to decomposition timeout'],
+            'validation_status': 'basic_fallback',
+            'validation_issues': ['LLM expansion failed, using original text'],
             'requires_gpu': requires_gpu,
             'status': 'pending',
             'attempts': 0
@@ -1179,7 +1143,7 @@ IMPORTANT: Your expanded_plan should be DETAILED and COMPREHENSIVE. Do not summa
         """Convert stored steps back to subtask format"""
         subtasks = []
         for step in steps:
-            # v3.2: Detect GPU requirement from stored step data
+            # Detect GPU requirement from stored step data
             step_packages = step.get('packages', [])
             combined_text = (
                 step.get('expanded_plan', '') + ' ' +
@@ -1191,7 +1155,9 @@ IMPORTANT: Your expanded_plan should be DETAILED and COMPREHENSIVE. Do not summa
             subtasks.append({
                 'id': step['id'],
                 'title': step.get('title', step['id']),
-                'description': step.get('expanded_plan', step.get('description', '')),
+                'description': step.get(
+                    'expanded_plan', step.get('description', '')
+                ),
                 'original_text': step.get('original_text', ''),
                 'expanded_plan': step.get('expanded_plan', ''),
                 'language': 'python',
@@ -1212,7 +1178,9 @@ IMPORTANT: Your expanded_plan should be DETAILED and COMPREHENSIVE. Do not summa
     # OTHER METHODS
     # =========================================================================
 
-    def mark_subtask_complete(self, task_id: str, outputs: Dict = None, report: str = None):
+    def mark_subtask_complete(
+        self, task_id: str, outputs: Dict = None, report: str = None
+    ):
         """Mark subtask as complete and update master document"""
         if task_id in self.subtask_status:
             self.subtask_status[task_id]['status'] = 'completed'
@@ -1225,12 +1193,16 @@ IMPORTANT: Your expanded_plan should be DETAILED and COMPREHENSIVE. Do not summa
                 output_files=outputs.get('output_files', []) if outputs else []
             )
 
-    def mark_subtask_failed(self, task_id: str, error: str, details: str = None):
+    def mark_subtask_failed(
+        self, task_id: str, error: str, details: str = None
+    ):
         """Mark subtask as failed and update master document"""
         if task_id in self.subtask_status:
             self.subtask_status[task_id]['status'] = 'failed'
             self.subtask_status[task_id]['error'] = error
-            self.subtask_status[task_id]['attempts'] = self.subtask_status[task_id].get('attempts', 0) + 1
+            self.subtask_status[task_id]['attempts'] = (
+                self.subtask_status[task_id].get('attempts', 0) + 1
+            )
 
         if self.master_document:
             self.master_document.mark_failed(
@@ -1239,11 +1211,14 @@ IMPORTANT: Your expanded_plan should be DETAILED and COMPREHENSIVE. Do not summa
                 attempts=self.subtask_status.get(task_id, {}).get('attempts', 1)
             )
 
-    def review_failure(self, subtask: Dict, error: str = None, context: Dict = None) -> Dict[str, Any]:
+    def review_failure(
+        self, subtask: Dict, error: str = None, context: Dict = None
+    ) -> Dict[str, Any]:
         """
         Review failure and decide on action.
 
-        v3.2: Uses invoke_with_timeout + parse_json_resilient.
+        v3.2.1: Uses invoke_resilient with exponential backoff retry.
+        No artificial timeouts.
         """
         failure_info = subtask.get('last_result', {})
         error = error or failure_info.get('error', 'Unknown error')
@@ -1279,25 +1254,32 @@ Respond in JSON:
 }}"""
 
         try:
-            response = invoke_with_timeout(
-                self.llm, prompt, timeout_seconds=self.REVIEW_TIMEOUT
+            response = invoke_resilient(
+                self.llm,
+                prompt,
+                ollama_base_url=self.ollama_base_url,
+                max_retries=10,           # Fewer retries for review (less critical)
+                initial_backoff=15.0,
             )
 
-            # v3.2: Multi-strategy JSON parsing
+            # Multi-strategy JSON parsing
             decision = parse_json_resilient(response)
             if decision:
                 agent_logger.log_reflection(
                     agent_name=self.agent_id,
                     task_id=subtask.get('id', 'unknown'),
-                    reflection=f"Decision: {decision.get('decision')} - {decision.get('reasoning', '')[:100]}"
+                    reflection=(
+                        f"Decision: {decision.get('decision')} - "
+                        f"{decision.get('reasoning', '')[:100]}"
+                    )
                 )
                 return decision
 
-        except LLMTimeoutError:
+        except LLMInvocationError as e:
             agent_logger.log_reflection(
                 agent_name=self.agent_id,
                 task_id=subtask.get('id', 'unknown'),
-                reflection=f"Review LLM call timed out after {self.REVIEW_TIMEOUT}s"
+                reflection=f"Review LLM call failed after all retries: {e}"
             )
         except Exception as e:
             agent_logger.log_reflection(
@@ -1321,10 +1303,21 @@ Respond in JSON:
         return {
             'initialized': True,
             'total_steps': len(steps),
-            'completed': len([s for s in steps.values() if s['status'] == 'completed']),
-            'failed': len([s for s in steps.values() if s['status'] == 'failed']),
-            'pending': len([s for s in steps.values() if s['status'] == 'pending']),
-            'running': len([s for s in steps.values() if s['status'] == 'running']),
-            'validated': len([s for s in steps.values() if s.get('validation_status') == 'validated']),
+            'completed': len([
+                s for s in steps.values() if s['status'] == 'completed'
+            ]),
+            'failed': len([
+                s for s in steps.values() if s['status'] == 'failed'
+            ]),
+            'pending': len([
+                s for s in steps.values() if s['status'] == 'pending'
+            ]),
+            'running': len([
+                s for s in steps.values() if s['status'] == 'running'
+            ]),
+            'validated': len([
+                s for s in steps.values()
+                if s.get('validation_status') == 'validated'
+            ]),
             'document_path': str(self.master_document.document_path)
         }

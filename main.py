@@ -11,10 +11,18 @@ This system maintains separation between:
 All execution artifacts (logs, outputs, reports) go to PROJECT_DIR.
 AGI_ROOT stays clean and only contains the pipeline code.
 
+v3.2.1 Updates:
+- Model selection is now fully modular via utils.model_config.
+  No hardcoded model names anywhere in main.py.  Resolution priority:
+    1. CLI --model flag (explicit parameter)
+    2. OLLAMA_MODEL environment variable (set by RUN scripts)
+    3. config.yaml → ollama.model
+    4. Single fallback constant in utils/model_config.py
+  Same chain applies to --ollama-url via resolve_base_url().
+
 v3.2 Updates:
 - ARC cluster as primary target (GPU + CPU partitions)
 - GPU-first architecture: master on GPU node, subtasks route to CPU or GPU
-- qwen3-coder-next:latest as default model (32K context on V100)
 - Dual cluster routing: AGI_CLUSTER (CPU) + AGI_GPU_CLUSTER (GPU subtasks)
 - Cluster configuration via cluster_config.yaml
 - Conda cleanup after successful task completion
@@ -30,13 +38,9 @@ Run with:
     # ARC cluster (default - CPU subtasks to compute1, GPU subtasks to gpu1v100)
     python main.py --prompt-file prompts/my_task.txt --project-dir /path/to/project --slurm
 
-    # Override GPU cluster target
-    python main.py --prompt-file prompts/gpu_task.txt --project-dir /path/to/project \\
-        --slurm --gpu-cluster arc_gpu1a100
-
-    # Use extended-time CPU partition for subtasks
-    python main.py --prompt-file prompts/long_task.txt --project-dir /path/to/project \\
-        --slurm --cluster arc_compute2
+    # Override model (highest priority — beats env var and config)
+    python main.py --prompt-file prompts/task.txt --project-dir ./project \\
+        --model qwen3-coder:32b
 
     # Resume from checkpoints
     python main.py --prompt-file prompts/task.txt --project-dir ./project --resume
@@ -76,9 +80,21 @@ from utils.logging_config import configure_logging, agent_logger
 from utils.documentation import configure_documentation, doc_generator
 from utils.git_tracker import configure_git_tracking, git_tracker
 
+# v3.2.1: Modular model configuration — single source of truth for defaults
+from utils.model_config import (
+    FALLBACK_MODEL,
+    FALLBACK_BASE_URL,
+    resolve_model,
+    resolve_base_url,
+)
+
 
 def load_config(config_path: str = "config/config.yaml") -> dict:
-    """Load configuration from YAML"""
+    """Load configuration from YAML.
+
+    The fallback dict uses FALLBACK_MODEL / FALLBACK_BASE_URL from
+    utils.model_config so there are zero hardcoded model names in main.py.
+    """
     try:
         with open(config_path, 'r') as f:
             return yaml.safe_load(f)
@@ -86,8 +102,8 @@ def load_config(config_path: str = "config/config.yaml") -> dict:
         print(f"Config file not found at {config_path}, using defaults")
         return {
             "ollama": {
-                "model": "qwen3-coder-next:latest",
-                "base_url": "http://127.0.0.1:11434",
+                "model": FALLBACK_MODEL,
+                "base_url": FALLBACK_BASE_URL,
                 "model_context_length": 32768,
             },
             "context": {
@@ -110,17 +126,17 @@ def load_config(config_path: str = "config/config.yaml") -> dict:
 def load_prompt_file(prompt_path: str) -> dict:
     """
     Load task prompt from a text file.
-    
+
     Supports both simple text files (just the task) and structured markdown
     with sections for task, context, inputs, outputs, etc.
     """
     path = Path(prompt_path)
-    
+
     if not path.exists():
         raise FileNotFoundError(f"Prompt file not found: {prompt_path}")
-    
+
     content = path.read_text()
-    
+
     # Parse structured format if present
     result = {
         "task": content,
@@ -129,13 +145,13 @@ def load_prompt_file(prompt_path: str) -> dict:
         "expected_outputs": [],
         "prompt_file": str(path.absolute())
     }
-    
+
     # Try to parse markdown sections
     if "##" in content or "# " in content:
         lines = content.split('\n')
         current_section = "task"
         section_content = []
-        
+
         for line in lines:
             if line.startswith('## ') or line.startswith('# '):
                 # Save previous section
@@ -149,19 +165,19 @@ def load_prompt_file(prompt_path: str) -> dict:
                         result["input_files"] = [f.strip().lstrip('- ') for f in text.split('\n') if f.strip()]
                     elif current_section == "output" or current_section == "outputs":
                         result["expected_outputs"] = [f.strip().lstrip('- ') for f in text.split('\n') if f.strip()]
-                
+
                 # Start new section
                 current_section = line.lstrip('#').strip().lower().replace(' ', '_')
                 section_content = []
             else:
                 section_content.append(line)
-        
+
         # Don't forget last section
         if section_content:
             text = '\n'.join(section_content).strip()
             if current_section == "task" or current_section == "goal":
                 result["task"] = text
-    
+
     return result
 
 
@@ -169,18 +185,18 @@ def archive_prompt(prompt_data: dict, project_dir: Path, config: dict) -> Path:
     """Archive the prompt file to project directory"""
     prompts_dir = project_dir / "prompts"
     prompts_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Generate unique filename
     task_hash = hashlib.md5(prompt_data["task"][:100].encode()).hexdigest()[:8]
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"prompt_{timestamp}_{task_hash}.json"
-    
+
     archive_path = prompts_dir / filename
     prompt_data["archived_at"] = datetime.now().isoformat()
-    
+
     with open(archive_path, 'w') as f:
         json.dump(prompt_data, f, indent=2)
-    
+
     return archive_path
 
 
@@ -194,14 +210,14 @@ def validate_project_dir(project_dir: str) -> Path:
 def load_cluster_config(config_path: str = None) -> dict:
     """
     Load the full cluster configuration from cluster_config.yaml.
-    
+
     This is the authoritative source for SLURM partition details,
     GPU settings, and resource limits. The clusters section in
     config.yaml is only a summary/fallback.
     """
     if not config_path:
         config_path = os.environ.get('AGI_CLUSTER_CONFIG')
-    
+
     if not config_path:
         for path in [
             Path.cwd() / 'config' / 'cluster_config.yaml',
@@ -210,20 +226,20 @@ def load_cluster_config(config_path: str = None) -> dict:
             if path.exists():
                 config_path = str(path)
                 break
-    
+
     if config_path and Path(config_path).exists():
         try:
             with open(config_path) as f:
                 return yaml.safe_load(f)
         except Exception as e:
             print(f"Warning: Failed to load cluster config from {config_path}: {e}")
-    
+
     return {}
 
 
 def list_clusters(config: dict, cluster_config: dict = None):
     """List all configured clusters from both config.yaml and cluster_config.yaml"""
-    
+
     # Prefer cluster_config.yaml (full definitions) over config.yaml (summaries)
     if cluster_config and cluster_config.get('clusters'):
         clusters = cluster_config['clusters']
@@ -235,24 +251,24 @@ def list_clusters(config: dict, cluster_config: dict = None):
         default_cpu = config.get("slurm", {}).get("default_cluster", "arc_compute1")
         default_gpu = config.get("slurm", {}).get("default_gpu_cluster", "arc_gpu1v100")
         source = "config.yaml (summary only)"
-    
+
     print(f"\n{'='*70}")
     print(f"  Available Clusters (source: {source})")
     print(f"{'='*70}")
     print(f"  Default CPU cluster: {default_cpu}")
     print(f"  Default GPU cluster: {default_gpu}")
-    
+
     # Separate GPU and CPU clusters for display
     gpu_clusters = {}
     cpu_clusters = {}
-    
+
     for name, cc in clusters.items():
         gpu_info = cc.get('gpu', {})
         if gpu_info.get('available', False) or cc.get('has_gpu', False):
             gpu_clusters[name] = cc
         else:
             cpu_clusters[name] = cc
-    
+
     if gpu_clusters:
         print(f"\n  --- GPU Partitions ---")
         for name, cc in gpu_clusters.items():
@@ -260,7 +276,7 @@ def list_clusters(config: dict, cluster_config: dict = None):
             slurm = cc.get('slurm', {})
             gpu = cc.get('gpu', {})
             desc = cc.get('description', cc.get('name', ''))
-            
+
             print(f"\n  {name}{is_default}")
             print(f"    {desc}")
             print(f"    Partition: {slurm.get('partition', cc.get('default_partition', 'N/A'))}")
@@ -269,14 +285,14 @@ def list_clusters(config: dict, cluster_config: dict = None):
             print(f"    GPU: {gpu.get('max_count', gpu.get('default_count', '?'))}× {gpu.get('type', cc.get('gpu_type', '?'))}")
             print(f"    Nodes: {cc.get('limits', {}).get('nodes_total', 'N/A')}")
             print(f"    NOTE: No --mem allowed on GPU partitions")
-    
+
     if cpu_clusters:
         print(f"\n  --- CPU Partitions ---")
         for name, cc in cpu_clusters.items():
             is_default = " (DEFAULT CPU)" if name == default_cpu else ""
             slurm = cc.get('slurm', {})
             desc = cc.get('description', cc.get('name', ''))
-            
+
             print(f"\n  {name}{is_default}")
             print(f"    {desc}")
             print(f"    Partition: {slurm.get('partition', cc.get('default_partition', 'N/A'))}")
@@ -284,7 +300,7 @@ def list_clusters(config: dict, cluster_config: dict = None):
             print(f"    Memory: {slurm.get('memory', cc.get('default_memory', 'N/A'))}")
             print(f"    Time: {slurm.get('time', cc.get('default_time', 'N/A'))}")
             print(f"    Nodes: {cc.get('limits', {}).get('nodes_total', 'N/A')}")
-    
+
     print(f"\n{'='*70}\n")
 
 
@@ -292,26 +308,26 @@ def check_cluster_status(sandbox: Sandbox, config: dict, cluster_name: str = Non
     """Check and display cluster status"""
     slurm_config = SlurmConfig(config_dict=config)
     slurm_tools = SlurmTools(sandbox, config=slurm_config, cluster_name=cluster_name)
-    
+
     if not slurm_tools.slurm_available:
         print("\n✗ SLURM is not available on this system\n")
         return {"available": False}
-    
+
     # Print cluster summary
     print("\n" + "="*70)
     slurm_tools.print_cluster_summary()
-    
+
     # Get live status
     print("\n--- Live Status ---")
     status = slurm_tools.get_cluster_status(partition=partition)
-    
+
     if status["success"]:
         print(f"Total Nodes: {status.get('total_nodes', 'N/A')}")
         print(f"Idle Nodes: {status.get('idle_count', 0)}")
-        
+
         if status.get("gpu_nodes"):
             print(f"GPU Nodes: {status.get('gpu_count', 0)}")
-        
+
         if partition:
             part_info = slurm_tools.get_partition_info(partition)
             if part_info.get("success"):
@@ -322,7 +338,7 @@ def check_cluster_status(sandbox: Sandbox, config: dict, cluster_name: str = Non
                 print(f"  Max Memory: {cfg.get('max_memory')}")
                 if cfg.get("has_gpu"):
                     print(f"  GPUs: {cfg.get('max_gpus')}x {cfg.get('gpu_type')}")
-    
+
     print("="*70 + "\n")
     return status
 
@@ -336,30 +352,30 @@ def print_banner(task: str, config: dict, project_dir: Path, cluster_info: dict 
     max_iterations = max_iterations or config['agents']['max_retries']
     context_length = config.get('ollama', {}).get('model_context_length', 32768)
     max_task_tokens = config.get('context', {}).get('max_tokens_per_task', 25000)
-    
+
     print(f"\n{'='*70}")
-    print(f"  AGI Multi-Agent Pipeline v3.2 (ARC GPU-First)")
+    print(f"  AGI Multi-Agent Pipeline v3.2.1 (ARC GPU-First)")
     print(f"{'='*70}")
     print(f"  Model:            {model}")
     print(f"  Context Window:   {context_length:,} tokens")
     print(f"  Task Budget:      {max_task_tokens:,} tokens per subtask")
     print(f"  Max Iterations:   {max_iterations}")
     print(f"  Project Dir:      {project_dir}")
-    
+
     if cluster_info:
         print(f"\n  SLURM Configuration:")
         print(f"    Cluster:    {cluster_info.get('cluster', 'N/A')}")
         print(f"    Partition:  {cluster_info.get('partition', 'N/A')}")
-        
+
         if cluster_info.get('gpus'):
             print(f"    GPUs:       {cluster_info['gpus']}× {cluster_info.get('gpu_type', 'generic')}")
-        
+
         if cluster_info.get('nodelist'):
             print(f"    Node(s):    {cluster_info['nodelist']}")
-        
+
         if cluster_info.get('idle_count'):
             print(f"    Available:  {cluster_info['idle_count']} nodes")
-    
+
     # v3.2: Subtask routing info
     if cluster_for_subtasks or gpu_cluster_for_subtasks:
         print(f"\n  Subtask Routing:")
@@ -367,13 +383,13 @@ def print_banner(task: str, config: dict, project_dir: Path, cluster_info: dict 
         print(f"    GPU subtasks → {gpu_cluster_for_subtasks or 'arc_gpu1v100'}")
         print(f"    Cleanup Env:   {'Enabled' if cleanup_env else 'Disabled'}")
         print(f"    Checkpointing: Enabled")
-    
+
     if config.get("parallel", {}).get("enabled"):
         print(f"\n  Parallel Execution: Enabled")
-    
+
     print(f"{'='*70}")
     print(f"\n  Task:")
-    
+
     # Wrap task text
     words = task.split()
     line = "    "
@@ -390,7 +406,7 @@ def print_banner(task: str, config: dict, project_dir: Path, cluster_info: dict 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Multi-Agent System for Complex Task Execution (v3.2 ARC GPU-First)",
+        description="Multi-Agent System for Complex Task Execution (v3.2.1)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -414,7 +430,7 @@ Examples:
   # Disable conda cleanup (keep environments for debugging)
   python main.py --prompt-file prompts/task.txt --project-dir ./project --no-cleanup-env
 
-  # Override model
+  # Override model (highest priority — beats OLLAMA_MODEL env and config.yaml)
   python main.py --prompt-file prompts/task.txt --project-dir ./project \\
       --model llama3.1:70b
 
@@ -426,23 +442,26 @@ Examples:
   python main.py --list-clusters --project-dir ./test
         """
     )
-    
+
     # Task input (mutually exclusive)
     task_group = parser.add_mutually_exclusive_group()
     task_group.add_argument("--task", type=str, help="High-level task description (inline)")
     task_group.add_argument("--prompt-file", type=str, help="Path to prompt file containing task")
     task_group.add_argument("--list-clusters", action="store_true", help="List all configured clusters")
     task_group.add_argument("--cluster-status", action="store_true", help="Check cluster/partition status")
-    
+
     # Project directory (required for most operations)
     parser.add_argument("--project-dir", type=str, required=True, help="Project directory for all files")
-    
+
     # Model and execution options
     model_group = parser.add_argument_group('Model Options')
     model_group.add_argument(
         "--model", "-m",
         type=str,
-        help="Ollama model to use (overrides config). Default: qwen3-coder-next:latest"
+        help=(
+            "Ollama model override (highest priority). "
+            "Falls back to OLLAMA_MODEL env → config.yaml → built-in default"
+        ),
     )
     model_group.add_argument(
         "--max-iterations", "--max-retries",
@@ -452,9 +471,12 @@ Examples:
     model_group.add_argument(
         "--ollama-url",
         type=str,
-        help="Ollama server URL (default: http://127.0.0.1:11434)"
+        help=(
+            "Ollama server URL override. "
+            "Falls back to OLLAMA_HOST env → config.yaml → built-in default"
+        ),
     )
-    
+
     # Cluster selection
     cluster_group = parser.add_argument_group('Cluster Options')
     cluster_group.add_argument(
@@ -490,7 +512,7 @@ Examples:
         type=str,
         help="Node(s) to exclude"
     )
-    
+
     # SLURM options
     slurm_group = parser.add_argument_group('SLURM Options')
     slurm_group.add_argument("--slurm", action="store_true", help="Enable SLURM job submission")
@@ -501,7 +523,7 @@ Examples:
         help="Memory per job (e.g., '64G'). WARNING: Do NOT use for GPU partitions"
     )
     slurm_group.add_argument("--time", "-t", type=str, help="Time limit (e.g., '1-00:00:00')")
-    
+
     # GPU options
     gpu_group = parser.add_argument_group('GPU Options')
     gpu_group.add_argument(
@@ -509,7 +531,7 @@ Examples:
         help="Number of GPUs to request (uses --gres=gpu:N format)"
     )
     gpu_group.add_argument("--gpu-type", type=str, help="GPU type (e.g., 'v100', 'a100')")
-    
+
     # Sub-agent options (v3.2)
     subagent_group = parser.add_argument_group('Sub-Agent Options (v3.2)')
     subagent_group.add_argument(
@@ -533,47 +555,49 @@ Examples:
         action="store_true",
         help="Clear all checkpoints before starting"
     )
-    
+
     # Parallel execution
     parser.add_argument("--parallel", action="store_true", help="Enable parallel subtask execution")
     parser.add_argument("--no-parallel", action="store_true", help="Disable parallel execution")
     parser.add_argument("--max-parallel", type=int, help="Maximum parallel jobs")
-    
+
     # Other options
     parser.add_argument("--config", type=str, default="config/config.yaml", help="Path to config file")
     parser.add_argument("--dry-run", action="store_true", help="Print configuration without executing")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
     parser.add_argument("--thread-id", type=str, help="Thread ID for workflow persistence")
     parser.add_argument("--context", type=str, help="Additional context as JSON string")
-    
+
     args = parser.parse_args()
-    
+
     # =========================================================================
     # LOAD CONFIGURATION
     # =========================================================================
     config = load_config(args.config)
-    
-    # Apply command-line overrides
-    if args.model:
-        config['ollama']['model'] = args.model
+
+    # v3.2.1: Resolve model and URL through the centralized resolution chain.
+    # resolve_model() checks: CLI --model → OLLAMA_MODEL env → config.yaml → FALLBACK_MODEL
+    # resolve_base_url() checks: CLI --ollama-url → OLLAMA_HOST env → config.yaml → FALLBACK_BASE_URL
+    # This replaces the old manual if/else override blocks.
+    config['ollama']['model'] = resolve_model(args.model, config)
+    config['ollama']['base_url'] = resolve_base_url(args.ollama_url, config)
+
     if args.max_iterations:
         config['agents']['max_retries'] = min(args.max_iterations, 12)
-    if args.ollama_url:
-        config['ollama']['base_url'] = args.ollama_url
-    
+
     # Load full cluster definitions from cluster_config.yaml
     full_cluster_config = load_cluster_config(args.cluster_config)
-    
+
     # Validate and setup project directory
     project_dir = validate_project_dir(args.project_dir)
-    
+
     # =========================================================================
     # CONFIGURE PROJECT-SPECIFIC LOGGING AND TRACKING
     # =========================================================================
     configure_logging(project_dir)
     configure_documentation(project_dir)
     configure_git_tracking(project_dir)
-    
+
     agent_logger.log_workflow_event("project_configured", {
         "project_dir": str(project_dir),
         "model": config['ollama']['model'],
@@ -582,24 +606,24 @@ Examples:
         "gpu_cluster": args.gpu_cluster,
     })
     # =========================================================================
-    
+
     # Initialize sandbox
     sandbox = Sandbox(project_dir)
-    
+
     # Handle --list-clusters (now uses full cluster_config.yaml)
     if args.list_clusters:
         list_clusters(config, full_cluster_config)
         sys.exit(0)
-    
+
     # Handle --cluster-status
     if args.cluster_status:
         check_cluster_status(sandbox, config, args.cluster, args.partition)
         sys.exit(0)
-    
+
     # Require task input if not listing/checking
     if not args.task and not args.prompt_file:
         parser.error("Either --task or --prompt-file is required")
-    
+
     # =========================================================================
     # SET CLUSTER ENVIRONMENT VARIABLES FOR SUB-AGENT (v3.2)
     # =========================================================================
@@ -607,13 +631,13 @@ Examples:
     # cluster settings for sbatch generation. Two clusters are set:
     #   AGI_CLUSTER     → default target for CPU subtasks
     #   AGI_GPU_CLUSTER → target for subtasks that need GPU resources
-    
+
     cluster_for_subtasks = args.cluster  # Already defaults to arc_compute1
     gpu_cluster_for_subtasks = args.gpu_cluster  # Already defaults to arc_gpu1v100
-    
+
     os.environ['AGI_CLUSTER'] = cluster_for_subtasks
     os.environ['AGI_GPU_CLUSTER'] = gpu_cluster_for_subtasks
-    
+
     # Set cluster config path
     cluster_config_path = args.cluster_config
     if not cluster_config_path:
@@ -624,16 +648,16 @@ Examples:
             if p.exists():
                 cluster_config_path = str(p)
                 break
-    
+
     if cluster_config_path:
         os.environ['AGI_CLUSTER_CONFIG'] = cluster_config_path
-    
+
     print(f"  Subtask CPU cluster:  {cluster_for_subtasks}")
     print(f"  Subtask GPU cluster:  {gpu_cluster_for_subtasks}")
     if cluster_config_path:
         print(f"  Cluster config:       {cluster_config_path}")
     # =========================================================================
-    
+
     # Resolve cluster info for the master job context
     # Try full cluster_config.yaml first, fall back to config.yaml summaries
     cluster_name = cluster_for_subtasks
@@ -651,10 +675,10 @@ Examples:
         }
     else:
         cluster_config_entry = config.get("clusters", {}).get(cluster_name, {})
-    
+
     # Determine partition
     partition = args.partition or cluster_config_entry.get("default_partition", "compute1")
-    
+
     # Determine SLURM usage
     use_slurm = False
     if args.slurm:
@@ -663,19 +687,19 @@ Examples:
         use_slurm = False
     elif config.get("slurm", {}).get("enabled"):
         use_slurm = True
-    
+
     # Check SLURM availability
     slurm_status = None
     if use_slurm:
         slurm_config_obj = SlurmConfig(config_dict=config)
         slurm_tools = SlurmTools(sandbox, config=slurm_config_obj, cluster_name=cluster_name)
-        
+
         if not slurm_tools.slurm_available:
             print(f"WARNING: SLURM requested but not available. Falling back to interactive mode.")
             use_slurm = False
         else:
             slurm_status = slurm_tools.get_cluster_status(partition=partition)
-    
+
     # Determine parallel execution
     parallel_enabled = True
     if args.no_parallel:
@@ -684,18 +708,18 @@ Examples:
         parallel_enabled = True
     elif config.get("parallel", {}).get("enabled") is not None:
         parallel_enabled = config["parallel"]["enabled"]
-    
+
     # Determine cleanup behavior (v3.2)
     cleanup_env = True
     if args.no_cleanup_env:
         cleanup_env = False
-    
+
     # =========================================================================
     # BUILD SLURM JOB CONFIG
     # =========================================================================
     # Check if the target cluster is a GPU cluster (no --mem allowed)
     is_gpu_cluster = cluster_config_entry.get("has_gpu", False)
-    
+
     # Memory: NEVER set for GPU clusters (causes allocation failures on ARC)
     if is_gpu_cluster:
         job_memory = None
@@ -703,7 +727,7 @@ Examples:
             print(f"WARNING: --memory ignored for GPU cluster '{cluster_name}' (causes allocation failures)")
     else:
         job_memory = args.memory or cluster_config_entry.get("default_memory", "64G")
-    
+
     slurm_job_config = {
         "cluster": cluster_name,
         "partition": partition,
@@ -723,19 +747,19 @@ Examples:
         "cleanup_env_on_success": cleanup_env,
         "enable_checkpoints": True,
     }
-    
+
     # =========================================================================
     # HANDLE CHECKPOINT MANAGEMENT (v3.2)
     # =========================================================================
     checkpoint_dir = project_dir / 'temp' / 'checkpoints'
-    
+
     if args.clear_checkpoints:
         if checkpoint_dir.exists():
             shutil.rmtree(checkpoint_dir)
             print(f"  Cleared checkpoints: {checkpoint_dir}")
-    
+
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    
+
     if args.resume and checkpoint_dir.exists():
         checkpoint_files = list(checkpoint_dir.glob('*_checkpoint.json'))
         if checkpoint_files:
@@ -745,7 +769,7 @@ Examples:
             if len(checkpoint_files) > 5:
                 print(f"    ... and {len(checkpoint_files) - 5} more")
     # =========================================================================
-    
+
     # Load task
     if args.prompt_file:
         try:
@@ -755,10 +779,10 @@ Examples:
             context["input_files"] = prompt_data.get("input_files", [])
             context["expected_outputs"] = prompt_data.get("expected_outputs", [])
             context["prompt_file"] = prompt_data.get("prompt_file", "")
-            
+
             archive_path = archive_prompt(prompt_data, project_dir, config)
             print(f"Prompt archived to: {archive_path}")
-            
+
         except FileNotFoundError as e:
             print(f"Error: {e}")
             sys.exit(1)
@@ -768,13 +792,13 @@ Examples:
     else:
         main_task = args.task
         context = {}
-        
+
         if args.context:
             try:
                 context = json.loads(args.context)
             except json.JSONDecodeError:
                 print("Warning: Could not parse context JSON")
-    
+
     # Add execution context
     context["project_dir"] = str(project_dir)
     context["use_slurm"] = use_slurm
@@ -783,7 +807,7 @@ Examples:
     context["parallel_enabled"] = parallel_enabled
     context["cluster_for_subtasks"] = cluster_for_subtasks
     context["gpu_cluster_for_subtasks"] = gpu_cluster_for_subtasks
-    
+
     # Prepare cluster info for banner
     cluster_info = {
         "cluster": cluster_name,
@@ -793,18 +817,18 @@ Examples:
         "nodelist": args.nodelist,
         "idle_count": slurm_status.get("idle_count") if slurm_status else None,
     }
-    
+
     # Print banner
     print_banner(
         main_task, config, project_dir,
         cluster_info if use_slurm else None,
-        model=args.model,
+        model=config['ollama']['model'],
         max_iterations=args.max_iterations,
         cluster_for_subtasks=cluster_for_subtasks,
         gpu_cluster_for_subtasks=gpu_cluster_for_subtasks,
         cleanup_env=cleanup_env,
     )
-    
+
     # Dry run
     if args.dry_run:
         print("DRY RUN MODE - No execution will occur\n")
@@ -836,12 +860,15 @@ Examples:
         print(f"  SLURM scripts in:     {project_dir}/slurm/scripts/")
         print(f"  SLURM logs in:        {project_dir}/slurm/logs/")
         sys.exit(0)
-    
-    # Initialize workflow
+
+    # Initialize workflow — passes already-resolved model and URL.
+    # MultiAgentWorkflow also calls resolve_model() internally, so even
+    # passing None would be safe, but we pass the resolved values for
+    # logging clarity and to avoid redundant resolution.
     try:
         workflow = MultiAgentWorkflow(
             ollama_model=config['ollama']['model'],
-            ollama_base_url=config['ollama'].get('base_url', 'http://127.0.0.1:11434'),
+            ollama_base_url=config['ollama']['base_url'],
             max_retries=config['agents']['max_retries'],
             project_dir=project_dir,
             use_slurm=use_slurm,
@@ -856,7 +883,7 @@ Examples:
             import traceback
             traceback.print_exc()
         sys.exit(1)
-    
+
     # Execute
     try:
         result = workflow.run(
@@ -864,7 +891,7 @@ Examples:
             context=context,
             thread_id=args.thread_id,
         )
-        
+
         print(f"\n{'='*70}")
         print(f"  Execution Complete!")
         print(f"{'='*70}")
@@ -873,13 +900,13 @@ Examples:
         print(f"  Failed:    {len(result.get('failed_subtasks', []))} subtasks")
         print(f"\n  Report saved to: {project_dir}/reports/")
         print(f"{'='*70}\n")
-        
+
         # Exit with appropriate code
         if result.get('status') == 'completed' and not result.get('failed_subtasks'):
             sys.exit(0)
         else:
             sys.exit(1)
-            
+
     except KeyboardInterrupt:
         print("\n\nInterrupted by user. Cleaning up...")
         print(f"  Checkpoints preserved in: {checkpoint_dir}")

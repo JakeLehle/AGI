@@ -1,20 +1,29 @@
 """
-LangGraph Workflow - Script-First Architecture with Reflexion Memory
+LangGraph Workflow v3.2.1 - Script-First Architecture with Reflexion Memory
 
 Orchestrates multi-agent system with:
-- Token-based context limits (configurable, default 25K for qwen3-coder-next:latest) instead of iteration counts
+- Token-based context limits (configurable, default 25K) instead of iteration counts
 - Each subtask gets its own persistent context window
 - Parallel SLURM job submission for independent tasks
 - Script generation and execution paradigm
 - Living document master prompt management
 - **Reflexion Memory for loop prevention**
 
+v3.2.1 Updates:
+- Model selection is now fully modular via utils.model_config.resolve_model().
+  No hardcoded model names in workflow code. Resolution priority:
+    1. Explicit parameter (from main.py CLI --model)
+    2. OLLAMA_MODEL environment variable (set in RUN scripts)
+    3. config.yaml → ollama.model
+    4. Single fallback constant in utils/model_config.py
+- All downstream agents (MasterAgent, ScriptFirstSubAgent) also use
+  resolve_model() internally, so passing None is safe at every level.
+
 v3.2 Updates:
 - Cluster configuration via AGI_CLUSTER environment variable
 - Conda cleanup after successful task completion
 - State checkpointing for resume capability
 - cleanup_env_on_success parameter support
-- Default model: qwen3-coder-next:latest (32K context)
 - Token budget: 25K/12K/3K (context/tool output/min continue)
 - Transition logging at every routing decision
 - GPU-aware parallel batching (separate GPU/CPU tasks)
@@ -32,6 +41,7 @@ Environment Variables:
 - AGI_MIN_TOKENS_TO_CONTINUE: Min tokens to continue (default: 3000)
 - AGI_CLUSTER: Cluster profile for subtask SLURM settings
 - AGI_CLUSTER_CONFIG: Path to cluster_config.yaml
+- OLLAMA_MODEL: Model override (used by resolve_model)
 """
 
 from typing import TypedDict, Annotated, List, Dict, Any, Optional
@@ -69,6 +79,7 @@ from utils.logging_config import agent_logger
 from utils.git_tracker import git_tracker
 from utils.documentation import doc_generator
 from utils.context_manager import ContextManager
+from utils.model_config import resolve_model, resolve_base_url
 
 # ============================================================================
 # REFLEXION MEMORY INTEGRATION
@@ -166,28 +177,28 @@ class WorkflowState(TypedDict):
 
 class MultiAgentWorkflow:
     """
-    LangGraph workflow with script-first architecture and reflexion memory.
+    LangGraph workflow v3.2.1 with script-first architecture and reflexion memory.
 
     Key features:
-    - Token-based context limits (configurable via environment) instead of iteration counts
+    - Token-based context limits (configurable via environment)
     - Each subtask gets its own persistent context window
     - Parallel SLURM job submission
     - Script generation → SLURM submit → monitor paradigm
     - Living document master prompt
     - Reflexion Memory for semantic duplicate detection
     - v3.2: Cluster configuration, conda cleanup, GPU-aware batching
+    - v3.2.1: Modular model config via resolve_model() — no hardcoded names
     """
 
-    # Token limits sized for qwen3-coder-next:latest @ 32K context
-    # Read from environment or use defaults matching config.yaml
+    # Token limits — read from environment or use defaults matching config.yaml
     MAX_CONTEXT_TOKENS = int(os.environ.get('AGI_MAX_CONTEXT_TOKENS', 25000))
     MAX_TOOL_OUTPUT_TOKENS = int(os.environ.get('AGI_MAX_TOOL_OUTPUT_TOKENS', 12000))
     MIN_TOKENS_TO_CONTINUE = int(os.environ.get('AGI_MIN_TOKENS_TO_CONTINUE', 3000))
 
     def __init__(
         self,
-        ollama_model: str = "qwen3-coder-next:latest",
-        ollama_base_url: str = "http://127.0.0.1:11434",
+        ollama_model: str = None,
+        ollama_base_url: str = None,
         max_retries: int = 12,  # Kept for backward compat, but token-based now
         project_dir: str = None,
         use_slurm: bool = True,
@@ -196,8 +207,10 @@ class MultiAgentWorkflow:
         use_reflexion_memory: bool = True,
         cleanup_env_on_success: bool = True,  # v3.2: Cleanup conda envs after success
     ):
-        self.ollama_model = ollama_model
-        self.ollama_base_url = ollama_base_url
+        # v3.2.1: Resolve model and URL via centralized config (no hardcoded names)
+        self.ollama_model = resolve_model(ollama_model)
+        self.ollama_base_url = resolve_base_url(ollama_base_url)
+
         self.project_dir = Path(project_dir) if project_dir else Path.cwd()
         self.use_slurm = use_slurm
         self.parallel_enabled = parallel_enabled
@@ -223,11 +236,12 @@ class MultiAgentWorkflow:
                 print("WARNING: SLURM not available, falling back to local execution")
                 self.use_slurm = False
 
-        # Initialize master agent
+        # Initialize master agent — passes resolved model, but MasterAgent
+        # also calls resolve_model() internally so None would be safe too
         self.master = MasterAgent(
             sandbox=self.sandbox,
-            ollama_model=ollama_model,
-            ollama_base_url=ollama_base_url,
+            ollama_model=self.ollama_model,
+            ollama_base_url=self.ollama_base_url,
             project_dir=self.project_dir
         )
 
@@ -252,8 +266,8 @@ class MultiAgentWorkflow:
 
         # Log configuration
         logger.info(
-            f"MultiAgentWorkflow v3.2 initialized: "
-            f"model={ollama_model}, "
+            f"MultiAgentWorkflow v3.2.1 initialized: "
+            f"model={self.ollama_model}, "
             f"tokens={self.MAX_CONTEXT_TOKENS}/{self.MAX_TOOL_OUTPUT_TOKENS}/{self.MIN_TOKENS_TO_CONTINUE}, "
             f"slurm={self.use_slurm}, "
             f"parallel={self.parallel_enabled}, "
@@ -371,7 +385,7 @@ class MultiAgentWorkflow:
             "reflexion_enabled": self.use_reflexion_memory,
             "cleanup_env_on_success": self.cleanup_env_on_success,  # v3.2
             "cluster": os.environ.get('AGI_CLUSTER', 'unknown'),  # v3.2
-            "model": self.ollama_model,  # v3.2
+            "model": self.ollama_model,
             "token_budget": f"{self.MAX_CONTEXT_TOKENS}/{self.MAX_TOOL_OUTPUT_TOKENS}/{self.MIN_TOKENS_TO_CONTINUE}",
         })
 
@@ -496,7 +510,6 @@ class MultiAgentWorkflow:
             cpu_ready = [t for t in ready_tasks if not t.get('requires_gpu')]
 
             # Prioritize: run GPU tasks first (usually fewer, longer-running)
-            # Limit GPU batch to avoid partition exhaustion
             max_gpu_batch = min(self.slurm_config.get("max_parallel_gpu_jobs", 4), max_batch)
             batch = gpu_ready[:max_gpu_batch] + cpu_ready[:max_batch - min(len(gpu_ready), max_gpu_batch)]
             batch = batch[:max_batch]
@@ -545,7 +558,8 @@ class MultiAgentWorkflow:
             # Mark as running in master document
             self.master.master_document.mark_running(task_id)
 
-            # Create sub-agent with v3.2 features
+            # Create sub-agent — passes resolved model, but sub-agent
+            # also calls resolve_model() internally so None would be safe too
             agent = ScriptFirstSubAgent(
                 agent_id=f"agent_{task_id}",
                 sandbox=self.sandbox,
@@ -574,7 +588,7 @@ class MultiAgentWorkflow:
         }
 
     def execute_sequential(self, state: WorkflowState) -> Dict:
-        """Execute a single task sequentially with sub-agent v3.2 features"""
+        """Execute a single task sequentially with sub-agent v3.2.1 features"""
         subtask = state['current_subtask']
         env_name = state['env_name']
         task_id = subtask['id']
@@ -599,7 +613,7 @@ class MultiAgentWorkflow:
         # Mark as running
         self.master.master_document.mark_running(task_id)
 
-        # Create sub-agent with v3.2 features
+        # Create sub-agent — passes resolved model
         agent = ScriptFirstSubAgent(
             agent_id=f"agent_{task_id}",
             sandbox=self.sandbox,
