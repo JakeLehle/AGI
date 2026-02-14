@@ -33,6 +33,17 @@ v3.2.1 Updates:
     3. config.yaml → ollama.model
     4. Single fallback constant in utils/model_config.py
 
+v3.2.2 Updates:
+- FIX A: _filter_executable_steps() — filters documentation sections (tables,
+  notes, output specs) BEFORE LLM expansion. Prevents non-executable content
+  from becoming subtasks. Saves LLM calls and prevents garbage dependencies.
+- FIX B: _sanitize_dependencies() — post-processes LLM-generated dependencies
+  after expansion. Removes refs to non-existent IDs, breaks circular deps via
+  topological sort, ensures first step has no deps, falls back to sequential
+  ordering if the dependency graph is unsalvageable.
+  Together these fixes prevent the "0 completed, 0 failed, all blocked" deadlock
+  that occurred when documentation sections created circular dependency chains.
+
 The master prompt serves as a living document that:
 1. Contains all pipeline steps with status
 2. Gets updated when subtasks complete (adds script paths)
@@ -45,6 +56,7 @@ from pathlib import Path
 import re
 import json
 from datetime import datetime
+from collections import deque
 
 try:
     from langchain_ollama import OllamaLLM
@@ -400,18 +412,24 @@ class MasterPromptDocument:
 
 class MasterAgent:
     """
-    Master agent v3.2.1 with comprehensive task decomposition.
+    Master agent v3.2.2 with comprehensive task decomposition.
 
     Key responsibilities:
     1. EXTRACT: Parse ALL steps from the detailed prompt
-    2. EXPAND: Create detailed execution plans for each step
-    3. VALIDATE: Verify plans match original intent
-    4. ASSIGN: Hand off validated plans to sub-agents
-    5. TRACK: Maintain the master prompt document
+    2. FILTER: Remove non-executable documentation sections (v3.2.2)
+    3. EXPAND: Create detailed execution plans for each step
+    4. SANITIZE: Fix circular/invalid dependencies (v3.2.2)
+    5. VALIDATE: Verify plans match original intent
+    6. ASSIGN: Hand off validated plans to sub-agents
+    7. TRACK: Maintain the master prompt document
 
     v3.2.1 — No artificial timeouts. The 3-day SLURM node window is the
     only hard limit. LLM calls use invoke_resilient() with exponential
     backoff retry to survive transient Ollama 500 errors.
+
+    v3.2.2 — Fixes A+B: extraction filter + dependency sanitizer.
+    Prevents the "0 completed, 0 failed, all blocked" deadlock caused by
+    documentation sections creating circular dependency chains.
 
     Model resolution (no hardcoded model names):
       Constructor accepts ollama_model=None by default. Actual model is
@@ -611,6 +629,143 @@ class MasterAgent:
 
         return extracted
 
+    # =========================================================================
+    # PHASE 1b: FILTER NON-EXECUTABLE STEPS (v3.2.2 — Fix A)
+    # =========================================================================
+
+    def _filter_executable_steps(
+        self, extracted_steps: List[Dict[str, Any]]
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """
+        Classify extracted steps as executable or documentation.
+
+        v3.2.2 Fix A: The prompt extractor matches every ## header and numbered
+        item, which pulls in documentation sections like "Expected Outputs",
+        "AnnData Structure", "Notes", and individual note items ("DO NOT use R").
+        These non-executable sections waste LLM expansion calls and — worse —
+        generate garbage dependencies that create circular deadlocks.
+
+        Classification criteria (step is DOCUMENTATION if ANY match):
+          1. Has code_hints → always executable (strongest signal)
+          2. Title matches known documentation patterns → filtered
+          3. Title starts with bold markers → filtered
+          4. Short content with no procedural title verbs → filtered
+          5. Content is primarily a markdown table → filtered
+
+        Returns:
+            (executable_steps, filtered_steps) — filtered steps are logged
+            but not sent to LLM expansion.
+        """
+        # ── Documentation title patterns ──────────────────────────────────
+        DOC_TITLE_PATTERNS = [
+            r'(?i)^expected\s+output',
+            r'(?i)^primary\s+data\s+file',
+            r'(?i)^anndata\s+structure',
+            r'(?i)^figures?\s*\(',          # "Figures (per puck)"
+            r'(?i)^reports?$',
+            r'(?i)^checkpoints?$',
+            r'(?i)^input\s+files?$',
+            r'(?i)^output\s+files?$',
+            r'(?i)^dependenc',               # "Dependencies Between Steps"
+            r'(?i)^success\s+criteria',
+            r'(?i)^notes?$',
+            r'(?i)^environment$',
+            r'(?i)^prerequisites?$',
+            r'(?i)^requirements?$',
+            r'(?i)^overview$',
+            r'(?i)^context$',
+            r'(?i)^summary$',
+        ]
+
+        BOLD_NOTE_PATTERN = re.compile(r'^\*\*[A-Z]')
+
+        PROCEDURAL_VERBS = {
+            'run', 'execute', 'create', 'generate', 'compute', 'calculate',
+            'load', 'save', 'write', 'read', 'filter', 'normalize',
+            'cluster', 'annotate', 'align', 'process', 'validate',
+            'download', 'install', 'build', 'train', 'predict',
+            'merge', 'combine', 'split', 'transform', 'plot',
+            'visualize', 'export', 'import', 'analyze', 'check',
+            'verify', 'submit', 'setup', 'configure', 'prepare',
+        }
+
+        executable = []
+        filtered = []
+
+        for step in extracted_steps:
+            title = step.get('title', '').strip()
+            full_text = step.get('full_text', '')
+            code_hints = step.get('code_hints', [])
+            content_len = len(full_text)
+
+            reason = None
+
+            # ── Rule 1: Has code_hints → always executable ────────────────
+            if code_hints:
+                executable.append(step)
+                continue
+
+            # ── Rule 2: Title matches documentation patterns ──────────────
+            for pattern in DOC_TITLE_PATTERNS:
+                if re.search(pattern, title):
+                    reason = f"title matches doc pattern: {pattern}"
+                    break
+
+            # ── Rule 3: Bold-prefixed notes ───────────────────────────────
+            if not reason and BOLD_NOTE_PATTERN.match(title):
+                reason = f"bold-prefixed note: {title[:50]}"
+
+            # ── Rule 4: Very short content with no procedural title ───────
+            if not reason and content_len < 200:
+                title_words = set(re.findall(r'\b\w+\b', title.lower()))
+                has_procedural = bool(title_words & PROCEDURAL_VERBS)
+                if not has_procedural:
+                    reason = f"short content ({content_len} chars) with no procedural title"
+
+            # ── Rule 5: Content is primarily a markdown table ─────────────
+            if not reason and content_len > 0:
+                lines = [l.strip() for l in full_text.split('\n') if l.strip()]
+                table_lines = sum(1 for l in lines if l.startswith('|'))
+                if len(lines) > 0 and table_lines / len(lines) > 0.5:
+                    text_lower = full_text.lower()
+                    has_procedural = any(
+                        re.search(rf'\b{v}\b', text_lower) for v in
+                        ['run', 'execute', 'create', 'generate', 'compute',
+                         'load', 'save', 'filter', 'normalize', 'cluster']
+                    )
+                    if not has_procedural:
+                        reason = f"primarily table content ({table_lines}/{len(lines)} lines)"
+
+            # ── Classify ──────────────────────────────────────────────────
+            if reason:
+                step['filter_reason'] = reason
+                filtered.append(step)
+            else:
+                executable.append(step)
+
+        # ── Log results ───────────────────────────────────────────────────
+        if filtered:
+            agent_logger.log_reflection(
+                agent_name=self.agent_id,
+                task_id="filter_steps",
+                reflection=(
+                    f"Filtered {len(filtered)}/{len(extracted_steps)} "
+                    f"non-executable sections: "
+                    f"{', '.join(s['title'][:40] for s in filtered[:5])}"
+                    f"{'...' if len(filtered) > 5 else ''}"
+                )
+            )
+            print(
+                f"    Filtered {len(filtered)} documentation sections "
+                f"(keeping {len(executable)} executable steps)"
+            )
+
+        # Re-number the executable steps sequentially
+        for i, step in enumerate(executable):
+            step['step_number'] = i + 1
+
+        return executable, filtered
+
     def _extract_task_context(self, task: str) -> Dict[str, Any]:
         """Extract critical context from task description"""
         context = {
@@ -732,6 +887,9 @@ class MasterAgent:
             for s in all_steps if s['step_number'] != step.get('step_number')
         ])
 
+        # v3.2.2: Include valid step IDs so LLM generates correct dep format
+        valid_step_ids = [f"step_{s['step_number']}" for s in all_steps]
+
         prompt = f"""You are expanding a pipeline step into a detailed execution plan.
 
 === ORIGINAL STEP FROM USER'S PROMPT ===
@@ -751,6 +909,8 @@ Output Files: {', '.join(context.get('output_files', []))}
 
 Other Steps in Pipeline:
 {other_steps_summary}
+
+Valid step IDs for dependencies: {', '.join(valid_step_ids)}
 
 === YOUR TASK ===
 Create a COMPREHENSIVE execution plan that:
@@ -779,7 +939,10 @@ Create a COMPREHENSIVE execution plan that:
 }}
 ```
 
-IMPORTANT: Your expanded_plan should be DETAILED and COMPREHENSIVE. Do not summarize - expand and clarify. Include ALL details from the user's original step description."""
+IMPORTANT: Your expanded_plan should be DETAILED and COMPREHENSIVE. Do not summarize - expand and clarify. Include ALL details from the user's original step description.
+- For "dependencies", ONLY use IDs from this list: {', '.join(valid_step_ids)}
+- A step that has no prerequisites should have "dependencies": []
+- Do NOT create circular dependencies (e.g., step_1 depending on step_2 while step_2 depends on step_1)"""
 
         try:
             response = invoke_resilient(
@@ -911,6 +1074,191 @@ IMPORTANT: Your expanded_plan should be DETAILED and COMPREHENSIVE. Do not summa
         }
 
     # =========================================================================
+    # PHASE 2b: DEPENDENCY SANITIZATION (v3.2.2 — Fix B)
+    # =========================================================================
+
+    def _sanitize_dependencies(
+        self, subtasks: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Post-process LLM-generated dependencies to guarantee a valid DAG.
+
+        v3.2.2 Fix B: Local LLMs frequently generate dependency values that
+        are free-form text ("Validate Input Data"), non-existent IDs ("step_0"),
+        self-references, or circular chains. This method enforces structural
+        correctness AFTER the LLM expansion phase.
+
+        Sanitization passes (applied in order):
+          1. Normalize: convert any dep value to a valid step_N ID format
+          2. Prune: remove refs to non-existent IDs and self-references
+          3. Root guarantee: first step always gets deps=[]
+          4. Cycle detection + breaking via Kahn's algorithm
+          5. Fallback: if graph is still cyclic, impose sequential ordering
+
+        Returns the subtask list with sanitized dependencies.
+        """
+        if not subtasks:
+            return subtasks
+
+        valid_ids = {s['id'] for s in subtasks}
+        id_to_idx = {s['id']: i for i, s in enumerate(subtasks)}
+
+        # ── Pass 1: Normalize dep values to step_N format ─────────────────
+        title_to_id = {}
+        for s in subtasks:
+            title_lower = s.get('title', '').lower().strip()
+            title_to_id[title_lower] = s['id']
+            idx = id_to_idx[s['id']]
+            title_to_id[f"step {idx + 1}"] = s['id']
+            title_to_id[f"step_{idx + 1}"] = s['id']
+            title_to_id[str(idx + 1)] = s['id']
+
+        for s in subtasks:
+            raw_deps = s.get('dependencies', [])
+            normalized = []
+            for dep in raw_deps:
+                dep_str = str(dep).strip().lower()
+                if dep_str in valid_ids:
+                    normalized.append(dep_str)
+                elif dep_str in title_to_id:
+                    normalized.append(title_to_id[dep_str])
+                else:
+                    for title, sid in title_to_id.items():
+                        if dep_str in title or title in dep_str:
+                            normalized.append(sid)
+                            break
+            s['dependencies'] = normalized
+
+        # ── Pass 2: Prune invalid refs and self-references ────────────────
+        for s in subtasks:
+            s['dependencies'] = [
+                d for d in s['dependencies']
+                if d in valid_ids and d != s['id']
+            ]
+            seen = set()
+            deduped = []
+            for d in s['dependencies']:
+                if d not in seen:
+                    seen.add(d)
+                    deduped.append(d)
+            s['dependencies'] = deduped
+
+        # ── Pass 3: First step always has no dependencies ─────────────────
+        subtasks[0]['dependencies'] = []
+
+        # ── Pass 4+5: Cycle detection and breaking ────────────────────────
+        subtasks = self._break_dependency_cycles(subtasks, valid_ids, id_to_idx)
+
+        # ── Log results ───────────────────────────────────────────────────
+        dep_summary = {s['id']: s['dependencies'] for s in subtasks}
+        agent_logger.log_reflection(
+            agent_name=self.agent_id,
+            task_id="sanitize_deps",
+            reflection=(
+                f"Sanitized dependencies for {len(subtasks)} subtasks. "
+                f"Dep graph: {json.dumps(dep_summary)}"
+            )
+        )
+
+        return subtasks
+
+    def _break_dependency_cycles(
+        self,
+        subtasks: List[Dict[str, Any]],
+        valid_ids: set,
+        id_to_idx: Dict[str, int],
+    ) -> List[Dict[str, Any]]:
+        """
+        Detect and break cycles in the dependency graph using Kahn's algorithm.
+
+        Iteratively removes back-edges (highest-numbered source node in cycle)
+        until the graph is acyclic. Falls back to sequential ordering if
+        cycles cannot be resolved within 50 iterations.
+        """
+        MAX_CYCLE_BREAK_ATTEMPTS = 50
+
+        for attempt in range(MAX_CYCLE_BREAK_ATTEMPTS):
+            # Build in-degree and adjacency
+            in_degree = {s['id']: 0 for s in subtasks}
+            dependents = {s['id']: [] for s in subtasks}
+
+            for s in subtasks:
+                for dep in s['dependencies']:
+                    if dep in in_degree:
+                        in_degree[s['id']] += 1
+                        dependents[dep].append(s['id'])
+
+            # Kahn's algorithm
+            queue = deque([sid for sid, deg in in_degree.items() if deg == 0])
+            sorted_order = []
+
+            while queue:
+                node = queue.popleft()
+                sorted_order.append(node)
+                for dependent in dependents[node]:
+                    in_degree[dependent] -= 1
+                    if in_degree[dependent] == 0:
+                        queue.append(dependent)
+
+            if len(sorted_order) == len(subtasks):
+                return subtasks  # Valid DAG
+
+            # ── Cycle detected — find and break it ────────────────────────
+            cycle_nodes = [
+                sid for sid in in_degree if sid not in set(sorted_order)
+            ]
+            if not cycle_nodes:
+                break
+
+            cycle_nodes_sorted = sorted(
+                cycle_nodes, key=lambda sid: id_to_idx.get(sid, 0), reverse=True
+            )
+
+            broken = False
+            for node_id in cycle_nodes_sorted:
+                node = next(s for s in subtasks if s['id'] == node_id)
+                cycle_set = set(cycle_nodes)
+                back_edges = [d for d in node['dependencies'] if d in cycle_set]
+                if back_edges:
+                    remove_dep = max(back_edges, key=lambda d: id_to_idx.get(d, 0))
+                    node['dependencies'].remove(remove_dep)
+                    agent_logger.log_reflection(
+                        agent_name=self.agent_id,
+                        task_id="break_cycle",
+                        reflection=(
+                            f"Broke cycle: removed {node_id} → {remove_dep} "
+                            f"(attempt {attempt + 1})"
+                        )
+                    )
+                    broken = True
+                    break
+
+            if not broken:
+                node_id = cycle_nodes_sorted[0]
+                node = next(s for s in subtasks if s['id'] == node_id)
+                node['dependencies'] = []
+                agent_logger.log_reflection(
+                    agent_name=self.agent_id,
+                    task_id="break_cycle",
+                    reflection=f"Force-cleared all deps for {node_id} (attempt {attempt + 1})"
+                )
+
+        # ── Fallback: sequential ordering ─────────────────────────────────
+        print("    ⚠ Could not resolve cycles — falling back to sequential ordering")
+        agent_logger.log_reflection(
+            agent_name=self.agent_id,
+            task_id="break_cycle",
+            reflection="Exhausted cycle-break attempts, falling back to sequential deps"
+        )
+        for i, s in enumerate(subtasks):
+            if i == 0:
+                s['dependencies'] = []
+            else:
+                s['dependencies'] = [subtasks[i - 1]['id']]
+
+        return subtasks
+
+    # =========================================================================
     # MAIN DECOMPOSITION METHOD
     # =========================================================================
 
@@ -920,14 +1268,20 @@ IMPORTANT: Your expanded_plan should be DETAILED and COMPREHENSIVE. Do not summa
         """
         Comprehensive task decomposition with extraction, expansion, and validation.
 
-        This is the main entry point that orchestrates the 3-phase approach:
+        This is the main entry point that orchestrates the multi-phase approach:
         1. Extract ALL steps from the detailed prompt
+        1b. Filter non-executable documentation sections (v3.2.2 Fix A)
         2. Expand each step into a detailed execution plan
+        2b. Sanitize dependencies to guarantee valid DAG (v3.2.2 Fix B)
         3. Validate each plan against the original
 
         v3.2.1: No artificial timeouts. Each LLM call uses invoke_resilient()
         which retries with exponential backoff through transient failures.
         The only hard limit is the 3-day SLURM node window.
+
+        v3.2.2: Fixes A+B prevent the "all tasks blocked" deadlock by
+        filtering documentation sections before expansion and sanitizing
+        dependencies after expansion.
         """
         # Initialize document
         self.initialize_document(main_task)
@@ -977,17 +1331,27 @@ IMPORTANT: Your expanded_plan should be DETAILED and COMPREHENSIVE. Do not summa
         # PHASE 1: EXTRACTION
         # =====================================================================
         print("\n  Phase 1: Extracting steps from prompt...")
-        extracted_steps = self._extract_steps_from_prompt(main_task)
+        raw_extracted_steps = self._extract_steps_from_prompt(main_task)
+        print(f"    Found {len(raw_extracted_steps)} raw steps")
 
-        # Store in master document
-        self.master_document.extracted_steps = extracted_steps
+        # =====================================================================
+        # PHASE 1b: FILTER NON-EXECUTABLE SECTIONS (v3.2.2 Fix A)
+        # =====================================================================
+        extracted_steps, filtered_steps = self._filter_executable_steps(raw_extracted_steps)
+
+        # Store both in master document for auditability
+        self.master_document.extracted_steps = raw_extracted_steps
 
         agent_logger.log_reflection(
             agent_name=self.agent_id,
             task_id="extraction",
-            reflection=f"Extracted {len(extracted_steps)} steps from prompt"
+            reflection=(
+                f"Extracted {len(raw_extracted_steps)} raw steps, "
+                f"filtered to {len(extracted_steps)} executable "
+                f"({len(filtered_steps)} documentation sections removed)"
+            )
         )
-        print(f"    Found {len(extracted_steps)} steps")
+        print(f"    → {len(extracted_steps)} executable steps for expansion")
 
         # =====================================================================
         # PHASE 2: EXPANSION (no artificial timeout — retries handle failures)
@@ -1071,6 +1435,17 @@ IMPORTANT: Your expanded_plan should be DETAILED and COMPREHENSIVE. Do not summa
             }
 
             subtasks.append(subtask)
+
+        # =====================================================================
+        # PHASE 2b: DEPENDENCY SANITIZATION (v3.2.2 Fix B)
+        # =====================================================================
+        print("\n  Phase 2b: Sanitizing dependencies...")
+        subtasks = self._sanitize_dependencies(subtasks)
+
+        # =====================================================================
+        # Register in document and save (AFTER sanitization)
+        # =====================================================================
+        for subtask in subtasks:
             self._register_subtask_in_document(subtask)
 
         # Save document
@@ -1080,6 +1455,11 @@ IMPORTANT: Your expanded_plan should be DETAILED and COMPREHENSIVE. Do not summa
         gpu_count = sum(1 for s in subtasks if s.get('requires_gpu'))
         if gpu_count:
             print(f"    ({gpu_count} GPU, {len(subtasks) - gpu_count} CPU)")
+
+        # Print dependency chain for visibility
+        for s in subtasks:
+            deps_str = ', '.join(s['dependencies']) if s['dependencies'] else '(none)'
+            print(f"    {s['id']}: {s['title'][:40]}  deps=[{deps_str}]")
 
         agent_logger.log_task_start(
             agent_name=self.agent_id,
