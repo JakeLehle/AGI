@@ -42,6 +42,20 @@ Environment Variables:
 - AGI_CLUSTER: Cluster profile for subtask SLURM settings
 - AGI_CLUSTER_CONFIG: Path to cluster_config.yaml
 - OLLAMA_MODEL: Model override (used by resolve_model)
+
+v3.2.2 Updates:
+- FIX D: Deadlock detection and recovery in route_execution_mode().
+  When identify_parallel_tasks() returns status='blocked' (no tasks ready,
+  but pending tasks remain), the router now calls _break_deadlock() which:
+    1. Strips deps pointing to failed/non-existent task IDs
+    2. Force-completes non-executable tasks (documentation sections that
+       slipped past Fix A's filter in master_agent.py)
+    3. Re-evaluates which tasks are now ready
+    4. If tasks were unblocked, routes to sequential/parallel execution
+    5. If still deadlocked after recovery, exits with status='deadlocked'
+       (not 'completed') so the report clearly shows the failure mode
+  This is a safety net — Fixes A+B in master_agent.py prevent the root
+  cause (bad deps / non-executable steps), but Fix D catches edge cases.
 """
 
 from typing import TypedDict, Annotated, List, Dict, Any, Optional
@@ -177,7 +191,7 @@ class WorkflowState(TypedDict):
 
 class MultiAgentWorkflow:
     """
-    LangGraph workflow v3.2.1 with script-first architecture and reflexion memory.
+    LangGraph workflow v3.2.2 with script-first architecture and reflexion memory.
 
     Key features:
     - Token-based context limits (configurable via environment)
@@ -188,6 +202,7 @@ class MultiAgentWorkflow:
     - Reflexion Memory for semantic duplicate detection
     - v3.2: Cluster configuration, conda cleanup, GPU-aware batching
     - v3.2.1: Modular model config via resolve_model() — no hardcoded names
+    - v3.2.2: Deadlock detection/recovery in router (Fix D safety net)
     """
 
     # Token limits — read from environment or use defaults matching config.yaml
@@ -266,7 +281,7 @@ class MultiAgentWorkflow:
 
         # Log configuration
         logger.info(
-            f"MultiAgentWorkflow v3.2.1 initialized: "
+            f"MultiAgentWorkflow v3.2.2 initialized: "
             f"model={self.ollama_model}, "
             f"tokens={self.MAX_CONTEXT_TOKENS}/{self.MAX_TOOL_OUTPUT_TOKENS}/{self.MIN_TOKENS_TO_CONTINUE}, "
             f"slurm={self.use_slurm}, "
@@ -895,20 +910,45 @@ class MultiAgentWorkflow:
         return {"master_decision": decision}
 
     def generate_final_report(self, state: WorkflowState) -> Dict:
-        """Generate final execution report"""
+        """Generate final execution report.
+
+        v3.2.2 Fix D: Now reports 'deadlocked' status when the pipeline
+        exits due to unrecoverable dependency cycles, instead of the
+        misleading 'completed' status from v3.2.1.
+        """
         completed = state.get('completed_subtasks', [])
         failed = state.get('failed_subtasks', [])
+        is_deadlocked = state.get('status') == 'deadlocked'
 
         # v3.2: Collect GPU/CPU routing stats
         all_subtasks = state.get('subtasks', [])
         gpu_tasks = [s for s in all_subtasks if s.get('requires_gpu')]
         cpu_tasks = [s for s in all_subtasks if not s.get('requires_gpu')]
 
+        # v3.2.2: Count blocked tasks (pending with unsatisfied deps)
+        blocked_tasks = [s for s in all_subtasks
+                         if s.get('status', 'pending') == 'pending']
+
+        # Determine final status string
+        if is_deadlocked:
+            final_status = "DEADLOCKED"
+            status_emoji = "⚠"
+        elif failed:
+            final_status = "PARTIAL"
+            status_emoji = "⚠"
+        elif len(completed) == len(all_subtasks):
+            final_status = "SUCCESS"
+            status_emoji = "✓"
+        else:
+            final_status = "COMPLETED"
+            status_emoji = "✓"
+
         # Build report
         report = f"""
 # AGI Pipeline Execution Report
 
 Generated: {datetime.now().isoformat()}
+Status: {status_emoji} {final_status}
 Model: {self.ollama_model}
 Cluster: {os.environ.get('AGI_CLUSTER', 'unknown')}
 Token Budget: {self.MAX_CONTEXT_TOKENS}/{self.MAX_TOOL_OUTPUT_TOKENS}/{self.MIN_TOKENS_TO_CONTINUE} (context/tool/min)
@@ -918,17 +958,44 @@ Token Budget: {self.MAX_CONTEXT_TOKENS}/{self.MAX_TOOL_OUTPUT_TOKENS}/{self.MIN_
 - **Total Subtasks**: {len(all_subtasks)}
 - **Completed**: {len(completed)}
 - **Failed**: {len(failed)}
+- **Blocked**: {len(blocked_tasks)}
 - **Success Rate**: {len(completed) / max(len(all_subtasks), 1) * 100:.1f}%
 - **GPU Tasks**: {len(gpu_tasks)} ({len([s for s in gpu_tasks if s.get('status') == 'completed'])} completed)
 - **CPU Tasks**: {len(cpu_tasks)} ({len([s for s in cpu_tasks if s.get('status') == 'completed'])} completed)
 
-## Task Details
+"""
+
+        # v3.2.2: Deadlock section
+        if is_deadlocked:
+            report += """## ⚠ DEADLOCK DETECTED
+
+The pipeline exited because all remaining tasks have unsatisfied
+dependencies that cannot be resolved. This typically means:
+1. Circular dependencies in the task graph (Fix B should prevent this)
+2. Non-executable documentation sections blocking real tasks (Fix A should prevent this)
+3. A dependency references a task that was never created
+
+### Blocked Tasks
 
 """
+            for st in blocked_tasks:
+                deps = st.get('dependencies', [])
+                report += f"- **{st['id']}**: deps={deps}, title: {st.get('title', 'N/A')[:80]}\n"
+
+            report += "\n### Recommended Actions\n\n"
+            report += "1. Check `reports/master_prompt_state.json` for the dependency graph\n"
+            report += "2. Verify Fix A filtered non-executable sections correctly\n"
+            report += "3. Verify Fix B sanitized the dependency DAG\n"
+            report += "4. Re-run with `--verbose` to see dependency chain at decomposition\n\n"
+
+        report += "## Task Details\n\n"
 
         for subtask in completed:
             gpu_flag = " [GPU]" if subtask.get('requires_gpu') else ""
-            report += f"### ✓ {subtask['id']}{gpu_flag}\n"
+            note = ""
+            if subtask.get('completion_note') == 'force_completed_by_deadlock_recovery':
+                note = " *(force-completed by deadlock recovery)*"
+            report += f"### ✓ {subtask['id']}{gpu_flag}{note}\n"
             report += f"{subtask.get('description', 'No description')[:200]}\n\n"
 
         for subtask in failed:
@@ -936,6 +1003,12 @@ Token Budget: {self.MAX_CONTEXT_TOKENS}/{self.MAX_TOOL_OUTPUT_TOKENS}/{self.MIN_
             report += f"### ✗ {subtask['id']}{gpu_flag}\n"
             report += f"{subtask.get('description', 'No description')[:200]}\n"
             report += f"**Error**: {subtask.get('last_result', {}).get('error', 'Unknown')[:500]}\n\n"
+
+        for subtask in blocked_tasks:
+            gpu_flag = " [GPU]" if subtask.get('requires_gpu') else ""
+            report += f"### ⊘ {subtask['id']}{gpu_flag} (BLOCKED)\n"
+            report += f"{subtask.get('description', 'No description')[:200]}\n"
+            report += f"**Deps**: {subtask.get('dependencies', [])}\n\n"
 
         # Add reflexion memory summary
         if self.use_reflexion_memory:
@@ -980,7 +1053,7 @@ Token Budget: {self.MAX_CONTEXT_TOKENS}/{self.MAX_TOOL_OUTPUT_TOKENS}/{self.MIN_
 
         return {
             "final_report": report,
-            "status": "completed"
+            "status": "deadlocked" if is_deadlocked else "completed"
         }
 
     def cleanup(self, state: WorkflowState) -> Dict:
@@ -999,13 +1072,65 @@ Token Budget: {self.MAX_CONTEXT_TOKENS}/{self.MAX_TOOL_OUTPUT_TOKENS}/{self.MIN_
     # ==================== Routing Functions ====================
 
     def route_execution_mode(self, state: WorkflowState) -> str:
-        """Route based on execution mode"""
+        """Route based on execution mode with deadlock detection.
+
+        v3.2.2 Fix D: When status='blocked' (all pending tasks have unsatisfied
+        deps), the old code fell through to 'complete' — silently exiting with
+        0 completed, 0 failed. Now we:
+        1. Attempt deadlock recovery via _break_deadlock()
+        2. If recovery unblocks tasks, route to sequential/parallel
+        3. If truly deadlocked, report 'deadlocked' status (not 'completed')
+        """
         batch = state.get('parallel_batch', [])
         current = state.get('current_subtask')
         status = state.get('status', '')
 
         if status == 'all_tasks_processed':
             decision = "complete"
+
+        elif status == 'blocked':
+            # ── FIX D: Deadlock detection and recovery ────────────────
+            print("\n⚠ DEADLOCK DETECTED: All pending tasks have unsatisfied dependencies")
+            agent_logger.log_workflow_event("deadlock_detected", {
+                "pending_count": len([s for s in state.get('subtasks', [])
+                                      if s.get('status', 'pending') == 'pending']),
+                "completed_count": len([s for s in state.get('subtasks', [])
+                                        if s.get('status') == 'completed']),
+                "failed_count": len([s for s in state.get('subtasks', [])
+                                     if s.get('status') == 'failed']),
+            })
+
+            recovery = self._break_deadlock(state)
+
+            if recovery['unblocked']:
+                # Recovery succeeded — route the unblocked tasks
+                unblocked = recovery['ready_tasks']
+                print(f"  ✓ Deadlock broken: {len(unblocked)} task(s) unblocked")
+                agent_logger.log_workflow_event("deadlock_recovered", {
+                    "unblocked_tasks": [t['id'] for t in unblocked],
+                    "actions_taken": recovery.get('actions', []),
+                })
+
+                if self.parallel_enabled and self.use_slurm and len(unblocked) > 1:
+                    state['parallel_batch'] = unblocked
+                    state['current_subtask'] = None
+                    decision = "parallel"
+                else:
+                    state['current_subtask'] = unblocked[0]
+                    state['parallel_batch'] = []
+                    decision = "sequential"
+            else:
+                # True deadlock — cannot recover
+                print("  ✗ UNRECOVERABLE DEADLOCK: Cannot break dependency cycle")
+                print(f"    Actions attempted: {recovery.get('actions', [])}")
+                agent_logger.log_workflow_event("deadlock_unrecoverable", {
+                    "actions_attempted": recovery.get('actions', []),
+                    "remaining_tasks": recovery.get('remaining_blocked', []),
+                })
+                # Set status so generate_report knows this was a deadlock
+                state['status'] = 'deadlocked'
+                decision = "complete"
+
         elif batch and len(batch) > 1:
             decision = "parallel"
         elif current or (batch and len(batch) == 1):
@@ -1026,6 +1151,205 @@ Token Budget: {self.MAX_CONTEXT_TOKENS}/{self.MAX_TOOL_OUTPUT_TOKENS}/{self.MIN_
         })
 
         return decision
+
+    def _break_deadlock(self, state: WorkflowState) -> Dict[str, Any]:
+        """Attempt to recover from a dependency deadlock.
+
+        v3.2.2 Fix D: Safety net for when identify_parallel_tasks() returns
+        status='blocked'. This should rarely trigger if Fix A (filter
+        non-executable steps) and Fix B (sanitize dependencies) in
+        master_agent.py are working correctly.
+
+        Recovery strategies (applied in order):
+        1. Strip deps pointing to failed task IDs (those tasks won't complete)
+        2. Strip deps pointing to non-existent task IDs (bad LLM output)
+        3. Force-complete non-executable tasks (doc sections that slipped
+           through Fix A's filter — detected by: no code_hints, no packages,
+           title matches documentation patterns)
+        4. After each strategy, re-check if any tasks are now ready
+
+        Returns:
+            {
+                'unblocked': bool,
+                'ready_tasks': List[Dict],  # tasks now ready to execute
+                'actions': List[str],       # what recovery actions were taken
+                'remaining_blocked': List[str],  # task IDs still blocked
+            }
+        """
+        subtasks = state.get('subtasks', [])
+        actions = []
+
+        # Build lookup sets
+        all_task_ids = {st['id'] for st in subtasks}
+        completed_ids = {st['id'] for st in subtasks
+                        if st.get('status') == 'completed'}
+        failed_ids = {st['id'] for st in subtasks
+                      if st.get('status') == 'failed'}
+        pending = [st for st in subtasks
+                   if st.get('status', 'pending') == 'pending']
+
+        if not pending:
+            return {
+                'unblocked': False,
+                'ready_tasks': [],
+                'actions': ['no_pending_tasks'],
+                'remaining_blocked': [],
+            }
+
+        # ── Strategy 1: Strip deps on failed tasks ────────────────────
+        # If a dependency has already failed, waiting on it is pointless.
+        # Remove it so downstream tasks can attempt execution.
+        stripped_failed = 0
+        for st in pending:
+            deps = st.get('dependencies', [])
+            original_len = len(deps)
+            cleaned = [d for d in deps if d not in failed_ids]
+            if len(cleaned) < original_len:
+                st['dependencies'] = cleaned
+                stripped_failed += (original_len - len(cleaned))
+                print(f"    → {st['id']}: stripped {original_len - len(cleaned)} "
+                      f"failed dep(s): {set(deps) & failed_ids}")
+
+        if stripped_failed > 0:
+            actions.append(f"stripped_{stripped_failed}_failed_deps")
+
+        # ── Strategy 2: Strip deps on non-existent task IDs ───────────
+        # LLM may have generated deps like "step_15" when only step_1..7 exist.
+        stripped_invalid = 0
+        for st in pending:
+            deps = st.get('dependencies', [])
+            original_len = len(deps)
+            cleaned = [d for d in deps if d in all_task_ids]
+            if len(cleaned) < original_len:
+                invalid = set(deps) - all_task_ids
+                st['dependencies'] = cleaned
+                stripped_invalid += (original_len - len(cleaned))
+                print(f"    → {st['id']}: stripped {original_len - len(cleaned)} "
+                      f"invalid dep(s): {invalid}")
+
+        if stripped_invalid > 0:
+            actions.append(f"stripped_{stripped_invalid}_invalid_deps")
+
+        # Check if strategies 1+2 unblocked anything
+        ready = self._find_ready_tasks(subtasks)
+        if ready:
+            return {
+                'unblocked': True,
+                'ready_tasks': ready,
+                'actions': actions,
+                'remaining_blocked': [],
+            }
+
+        # ── Strategy 3: Force-complete non-executable tasks ───────────
+        # Documentation sections that slipped past Fix A's filter.
+        # These have no code to execute — mark them completed so they
+        # stop blocking downstream tasks.
+        DOC_PATTERNS = [
+            r'(?i)expected\s*output', r'(?i)success\s*criteria',
+            r'(?i)notes?\b', r'(?i)dependencies\b',
+            r'(?i)anndata\s*structure', r'(?i)environment\b',
+            r'(?i)input\s*files?\b', r'(?i)output\s*files?\b',
+            r'(?i)important\s*considerations',
+        ]
+
+        force_completed = 0
+        for st in list(pending):  # copy list since we modify status
+            title = st.get('title', '')
+            code_hints = st.get('code_hints', [])
+            packages = st.get('packages', [])
+            description = st.get('description', '')
+
+            # Heuristic: non-executable if no code hints, no packages,
+            # and title matches a documentation pattern
+            is_doc = False
+            if not code_hints and not packages:
+                for pattern in DOC_PATTERNS:
+                    if re.search(pattern, title):
+                        is_doc = True
+                        break
+                # Also catch very short descriptions with no procedural content
+                if not is_doc and len(description) < 100:
+                    procedural_verbs = [
+                        'run', 'execute', 'compute', 'generate', 'create',
+                        'load', 'save', 'write', 'read', 'process', 'train',
+                        'cluster', 'annotate', 'plot', 'visualize', 'filter',
+                    ]
+                    has_verb = any(v in description.lower()
+                                  for v in procedural_verbs)
+                    if not has_verb:
+                        is_doc = True
+
+            if is_doc:
+                st['status'] = 'completed'
+                st['completion_note'] = 'force_completed_by_deadlock_recovery'
+                completed_ids.add(st['id'])
+                force_completed += 1
+                print(f"    → {st['id']}: force-completed "
+                      f"(non-executable: '{title[:50]}')")
+
+        if force_completed > 0:
+            actions.append(f"force_completed_{force_completed}_doc_tasks")
+
+        # Re-check after force-completing
+        ready = self._find_ready_tasks(subtasks)
+        if ready:
+            return {
+                'unblocked': True,
+                'ready_tasks': ready,
+                'actions': actions,
+                'remaining_blocked': [],
+            }
+
+        # ── Strategy 4: Last resort — force first pending task to have no deps
+        # This breaks the cycle at an arbitrary point, letting at least one
+        # task attempt execution. Only used if all else fails.
+        still_pending = [st for st in subtasks
+                         if st.get('status', 'pending') == 'pending']
+        if still_pending:
+            victim = still_pending[0]
+            old_deps = victim.get('dependencies', [])
+            victim['dependencies'] = []
+            actions.append(f"forced_root_{victim['id']}_cleared_{len(old_deps)}_deps")
+            print(f"    → {victim['id']}: forced to root (cleared deps: {old_deps})")
+
+            ready = self._find_ready_tasks(subtasks)
+            if ready:
+                return {
+                    'unblocked': True,
+                    'ready_tasks': ready,
+                    'actions': actions,
+                    'remaining_blocked': [
+                        st['id'] for st in subtasks
+                        if st.get('status', 'pending') == 'pending'
+                        and st['id'] not in {r['id'] for r in ready}
+                    ],
+                }
+
+        # Truly unrecoverable
+        return {
+            'unblocked': False,
+            'ready_tasks': [],
+            'actions': actions,
+            'remaining_blocked': [st['id'] for st in subtasks
+                                  if st.get('status', 'pending') == 'pending'],
+        }
+
+    def _find_ready_tasks(self, subtasks: List[Dict]) -> List[Dict]:
+        """Find pending tasks whose dependencies are all satisfied.
+
+        Helper for _break_deadlock() — same logic as identify_parallel_tasks()
+        but without modifying state or batching.
+        """
+        completed_ids = {st['id'] for st in subtasks
+                        if st.get('status') == 'completed'}
+        ready = []
+        for st in subtasks:
+            if st.get('status', 'pending') != 'pending':
+                continue
+            deps = set(st.get('dependencies', []))
+            if deps.issubset(completed_ids):
+                ready.append(st)
+        return ready
 
     def route_after_execution(self, state: WorkflowState) -> str:
         """Route after execution"""
