@@ -22,6 +22,18 @@ v3.2.1 Updates:
   backoff retry. Survives transient Ollama 500 errors from memory pressure.
 - No artificial timeouts. The 3-day SLURM wall time is the only hard limit.
 
+v3.2.2 Updates:
+- FIX C: Pip fallback for conda packages. _generate_env_yaml() now:
+  1. Parses code_hints from user prompt for explicit pip: sections
+  2. Maintains a KNOWN_PIP_ONLY set for packages not on conda-forge/bioconda
+     (popv, celltypist, scvi-tools, decoupler, episcanpy, etc.)
+  3. Routes packages to pip or conda deps correctly in the generated YAML
+- _create_conda_environment() now has a pip retry fallback: if conda env
+  create fails, it parses failed packages from stderr and retries them
+  individually with pip install inside the (partially created) environment.
+- These changes prevent the "conda install popv" failure that blocked all
+  downstream steps in the slide-TCR-seq pipeline.
+
 Flow:
 1. Load cluster config (arc_compute1, arc_gpu1v100, etc.)
 2. Route task to GPU or CPU cluster based on packages/metadata
@@ -346,7 +358,7 @@ class TaskCheckpoint:
 
 class ScriptFirstSubAgentV3:
     """
-    Complete SubAgent v3.2.1 with dual cluster routing, cleanup, and resume.
+    Complete SubAgent v3.2.2 with dual cluster routing, cleanup, and resume.
 
     v3.2.1 — No hardcoded model names. Model resolved via
     utils.model_config.resolve_model() with priority:
@@ -354,6 +366,10 @@ class ScriptFirstSubAgentV3:
       2. OLLAMA_MODEL environment variable (from RUN script)
       3. config.yaml → ollama.model
       4. Fallback constant in utils/model_config.py
+
+    v3.2.2 — Fix C: Pip fallback for conda packages. Parses code_hints
+    for pip: sections, maintains known pip-only package list, and retries
+    failed conda packages with pip inside the environment.
 
     All LLM calls use invoke_resilient() with exponential backoff retry.
     No artificial timeouts — the 3-day SLURM wall time is the only limit.
@@ -766,16 +782,67 @@ class ScriptFirstSubAgentV3:
         }
 
     def _generate_env_yaml(self, subtask: Dict, env_name: str) -> str:
-        """Generate conda environment YAML with open-source channels only."""
+        """Generate conda environment YAML with intelligent pip routing.
+
+        v3.2.2 Fix C: The original implementation routed ALL packages to
+        conda deps, causing failures for pip-only packages like popv,
+        celltypist, and scvi-tools that are not available on conda-forge
+        or bioconda. This version:
+
+        1. Parses code_hints from the user's prompt for explicit pip: sections
+        2. Checks against KNOWN_PIP_ONLY set for packages not on conda channels
+        3. Routes git URLs and / paths to pip (unchanged from v3.2.1)
+        4. Everything else goes to conda deps (unchanged from v3.2.1)
+
+        Open-source channels only (no defaults/main - commercial license).
+        """
+        # ── Known pip-only packages ───────────────────────────────────────
+        # These are NOT available on conda-forge or bioconda and MUST be
+        # installed via pip. This list should be expanded as needed.
+        KNOWN_PIP_ONLY = {
+            'popv', 'celltypist', 'decoupler', 'episcanpy',
+            'scanpy-scripts', 'scvi-tools', 'scvi', 'scvelo',
+            'cellbender', 'cellxgene-census', 'cellxgene',
+            'pertpy', 'muon', 'moscot', 'squidpy',
+            'cell2location', 'tangram-sc', 'stereopy',
+            'commot', 'spatialdm', 'stlearn',
+        }
+
         packages = subtask.get('packages', [])
-        deps = ['python>=3.10']
+        code_hints = subtask.get('code_hints', [])
+
+        # Extract pip packages specified in user's prompt code hints
+        pip_from_hints = self._extract_pip_packages_from_hints(code_hints)
+
+        conda_deps = ['python>=3.10']
         pip_pkgs = []
 
         for pkg in packages:
+            # Strip version specifiers for matching (keep for output)
+            pkg_name = re.split(r'[><=!~]', pkg)[0].strip().lower()
+
             if '/' in pkg or pkg.startswith('git+'):
+                # Git URLs and paths always go to pip
+                pip_pkgs.append(pkg)
+            elif pkg_name in KNOWN_PIP_ONLY:
+                # Known pip-only packages
+                pip_pkgs.append(pkg)
+            elif pkg_name in pip_from_hints:
+                # User explicitly specified this as a pip package
                 pip_pkgs.append(pkg)
             else:
-                deps.append(pkg)
+                # Default: conda dependency
+                conda_deps.append(pkg)
+
+        # Also add any pip-from-hints packages not already in the list
+        for hint_pkg in pip_from_hints:
+            if hint_pkg not in [re.split(r'[><=!~]', p)[0].strip().lower()
+                                for p in pip_pkgs]:
+                # Check if it's already in conda_deps
+                conda_names = [re.split(r'[><=!~]', d)[0].strip().lower()
+                               for d in conda_deps]
+                if hint_pkg not in conda_names:
+                    pip_pkgs.append(hint_pkg)
 
         # Open-source channels only (no defaults/main - commercial license)
         lines = [
@@ -786,7 +853,7 @@ class ScriptFirstSubAgentV3:
             "  - nodefaults",
             "dependencies:",
         ]
-        for d in deps:
+        for d in conda_deps:
             lines.append(f"  - {d}")
 
         if pip_pkgs:
@@ -794,7 +861,71 @@ class ScriptFirstSubAgentV3:
             for p in pip_pkgs:
                 lines.append(f"    - {p}")
 
+        # Log routing decisions for debugging
+        if pip_pkgs:
+            agent_logger.log_reflection(
+                agent_name=self.agent_id,
+                task_id="env_yaml",
+                reflection=(
+                    f"Env {env_name}: "
+                    f"{len(conda_deps)-1} conda deps, "
+                    f"{len(pip_pkgs)} pip deps "
+                    f"(pip: {', '.join(pip_pkgs[:5])})"
+                )
+            )
+
         return '\n'.join(lines) + '\n'
+
+    def _extract_pip_packages_from_hints(
+        self, code_hints: List[str]
+    ) -> set:
+        """Parse code_hints for explicit pip package specifications.
+
+        v3.2.2 Fix C: User prompts often contain conda YAML snippets like:
+
+            dependencies:
+              - scanpy>=1.9.0
+              - pip
+              - pip:
+                - popv>=0.9.0
+
+        This method extracts packages listed under 'pip:' sections in any
+        code hint block, returning them as a set of lowercase package names
+        (without version specifiers) for matching.
+        """
+        pip_packages = set()
+
+        for hint in code_hints:
+            # Strategy 1: Parse as YAML if possible
+            if yaml and ('pip:' in hint or 'pip :' in hint):
+                try:
+                    parsed = yaml.safe_load(hint)
+                    if isinstance(parsed, dict):
+                        deps = parsed.get('dependencies', [])
+                        for dep in deps:
+                            if isinstance(dep, dict) and 'pip' in dep:
+                                for pip_pkg in dep['pip']:
+                                    name = re.split(r'[><=!~]', str(pip_pkg))[0].strip().lower()
+                                    if name:
+                                        pip_packages.add(name)
+                except Exception:
+                    pass
+
+            # Strategy 2: Regex fallback for pip: sections
+            # Matches indented items after a "- pip:" or "pip:" line
+            pip_section = re.search(
+                r'(?:^|\n)\s*-?\s*pip\s*:\s*\n((?:\s+- .+\n?)+)',
+                hint, re.MULTILINE
+            )
+            if pip_section:
+                for line in pip_section.group(1).split('\n'):
+                    line = line.strip().lstrip('- ').strip()
+                    if line:
+                        name = re.split(r'[><=!~]', line)[0].strip().lower()
+                        if name and name != 'pip':
+                            pip_packages.add(name)
+
+        return pip_packages
 
     def _generate_python_script(self, subtask: Dict) -> Dict[str, Any]:
         """Generate the Python script for this subtask.
@@ -1016,6 +1147,14 @@ print(f"[MODE] DRY_RUN={{DRY_RUN}}, PROJECT_ROOT={{PROJECT_ROOT}}")
     # =========================================================================
 
     def _create_conda_environment(self) -> Dict[str, Any]:
+        """Create conda environment from YAML with pip fallback.
+
+        v3.2.2 Fix C: If conda env create fails (e.g., a package like popv
+        is not on conda-forge), this method now:
+        1. Attempts to create a minimal env without the failing packages
+        2. Retries failed packages individually with pip install
+        3. Reports which packages were installed via pip fallback
+        """
         if not self.checkpoint or not self.checkpoint.env_yaml_path:
             return {'success': False, 'error': 'No env yaml'}
 
@@ -1026,6 +1165,7 @@ print(f"[MODE] DRY_RUN={{DRY_RUN}}, PROJECT_ROOT={{PROJECT_ROOT}}")
             return {'success': False, 'error': f'YAML not found: {env_yaml}'}
 
         try:
+            # Check if env already exists
             result = subprocess.run(
                 ['conda', 'env', 'list'],
                 capture_output=True, text=True, timeout=60
@@ -1033,6 +1173,7 @@ print(f"[MODE] DRY_RUN={{DRY_RUN}}, PROJECT_ROOT={{PROJECT_ROOT}}")
             if env_name in result.stdout:
                 return {'success': True, 'already_exists': True}
 
+            # Try creating the full environment
             result = subprocess.run(
                 ['conda', 'env', 'create', '-f', str(env_yaml), '-n', env_name],
                 capture_output=True, text=True, timeout=600
@@ -1040,9 +1181,213 @@ print(f"[MODE] DRY_RUN={{DRY_RUN}}, PROJECT_ROOT={{PROJECT_ROOT}}")
 
             if result.returncode == 0 or 'already exists' in result.stderr:
                 return {'success': True}
-            return {'success': False, 'error': result.stderr[:500]}
+
+            # ── Conda failed — attempt pip fallback ───────────────────────
+            stderr = result.stderr
+            print(f"  ⚠ Conda env create failed, attempting pip fallback...")
+            agent_logger.log_reflection(
+                agent_name=self.agent_id,
+                task_id="conda_fallback",
+                reflection=f"Conda env create failed: {stderr[:300]}"
+            )
+
+            # Parse which packages failed from stderr
+            failed_pkgs = self._parse_failed_conda_packages(stderr, env_yaml)
+
+            if not failed_pkgs:
+                # Can't determine what failed — return original error
+                return {'success': False, 'error': stderr[:500]}
+
+            # Create a stripped YAML without the failing packages
+            stripped_yaml = self._create_stripped_yaml(env_yaml, failed_pkgs)
+            if stripped_yaml:
+                stripped_path = env_yaml.with_suffix('.stripped.yml')
+                stripped_path.write_text(stripped_yaml)
+
+                # Try creating env with stripped YAML
+                result2 = subprocess.run(
+                    ['conda', 'env', 'create', '-f', str(stripped_path),
+                     '-n', env_name],
+                    capture_output=True, text=True, timeout=600
+                )
+
+                if result2.returncode != 0 and 'already exists' not in result2.stderr:
+                    return {
+                        'success': False,
+                        'error': f"Stripped env also failed: {result2.stderr[:300]}"
+                    }
+
+            # Now pip install the failed packages into the env
+            pip_installed = []
+            pip_failed = []
+            for pkg in failed_pkgs:
+                pip_result = subprocess.run(
+                    ['conda', 'run', '-n', env_name,
+                     'pip', 'install', pkg],
+                    capture_output=True, text=True, timeout=300
+                )
+                if pip_result.returncode == 0:
+                    pip_installed.append(pkg)
+                    print(f"    ✓ pip installed: {pkg}")
+                else:
+                    pip_failed.append(pkg)
+                    print(f"    ✗ pip failed: {pkg}")
+
+            if pip_failed:
+                agent_logger.log_reflection(
+                    agent_name=self.agent_id,
+                    task_id="conda_fallback",
+                    reflection=(
+                        f"Pip fallback partial: "
+                        f"installed={pip_installed}, failed={pip_failed}"
+                    )
+                )
+                return {
+                    'success': False,
+                    'error': (
+                        f"Pip fallback failed for: {', '.join(pip_failed)}. "
+                        f"Installed via pip: {', '.join(pip_installed)}"
+                    )
+                }
+
+            agent_logger.log_reflection(
+                agent_name=self.agent_id,
+                task_id="conda_fallback",
+                reflection=(
+                    f"Pip fallback succeeded: {', '.join(pip_installed)}"
+                )
+            )
+            return {
+                'success': True,
+                'pip_fallback': pip_installed,
+            }
+
         except Exception as e:
             return {'success': False, 'error': str(e)}
+
+    def _parse_failed_conda_packages(
+        self, stderr: str, env_yaml_path: Path
+    ) -> List[str]:
+        """Extract package names that caused conda env create to fail.
+
+        Parses common conda error patterns:
+        - "PackagesNotFoundError: The following packages are not available..."
+        - "ResolvePackageNotFound: ..."
+        - "Nothing provides <pkg> needed by ..."
+        - "UnsatisfiableError: ..."
+        """
+        failed = []
+
+        # Pattern 1: PackagesNotFoundError / ResolvePackageNotFound
+        not_found = re.findall(
+            r'[-–]\s*([a-zA-Z0-9_\-]+(?:[><=!]+\S*)?)',
+            stderr
+        )
+        # Filter to only actual package names (not flags or noise)
+        for pkg in not_found:
+            name = re.split(r'[><=!~]', pkg)[0].strip()
+            if name and len(name) > 1 and not name.startswith('-'):
+                if name.lower() not in {'the', 'following', 'packages', 'not',
+                                         'available', 'from', 'current', 'channels'}:
+                    failed.append(name)
+
+        # Pattern 2: "nothing provides <pkg>"
+        nothing_provides = re.findall(
+            r'nothing provides\s+([a-zA-Z0-9_\-]+)', stderr, re.IGNORECASE
+        )
+        failed.extend(nothing_provides)
+
+        # Pattern 3: If we can read the YAML, cross-ref with known pip-only
+        if not failed and env_yaml_path.exists():
+            try:
+                content = env_yaml_path.read_text()
+                if yaml:
+                    parsed = yaml.safe_load(content)
+                    deps = parsed.get('dependencies', [])
+                    for dep in deps:
+                        if isinstance(dep, str):
+                            name = re.split(r'[><=!~]', dep)[0].strip().lower()
+                            # Check against the known pip-only set
+                            KNOWN_PIP_ONLY = {
+                                'popv', 'celltypist', 'decoupler', 'episcanpy',
+                                'scanpy-scripts', 'scvi-tools', 'scvi', 'scvelo',
+                                'cellbender', 'cellxgene-census', 'cellxgene',
+                                'pertpy', 'muon', 'moscot', 'squidpy',
+                                'cell2location', 'tangram-sc', 'stereopy',
+                                'commot', 'spatialdm', 'stlearn',
+                            }
+                            if name in KNOWN_PIP_ONLY:
+                                failed.append(dep)
+            except Exception:
+                pass
+
+        # Deduplicate
+        seen = set()
+        unique = []
+        for pkg in failed:
+            name = re.split(r'[><=!~]', pkg)[0].strip().lower()
+            if name not in seen:
+                seen.add(name)
+                unique.append(pkg)
+
+        return unique
+
+    def _create_stripped_yaml(
+        self, original_yaml: Path, remove_packages: List[str]
+    ) -> Optional[str]:
+        """Create a copy of the env YAML with specified packages removed."""
+        try:
+            content = original_yaml.read_text()
+            remove_names = {
+                re.split(r'[><=!~]', p)[0].strip().lower()
+                for p in remove_packages
+            }
+
+            if yaml:
+                parsed = yaml.safe_load(content)
+                if not parsed or 'dependencies' not in parsed:
+                    return None
+
+                new_deps = []
+                for dep in parsed['dependencies']:
+                    if isinstance(dep, str):
+                        name = re.split(r'[><=!~]', dep)[0].strip().lower()
+                        if name not in remove_names:
+                            new_deps.append(dep)
+                    elif isinstance(dep, dict):
+                        # pip: section — also strip removed packages
+                        if 'pip' in dep:
+                            new_pip = [
+                                p for p in dep['pip']
+                                if re.split(r'[><=!~]', str(p))[0].strip().lower()
+                                not in remove_names
+                            ]
+                            if new_pip:
+                                new_deps.append({'pip': new_pip})
+                        else:
+                            new_deps.append(dep)
+
+                parsed['dependencies'] = new_deps
+                import io
+                buf = io.StringIO()
+                yaml.dump(parsed, buf, default_flow_style=False)
+                return buf.getvalue()
+            else:
+                # Fallback: line-by-line removal (no yaml module)
+                lines = content.split('\n')
+                filtered = []
+                for line in lines:
+                    skip = False
+                    for pkg_name in remove_names:
+                        if re.search(rf'^\s*-\s*{re.escape(pkg_name)}', line):
+                            skip = True
+                            break
+                    if not skip:
+                        filtered.append(line)
+                return '\n'.join(filtered)
+
+        except Exception:
+            return None
 
     def _cleanup_conda_environment(self) -> Dict[str, Any]:
         if not self.checkpoint or not self.checkpoint.env_name:
