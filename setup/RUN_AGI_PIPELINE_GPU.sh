@@ -11,10 +11,18 @@
 #SBATCH --error=slurm_logs/agi_%j.err
 
 ###############################################################################
-# AGI Multi-Agent Pipeline v3.2.1 - ARC GPU Submission Script
+# AGI Multi-Agent Pipeline v1.2.0 — ARC GPU Submission Script
 #
 # Runs the MASTER PIPELINE on an ARC GPU node for fast LLM inference.
 # Subtask scripts are submitted to CPU or GPU partitions as needed.
+#
+# v1.2.0 NEW FEATURES:
+# ---------------------
+#   - Diagnostic Agent: Cross-task error diagnosis with global solution memory
+#   - Diagnostic Memory: Persistent knowledge base of validated fixes
+#   - Disk Manager: Proactive disk monitoring and auto-cleanup
+#   - Bootstrap Solutions: Pre-seed known fixes on first run
+#   - Enhanced Context Manager: Diagnostic context injection
 #
 # MODEL RESOLUTION CHAIN (v3.2.1):
 # ---------------------------------
@@ -42,6 +50,9 @@
 #
 #   # Override model
 #   sbatch --export=ALL,OLLAMA_MODEL=llama3.1:70b setup/RUN_AGI_PIPELINE_GPU.sh
+#
+#   # Disable diagnostic agent (faster, no Mem0 overhead)
+#   sbatch --export=ALL,DIAGNOSTIC_AGENT_ENABLED=false setup/RUN_AGI_PIPELINE_GPU.sh
 #
 ###############################################################################
 
@@ -79,7 +90,7 @@ PROJECT_DIR="${PROJECT_DIR:-/work/sdz852/WORKING/slide-TCR-seq-working}"
 # AGI repository root (the code)
 AGI_ROOT="${AGI_ROOT:-/work/sdz852/WORKING/AGI}"
 
-# AGI data directory (reflexion memory storage)
+# AGI data directory (reflexion memory + diagnostic memory storage)
 AGI_DATA_DIR="${AGI_DATA_DIR:-/work/sdz852/agi_data}"
 
 # Conda environment for AGI pipeline
@@ -108,10 +119,10 @@ OLLAMA_MODEL="${OLLAMA_MODEL:-qwen3-coder:latest}"
 # Ollama context window — must match config.yaml → ollama.model_context_length
 OLLAMA_CONTEXT_LENGTH="${OLLAMA_CONTEXT_LENGTH:-32768}"
 
-# Embedding model for reflexion memory
+# Embedding model for reflexion memory + diagnostic memory
 EMBEDDING_MODEL="${EMBEDDING_MODEL:-nomic-embed-text}"
 
-# Enable reflexion memory
+# Enable reflexion memory (per-task retry loop prevention)
 USE_REFLEXION_MEMORY="${USE_REFLEXION_MEMORY:-true}"
 
 # ============================================================================
@@ -123,74 +134,120 @@ MAX_TOOL_OUTPUT_TOKENS="${MAX_TOOL_OUTPUT_TOKENS:-12000}"
 MIN_TOKENS_TO_CONTINUE="${MIN_TOKENS_TO_CONTINUE:-3000}"
 
 # ============================================================================
+# DIAGNOSTIC AGENT CONFIGURATION (v1.2.0 — NEW)
+# ============================================================================
+# The Diagnostic Agent provides cross-task error diagnosis with a global
+# solution memory. When a subtask fails, the diagnostic agent:
+#   1. Checks DiagnosticMemory for known solutions (instant fix)
+#   2. If no known fix, investigates the error systematically
+#   3. Stores validated fixes for future reuse across ALL tasks/projects
+#
+# DIAGNOSTIC_AGENT_ENABLED: Master switch for the diagnostic agent.
+#   - true (default): Enables diagnostic agent + diagnostic memory
+#   - false: Disables entirely (falls back to standard reflexion-only retry)
+#
+# DIAGNOSTIC_MAX_INVOCATIONS: Max diagnostic agent calls per subtask.
+#   Prevents runaway diagnostic loops. Each invocation = 1 LLM call.
+#   Default: 2 (investigate once, verify once)
+#
+# DIAGNOSTIC_TOKEN_BUDGET: Max tokens the diagnostic agent can consume
+#   per invocation from the subtask's context window.
+#   Default: 4000 (enough for error analysis + fix generation)
+#
+# DIAGNOSTIC_MEMORY_BOOTSTRAP: Seed the diagnostic memory with known
+#   solutions on first run (e.g., "celltypist is pip-only", "no --mem
+#   on GPU partitions"). Only runs once — subsequent runs skip if
+#   solutions already exist.
+#   - true (default): Bootstrap on first run
+#   - false: Start with empty knowledge base
+#
+# SOLUTION_MEMORY_THRESHOLD: Minimum semantic similarity (0.0–1.0) for
+#   a stored solution to be considered a "confident match". Lower values
+#   = more matches but less precision. Higher = fewer but more reliable.
+#   Default: 0.85
+# ============================================================================
+
+DIAGNOSTIC_AGENT_ENABLED="${DIAGNOSTIC_AGENT_ENABLED:-true}"
+DIAGNOSTIC_MAX_INVOCATIONS="${DIAGNOSTIC_MAX_INVOCATIONS:-2}"
+DIAGNOSTIC_TOKEN_BUDGET="${DIAGNOSTIC_TOKEN_BUDGET:-4000}"
+DIAGNOSTIC_MEMORY_BOOTSTRAP="${DIAGNOSTIC_MEMORY_BOOTSTRAP:-true}"
+SOLUTION_MEMORY_THRESHOLD="${SOLUTION_MEMORY_THRESHOLD:-0.85}"
+
+# ============================================================================
+# DISK MANAGER CONFIGURATION (v1.2.0 — NEW)
+# ============================================================================
+# The Disk Manager monitors user quota and proactively cleans up stale
+# conda environments, pip caches, and temp files before "Disk quota
+# exceeded" errors kill running jobs.
+#
+# DISK_MONITOR_ENABLED: Enable proactive disk monitoring.
+#   - true (default): Check disk before each subtask + auto-cleanup
+#   - false: No monitoring (rely on OS errors)
+#
+# DISK_LOW_SPACE_THRESHOLD_GB: Trigger cleanup when free space drops
+#   below this threshold (in GB). Set based on your /work quota.
+#   Default: 10 (10 GB remaining triggers cleanup)
+#
+# DISK_CLEANUP_STALE_ENVS: Auto-remove agi_* conda environments from
+#   previous pipeline runs that are no longer in use.
+#   - true (default): Clean up stale environments
+#   - false: Keep all environments (useful for debugging)
+#
+# DISK_CLEANUP_CONDA_CACHE: Run 'conda clean --all' when low on space.
+#   - true (default): Clean conda package cache
+#   - false: Preserve cache (faster re-installs but uses more space)
+# ============================================================================
+
+DISK_MONITOR_ENABLED="${DISK_MONITOR_ENABLED:-true}"
+DISK_LOW_SPACE_THRESHOLD_GB="${DISK_LOW_SPACE_THRESHOLD_GB:-10}"
+DISK_CLEANUP_STALE_ENVS="${DISK_CLEANUP_STALE_ENVS:-true}"
+DISK_CLEANUP_CONDA_CACHE="${DISK_CLEANUP_CONDA_CACHE:-true}"
+
+# ============================================================================
 # SUBTASK RESOURCE OVERRIDES (Optional)
 # ============================================================================
 # These override the cluster defaults for ALL subtasks.
 # Leave empty to use cluster config defaults.
 # Individual subtasks can still specify their own requirements.
 
-# Override partition for subtasks (leave empty for cluster default)
 SUBTASK_PARTITION="${SUBTASK_PARTITION:-}"
-
-# Override account for subtasks
 SUBTASK_ACCOUNT="${SUBTASK_ACCOUNT:-}"
-
-# Override time limit for subtasks
 SUBTASK_TIME="${SUBTASK_TIME:-}"
-
-# Override memory for subtasks (leave empty for GPU clusters that don't use it)
 SUBTASK_MEMORY="${SUBTASK_MEMORY:-}"
-
-# Override CPUs for subtasks
 SUBTASK_CPUS="${SUBTASK_CPUS:-}"
-
-# Override GPU count for subtasks
 SUBTASK_GPUS="${SUBTASK_GPUS:-}"
 
 # ============================================================================
-# VALIDATION
+# CONDA ENVIRONMENT CLEANUP (v3.2)
 # ============================================================================
+# After a subtask completes successfully, its conda environment can be
+# removed to free disk space. Set to "false" for debugging.
 
-if [ -z "${PROJECT_DIR}" ]; then
-    echo "ERROR: PROJECT_DIR must be specified"
-    exit 1
-fi
-
-PROJECT_DIR=$(realpath "${PROJECT_DIR}")
-
-if [ ! -d "${AGI_ROOT}" ]; then
-    echo "ERROR: AGI_ROOT does not exist: ${AGI_ROOT}"
-    exit 1
-fi
-
-if [ ! -d "${PROJECT_DIR}" ]; then
-    echo "ERROR: PROJECT_DIR does not exist: ${PROJECT_DIR}"
-    exit 1
-fi
+CLEANUP_ENV_ON_SUCCESS="${CLEANUP_ENV_ON_SUCCESS:-true}"
 
 # ============================================================================
-# STARTUP BANNER
+# DISPLAY CONFIGURATION
 # ============================================================================
 
+echo ""
 echo "============================================================================"
-echo "  AGI Multi-Agent Pipeline v3.2.1 (ARC GPU)"
+echo "  AGI Multi-Agent Pipeline v1.2.0"
 echo "============================================================================"
-echo "  Job ID:              ${SLURM_JOB_ID:-local}"
+echo "  Job ID:              ${SLURM_JOB_ID:-interactive}"
 echo "  Node:                $(hostname)"
 echo "  Start Time:          $(date)"
-echo ""
-echo "  ┌──────────────────────────────────────────────────────────────────────┐"
-echo "  │  MASTER PIPELINE:   Running on GPU node ($(hostname))"
-echo "  │  SUBTASK CPU TARGET: ${AGI_CLUSTER}"
-echo "  │  SUBTASK GPU TARGET: ${AGI_GPU_CLUSTER}"
-echo "  │  (CPU subtasks → ${AGI_CLUSTER}, GPU subtasks → ${AGI_GPU_CLUSTER})"
-echo "  └──────────────────────────────────────────────────────────────────────┘"
-echo ""
+echo "  Cluster (CPU):       ${AGI_CLUSTER}"
+echo "  Cluster (GPU):       ${AGI_GPU_CLUSTER}"
 echo "  AGI Root:            ${AGI_ROOT}"
 echo "  Project Dir:         ${PROJECT_DIR}"
 echo "  Prompt File:         ${PROMPT_FILE}"
 echo "  Model:               ${OLLAMA_MODEL}"
 echo "  Context Length:       ${OLLAMA_CONTEXT_LENGTH}"
+echo "  ---"
+echo "  Diagnostic Agent:    ${DIAGNOSTIC_AGENT_ENABLED}"
+echo "  Diagnostic Memory:   bootstrap=${DIAGNOSTIC_MEMORY_BOOTSTRAP}, threshold=${SOLUTION_MEMORY_THRESHOLD}"
+echo "  Disk Monitor:        ${DISK_MONITOR_ENABLED} (threshold=${DISK_LOW_SPACE_THRESHOLD_GB}GB)"
+echo "  Cleanup Envs:        ${CLEANUP_ENV_ON_SUCCESS}"
 echo "============================================================================"
 
 # Create directories
@@ -254,6 +311,50 @@ unset ROCR_VISIBLE_DEVICES 2>/dev/null
 unset GPU_DEVICE_ORDINAL 2>/dev/null
 
 # ============================================================================
+# DISK SPACE CHECK (v1.2.0)
+# ============================================================================
+
+if [ "${DISK_MONITOR_ENABLED}" = "true" ]; then
+    echo ""
+    echo ">>> Checking disk space..."
+
+    # Check /work quota (most common constraint on HPC)
+    WORK_DIR=$(dirname "${PROJECT_DIR}")
+    AVAIL_KB=$(df -k "${WORK_DIR}" 2>/dev/null | tail -1 | awk '{print $4}')
+    if [ -n "${AVAIL_KB}" ]; then
+        AVAIL_GB=$((AVAIL_KB / 1048576))
+        echo "    Available: ~${AVAIL_GB} GB on $(df "${WORK_DIR}" 2>/dev/null | tail -1 | awk '{print $6}')"
+        if [ "${AVAIL_GB}" -lt "${DISK_LOW_SPACE_THRESHOLD_GB}" ]; then
+            echo "    ⚠ WARNING: Low disk space (${AVAIL_GB}GB < ${DISK_LOW_SPACE_THRESHOLD_GB}GB threshold)"
+            if [ "${DISK_CLEANUP_CONDA_CACHE}" = "true" ]; then
+                echo "    >>> Running conda clean to free space..."
+                conda clean --all --yes 2>/dev/null
+                echo "    >>> Cleaned conda cache"
+            fi
+            if [ "${DISK_CLEANUP_STALE_ENVS}" = "true" ]; then
+                echo "    >>> Removing stale agi_* environments..."
+                for env_dir in $(conda env list 2>/dev/null | grep "agi_" | awk '{print $NF}'); do
+                    if [ -d "${env_dir}" ]; then
+                        env_name=$(basename "${env_dir}")
+                        echo "      Removing: ${env_name}"
+                        conda env remove -n "${env_name}" --yes 2>/dev/null || true
+                    fi
+                done
+                echo "    >>> Stale environments cleaned"
+            fi
+            # Re-check
+            AVAIL_KB_POST=$(df -k "${WORK_DIR}" 2>/dev/null | tail -1 | awk '{print $4}')
+            AVAIL_GB_POST=$((AVAIL_KB_POST / 1048576))
+            echo "    Available after cleanup: ~${AVAIL_GB_POST} GB"
+        else
+            echo "    ✓ Disk space OK"
+        fi
+    else
+        echo "    Could not determine disk space — skipping check"
+    fi
+fi
+
+# ============================================================================
 # EXPORT ENVIRONMENT VARIABLES FOR SUBAGENT
 # ============================================================================
 
@@ -296,10 +397,28 @@ export AGI_SUBTASK_MEMORY="${SUBTASK_MEMORY}"
 export AGI_SUBTASK_CPUS="${SUBTASK_CPUS}"
 export AGI_SUBTASK_GPUS="${SUBTASK_GPUS}"
 
+# ==========================================================================
+# v1.2.0: DIAGNOSTIC AGENT & DISK MANAGER CONFIGURATION
+# ==========================================================================
+export AGI_DIAGNOSTIC_AGENT_ENABLED="${DIAGNOSTIC_AGENT_ENABLED}"
+export AGI_DIAGNOSTIC_MAX_INVOCATIONS="${DIAGNOSTIC_MAX_INVOCATIONS}"
+export AGI_DIAGNOSTIC_TOKEN_BUDGET="${DIAGNOSTIC_TOKEN_BUDGET}"
+export AGI_DIAGNOSTIC_MEMORY_BOOTSTRAP="${DIAGNOSTIC_MEMORY_BOOTSTRAP}"
+export AGI_SOLUTION_MEMORY_THRESHOLD="${SOLUTION_MEMORY_THRESHOLD}"
+
+export AGI_DISK_MONITOR_ENABLED="${DISK_MONITOR_ENABLED}"
+export AGI_DISK_LOW_SPACE_THRESHOLD_GB="${DISK_LOW_SPACE_THRESHOLD_GB}"
+export AGI_DISK_CLEANUP_STALE_ENVS="${DISK_CLEANUP_STALE_ENVS}"
+export AGI_DISK_CLEANUP_CONDA_CACHE="${DISK_CLEANUP_CONDA_CACHE}"
+
+export AGI_CLEANUP_ENV_ON_SUCCESS="${CLEANUP_ENV_ON_SUCCESS}"
+
 echo "    AGI_CLUSTER=${AGI_CLUSTER}"
 echo "    AGI_GPU_CLUSTER=${AGI_GPU_CLUSTER}"
 echo "    AGI_CLUSTER_CONFIG=${AGI_CLUSTER_CONFIG}"
 echo "    OLLAMA_MODEL=${OLLAMA_MODEL}"
+echo "    AGI_DIAGNOSTIC_AGENT_ENABLED=${AGI_DIAGNOSTIC_AGENT_ENABLED}"
+echo "    AGI_DISK_MONITOR_ENABLED=${AGI_DISK_MONITOR_ENABLED}"
 
 # Display cluster info
 echo ""
@@ -377,13 +496,51 @@ else
     echo "    ✓ ${OLLAMA_MODEL}"
 fi
 
-if [ "${USE_REFLEXION_MEMORY}" = "true" ]; then
+if [ "${USE_REFLEXION_MEMORY}" = "true" ] || [ "${DIAGNOSTIC_AGENT_ENABLED}" = "true" ]; then
     if ! ollama list 2>/dev/null | grep -q "${EMBEDDING_MODEL}"; then
         echo "    Pulling ${EMBEDDING_MODEL}..."
         ollama pull "${EMBEDDING_MODEL}"
     else
         echo "    ✓ ${EMBEDDING_MODEL}"
     fi
+fi
+
+# ============================================================================
+# BOOTSTRAP DIAGNOSTIC MEMORY (v1.2.0)
+# ============================================================================
+
+if [ "${DIAGNOSTIC_AGENT_ENABLED}" = "true" ] && [ "${DIAGNOSTIC_MEMORY_BOOTSTRAP}" = "true" ]; then
+    echo ""
+    echo ">>> Bootstrapping diagnostic memory (first-run seeding)..."
+    python3 << 'BOOTSTRAP_EOF'
+import sys
+import os
+
+# Ensure AGI root is on path
+agi_root = os.environ.get('AGI_ROOT', '.')
+if agi_root not in sys.path:
+    sys.path.insert(0, agi_root)
+
+try:
+    from memory.diagnostic_memory import DiagnosticMemory, BOOTSTRAP_SOLUTIONS
+
+    dm = DiagnosticMemory()
+    stats = dm.get_stats()
+
+    if stats.get("total_solutions", 0) == 0:
+        print(f"    Seeding {len(BOOTSTRAP_SOLUTIONS)} known solutions...")
+        result = dm.store_known_solutions(BOOTSTRAP_SOLUTIONS)
+        print(f"    ✓ Stored {result['stored_count']} solutions "
+              f"({result['failed_count']} failed)")
+    else:
+        print(f"    ✓ Diagnostic memory already has "
+              f"{stats['total_solutions']} solutions — skipping bootstrap")
+except ImportError as e:
+    print(f"    ⚠ DiagnosticMemory not available: {e}")
+    print(f"    Diagnostic agent will run without persistent memory")
+except Exception as e:
+    print(f"    ⚠ Bootstrap failed (non-fatal): {e}")
+BOOTSTRAP_EOF
 fi
 
 # ============================================================================
@@ -407,7 +564,7 @@ fi
 
 echo ""
 echo "============================================================================"
-echo "  Running AGI Pipeline"
+echo "  Running AGI Pipeline v1.2.0"
 echo "============================================================================"
 echo "  Master Node:            $(hostname) (GPU)"
 echo "  Subtask CPU Target:     ${AGI_CLUSTER}"
@@ -415,6 +572,11 @@ echo "  Subtask GPU Target:     ${AGI_GPU_CLUSTER}"
 echo "  Project:                ${PROJECT_DIR}"
 echo "  Model:                  ${OLLAMA_MODEL}"
 echo "  Context Length:          ${OLLAMA_CONTEXT_LENGTH}"
+echo "  ---"
+echo "  Diagnostic Agent:       ${DIAGNOSTIC_AGENT_ENABLED} (max=${DIAGNOSTIC_MAX_INVOCATIONS}, budget=${DIAGNOSTIC_TOKEN_BUDGET}t)"
+echo "  Solution Memory:        threshold=${SOLUTION_MEMORY_THRESHOLD}"
+echo "  Disk Monitor:           ${DISK_MONITOR_ENABLED} (threshold=${DISK_LOW_SPACE_THRESHOLD_GB}GB)"
+echo "  Cleanup Envs on Pass:   ${CLEANUP_ENV_ON_SUCCESS}"
 echo "============================================================================"
 echo ""
 
@@ -446,22 +608,81 @@ if [ -n "${OLLAMA_PID}" ]; then
 fi
 
 # ============================================================================
+# POST-RUN DISK CLEANUP (v1.2.0)
+# ============================================================================
+
+if [ "${DISK_MONITOR_ENABLED}" = "true" ] && [ "${DISK_CLEANUP_STALE_ENVS}" = "true" ]; then
+    echo ""
+    echo ">>> Post-run disk cleanup..."
+    STALE_COUNT=0
+    for env_dir in $(conda env list 2>/dev/null | grep "agi_" | awk '{print $NF}'); do
+        if [ -d "${env_dir}" ]; then
+            env_name=$(basename "${env_dir}")
+            # Only clean up if env is not actively used by a running job
+            if ! squeue -u "$USER" 2>/dev/null | grep -q "agi"; then
+                echo "    Removing stale env: ${env_name}"
+                conda env remove -n "${env_name}" --yes 2>/dev/null || true
+                STALE_COUNT=$((STALE_COUNT + 1))
+            fi
+        fi
+    done
+    if [ "${STALE_COUNT}" -gt 0 ]; then
+        echo "    Cleaned ${STALE_COUNT} stale environments"
+    else
+        echo "    No stale environments found"
+    fi
+fi
+
+# ============================================================================
+# DIAGNOSTIC MEMORY SUMMARY (v1.2.0)
+# ============================================================================
+
+if [ "${DIAGNOSTIC_AGENT_ENABLED}" = "true" ]; then
+    echo ""
+    echo ">>> Diagnostic Memory Summary:"
+    python3 << 'STATS_EOF' 2>/dev/null || echo "    (stats unavailable)"
+import sys, os
+agi_root = os.environ.get('AGI_ROOT', '.')
+if agi_root not in sys.path:
+    sys.path.insert(0, agi_root)
+try:
+    from memory.diagnostic_memory import DiagnosticMemory
+    dm = DiagnosticMemory()
+    stats = dm.get_stats()
+    print(f"    Total solutions:   {stats.get('total_solutions', 0)}")
+    by_type = stats.get('solutions_by_type', {})
+    if by_type:
+        top_types = sorted(by_type.items(), key=lambda x: x[1], reverse=True)[:5]
+        for etype, count in top_types:
+            print(f"      {etype}: {count}")
+    top = stats.get('most_reused', [])
+    if top:
+        print(f"    Most reused fix:   {top[0].get('solution', 'N/A')[:60]}... "
+              f"(used {top[0].get('success_count', 0)}x)")
+except Exception as e:
+    print(f"    Could not retrieve stats: {e}")
+STATS_EOF
+fi
+
+# ============================================================================
 # SUMMARY
 # ============================================================================
 
 echo ""
 echo "============================================================================"
-echo "  Job Complete"
+echo "  Job Complete — v1.2.0"
 echo "============================================================================"
 echo "  End Time:       $(date)"
 echo "  Exit Code:      ${PIPELINE_EXIT_CODE}"
 echo "  Cluster:        ${AGI_CLUSTER}"
 echo "  GPU Cluster:    ${AGI_GPU_CLUSTER}"
 echo "  Model:          ${OLLAMA_MODEL}"
+echo "  Diagnostic:     ${DIAGNOSTIC_AGENT_ENABLED}"
 echo ""
 echo "  Outputs:        ${PROJECT_DIR}/"
 echo "  Checkpoints:    ${PROJECT_DIR}/temp/checkpoints/"
 echo "  SLURM Logs:     ${PROJECT_DIR}/slurm/logs/"
+echo "  Diagnostic DB:  ${AGI_DATA_DIR}/qdrant_storage/"
 echo "============================================================================"
 
 exit ${PIPELINE_EXIT_CODE}

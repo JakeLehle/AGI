@@ -1,7 +1,7 @@
 """
-Script-First Sub-Agent v3.2.1 - Complete Implementation
+Script-First Sub-Agent v1.2.0 — 4-Phase Lifecycle with Diagnostic Agent
 
-Features:
+Features (inherited from v3.2.2):
 - DUAL CLUSTER ROUTING: AGI_CLUSTER (CPU) + AGI_GPU_CLUSTER (GPU subtasks)
 - GPU-AWARE SBATCH: Auto-routes tasks to GPU/CPU based on package detection
 - GPU NODE RULES: No --mem on GPU partitions, --gres=gpu:N format
@@ -11,42 +11,41 @@ Features:
 - PROPER SLURM: Jobs appear in squeue, uses sbatch correctly
 - OPEN-SOURCE CHANNELS: conda-forge, bioconda only (no defaults/main)
 
-v3.2.1 Updates:
-- Model selection is now fully modular via utils.model_config.resolve_model().
-  No hardcoded model names in agent code. Resolution priority:
-    1. Explicit parameter (from workflow/CLI --model)
-    2. OLLAMA_MODEL environment variable (set in RUN scripts)
-    3. config.yaml → ollama.model
-    4. Single fallback constant in utils/model_config.py
-- All LLM calls use invoke_resilient() from utils.llm_invoke with exponential
-  backoff retry. Survives transient Ollama 500 errors from memory pressure.
-- No artificial timeouts. The 3-day SLURM wall time is the only hard limit.
+v1.2.0 Changes:
+  The monolithic execute() → generate_all_artifacts → retry loop is replaced
+  by a 4-phase lifecycle with independent error handling at each phase:
 
-v3.2.2 Updates:
-- FIX C: Pip fallback for conda packages. _generate_env_yaml() now:
-  1. Parses code_hints from user prompt for explicit pip: sections
-  2. Maintains a KNOWN_PIP_ONLY set for packages not on conda-forge/bioconda
-     (popv, celltypist, scvi-tools, decoupler, episcanpy, etc.)
-  3. Routes packages to pip or conda deps correctly in the generated YAML
-- _create_conda_environment() now has a pip retry fallback: if conda env
-  create fails, it parses failed packages from stderr and retries them
-  individually with pip install inside the (partially created) environment.
-- These changes prevent the "conda install popv" failure that blocked all
-  downstream steps in the slide-TCR-seq pipeline.
+    Phase 1: Script Generation (validated two-pass)
+      - Outline generation → LLM validation → full implementation → validation
+      - Language-agnostic (Python, R, bash, Perl, Java)
 
-Flow:
-1. Load cluster config (arc_compute1, arc_gpu1v100, etc.)
-2. Route task to GPU or CPU cluster based on packages/metadata
-3. Generate artifacts (env.yml, script.py, sbatch with cluster settings)
-4. Create conda env
-5. Submit via sbatch → appears in squeue
-6. Wait → Analyze → Retry or Complete
-7. On success: cleanup conda env, delete checkpoint
+    Phase 2: Environment Creation (script-informed, LLM-reviewed)
+      - Entire script sent to LLM for full dependency analysis
+      - YAML generation with proper conda/pip/system routing
+      - Environment build with repair loop (max 15 iterations)
+      - YAML is always the single source of truth
+      - DiskManager integration for proactive quota management
 
-GPU NODE RULES (ARC):
-- Do NOT specify --mem on GPU partitions (causes allocation failures)
-- Use --gres=gpu:N format (not --gpus N)
-- Standard GPU request: --gres=gpu:1 -N 1 -n 1 -c 80
+    Phase 3: Sbatch Generation (language-aware)
+      - Language dispatch table for execution commands
+      - GPU routing based on script content + env packages
+      - Submission test with rule-based config repair
+
+    Phase 4: Execution + Diagnostic Agent Loop
+      - Expanded error classification (12 error types)
+      - DiagnosticAgent invocation with independent 25K token budget
+      - Structured FixPrescription application
+      - DiagnosticMemory for cross-task solution reuse
+      - ReflexionMemory for per-task loop prevention
+
+  Removed methods:
+    - _generate_all_artifacts() → replaced by per-phase generation
+    - _reflect_and_update() → replaced by diagnostic agent
+    - _generate_env_yaml() → replaced by LLM dependency review in Phase 2
+    - _generate_python_script() → replaced by _generate_script() (language-agnostic)
+
+  All LLM calls use invoke_resilient() with exponential backoff retry.
+  No artificial timeouts — the 3-day SLURM wall time is the only limit.
 """
 
 from typing import Dict, Any, List, Optional
@@ -57,8 +56,9 @@ import time
 import subprocess
 import os
 from datetime import datetime
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from enum import Enum
+import logging
 
 try:
     import yaml
@@ -75,9 +75,11 @@ from utils.context_manager import ContextManager
 from utils.llm_invoke import invoke_resilient, LLMInvocationError
 from utils.model_config import resolve_model, resolve_base_url
 
+logger = logging.getLogger(__name__)
+
 
 # =============================================================================
-# CLUSTER CONFIGURATION (v3.2 - GPU Routing Support)
+# CLUSTER CONFIGURATION (v3.2 — GPU Routing Support)
 # =============================================================================
 
 class ClusterConfig:
@@ -107,7 +109,7 @@ class ClusterConfig:
                     'nodes': 1,
                     'ntasks': 1,
                     'cpus_per_task': 80,
-                    # NO memory key - GPU nodes must NOT specify --mem
+                    # NO memory key — GPU nodes must NOT specify --mem
                     'time': '1-00:00:00',
                 },
                 'gpu': {
@@ -135,7 +137,9 @@ class ClusterConfig:
             self.cluster_name,
             self.DEFAULT_CONFIG['clusters']['default']
         )
-        self.gpu_cluster_name = os.environ.get('AGI_GPU_CLUSTER', 'arc_gpu1v100')
+        self.gpu_cluster_name = os.environ.get(
+            'AGI_GPU_CLUSTER', 'arc_gpu1v100'
+        )
 
     def _load_config(self) -> Dict:
         """Load cluster config from file."""
@@ -157,7 +161,10 @@ class ClusterConfig:
                 if config and 'clusters' in config:
                     return config
             except Exception as e:
-                print(f"[ClusterConfig] Warning: Failed to load {config_path}: {e}")
+                print(
+                    f"[ClusterConfig] Warning: "
+                    f"Failed to load {config_path}: {e}"
+                )
 
         return self.DEFAULT_CONFIG
 
@@ -166,150 +173,89 @@ class ClusterConfig:
         """SLURM settings for current (CPU) cluster."""
         return self.cluster.get('slurm', {})
 
-    @property
-    def gpu(self) -> Dict:
-        """GPU settings for current cluster."""
-        return self.cluster.get('gpu', {})
+    def get_gpu_cluster(self) -> Dict:
+        """Get the GPU cluster configuration."""
+        return self.config.get('clusters', {}).get(
+            self.gpu_cluster_name,
+            self.DEFAULT_CONFIG['clusters']['default_gpu']
+        )
 
-    @property
-    def limits(self) -> Dict:
-        """Resource limits for current cluster."""
-        return self.cluster.get('limits', {})
+    def task_needs_gpu(self, task_description: str = '', packages: list = None) -> bool:
+        """Detect if a task needs GPU based on packages or description."""
+        gpu_packages = self.config.get(
+            'gpu_packages', self.DEFAULT_CONFIG['gpu_packages']
+        )
+        check_text = task_description.lower()
 
-    def get_slurm_value(self, key: str, default: Any = None) -> Any:
-        """Get a SLURM setting with env override support."""
-        env_key = f'AGI_SUBTASK_{key.upper()}'
-        env_val = os.environ.get(env_key)
-        if env_val:
-            return env_val
-        return self.slurm.get(key, default)
+        if packages:
+            for pkg in packages:
+                if pkg.lower() in gpu_packages:
+                    return True
+                if pkg.lower() in check_text:
+                    pass
 
-    def is_gpu_cluster(self) -> bool:
-        """Check if current default cluster has GPUs."""
-        return self.gpu.get('available', False)
+        for gpu_pkg in gpu_packages:
+            if gpu_pkg.lower() in check_text:
+                return True
 
-    def get_gpu_directive(self, count: int = None) -> str:
-        """Get GPU SBATCH directive string (--gres=gpu:N format)."""
-        gpu = self.cluster.get('gpu', {})
-        if not gpu.get('available', False):
-            return ""
-        count = count or gpu.get('default_count', 1)
-        fmt = gpu.get('directive_format', '--gres=gpu:{count}')
-        return fmt.format(count=count)
-
-    def get_gpu_cluster(self) -> Optional[Dict]:
-        """Load GPU cluster config for tasks requiring GPU resources."""
-        gpu_cluster = self.config.get('clusters', {}).get(self.gpu_cluster_name)
-        if gpu_cluster:
-            return gpu_cluster
-        if self.cluster.get('gpu', {}).get('available', False):
-            return self.cluster
-        return None
-
-    def get_cluster_for_task(
-        self, task_description: str = "", requires_gpu: bool = False
-    ) -> Dict:
-        """Select appropriate cluster config based on task requirements."""
-        if requires_gpu:
-            gpu_cluster = self.get_gpu_cluster()
-            if gpu_cluster:
-                return gpu_cluster
-
-        if task_description:
-            gpu_packages = self.config.get(
-                'gpu_packages',
-                self.DEFAULT_CONFIG.get('gpu_packages', [])
-            )
-            task_lower = task_description.lower()
-            for pkg in gpu_packages:
-                if pkg.lower() in task_lower:
-                    gpu_cluster = self.get_gpu_cluster()
-                    if gpu_cluster:
-                        return gpu_cluster
-                    break
-
-        return self.cluster
+        return False
 
     def get_slurm_for_task(
-        self, task_description: str = "", requires_gpu: bool = False
+        self, task_description: str = '', requires_gpu: bool = False,
+        packages: list = None
     ) -> Dict:
-        """Get complete SLURM settings dict for a task with proper GPU routing.
-
-        Returns dict with keys: partition, account, nodes, ntasks, cpus_per_task,
-        memory, time, gpu_available, gpu_directive, cluster_name
-
-        IMPORTANT: memory is None for GPU clusters (specifying --mem causes
-        allocation failures on ARC GPU nodes).
-        """
-        cluster = self.get_cluster_for_task(task_description, requires_gpu)
-        slurm = cluster.get('slurm', {})
-        gpu_cfg = cluster.get('gpu', {})
-        is_gpu = gpu_cfg.get('available', False)
-
-        selected_name = self.cluster_name
-        if cluster is not self.cluster:
-            selected_name = self.gpu_cluster_name
-
-        result = {
-            'partition': slurm.get('partition', 'compute1'),
-            'account': slurm.get('account', 'sdz852'),
-            'nodes': slurm.get('nodes', 1),
-            'ntasks': slurm.get('ntasks', 1),
-            'cpus_per_task': slurm.get('cpus_per_task', 20),
-            'memory': slurm.get('memory'),  # None for GPU clusters
-            'time': slurm.get('time', '1-00:00:00'),
-            'gpu_available': is_gpu,
-            'gpu_directive': None,
-            'cluster_name': selected_name,
-        }
-
-        # Apply env var overrides
-        for key in ['partition', 'account', 'time']:
-            env_key = f"AGI_SUBTASK_{key.upper()}"
-            env_val = os.environ.get(env_key)
-            if env_val:
-                result[key] = env_val
-
-        # Memory override - but NEVER apply memory to GPU clusters
-        mem_override = os.environ.get('AGI_SUBTASK_MEMORY')
-        if mem_override and not is_gpu:
-            result['memory'] = mem_override
-
-        cpus_override = os.environ.get('AGI_SUBTASK_CPUS')
-        if cpus_override:
-            result['cpus_per_task'] = int(cpus_override)
-
-        # GPU directive (--gres=gpu:N format)
-        if is_gpu:
-            count = gpu_cfg.get('default_count', 1)
-            gpus_override = os.environ.get('AGI_SUBTASK_GPUS')
-            if gpus_override:
-                count = int(gpus_override)
-            fmt = gpu_cfg.get('directive_format', '--gres=gpu:{count}')
-            result['gpu_directive'] = fmt.format(count=count)
-
-        return result
-
-    def __repr__(self):
-        return (
-            f"ClusterConfig(cpu={self.cluster_name}, "
-            f"gpu={self.gpu_cluster_name}, "
-            f"partition={self.slurm.get('partition', '?')})"
+        """Get SLURM settings routed to the right cluster for this task."""
+        needs_gpu = requires_gpu or self.task_needs_gpu(
+            task_description, packages
         )
+
+        if needs_gpu:
+            gpu_cluster = self.get_gpu_cluster()
+            slurm_settings = dict(gpu_cluster.get('slurm', {}))
+            gpu_config = gpu_cluster.get('gpu', {})
+
+            slurm_settings['gpu_available'] = True
+            gpu_count = gpu_config.get('default_count', 1)
+            directive_fmt = gpu_config.get(
+                'directive_format', '--gres=gpu:{count}'
+            )
+            slurm_settings['gpu_directive'] = directive_fmt.format(
+                count=gpu_count
+            )
+            slurm_settings['cluster_name'] = self.gpu_cluster_name
+        else:
+            slurm_settings = dict(self.slurm)
+            slurm_settings['gpu_available'] = False
+            slurm_settings['gpu_directive'] = None
+            slurm_settings['cluster_name'] = self.cluster_name
+
+        return slurm_settings
 
 
 # =============================================================================
-# CHECKPOINT STATE
+# CHECKPOINT STATE (v1.2.0 — Extended)
 # =============================================================================
 
 class TaskStatus(Enum):
     NOT_STARTED = "not_started"
-    GENERATING = "generating"
-    CREATING_ENV = "creating_env"
+    # Phase 1
+    GENERATING_OUTLINE = "generating_outline"
+    VALIDATING_OUTLINE = "validating_outline"
+    GENERATING_SCRIPT = "generating_script"
+    VALIDATING_SCRIPT = "validating_script"
+    # Phase 2
+    REVIEWING_DEPS = "reviewing_deps"
+    BUILDING_ENV = "building_env"
+    REPAIRING_ENV = "repairing_env"
+    # Phase 3
+    GENERATING_SBATCH = "generating_sbatch"
+    TESTING_SUBMISSION = "testing_submission"
+    # Phase 4
     RUNNING_DRYRUN = "running_dryrun"
     WAITING_JOB = "waiting_job"
-    REFLECTING = "reflecting"
+    DIAGNOSING = "diagnosing"
     RUNNING_PROD = "running_prod"
+    # Terminal
     COMPLETED = "completed"
     FAILED = "failed"
 
@@ -330,14 +276,30 @@ class TaskCheckpoint:
     created_at: str
     updated_at: str
     routed_cluster: Optional[str] = None
+    # v1.2.0 additions
+    language: Optional[str] = None
+    outline_validated: bool = False
+    script_validated: bool = False
+    phase: int = 0
+    diagnostic_invocations: int = 0
 
     def to_dict(self) -> Dict:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: Dict) -> 'TaskCheckpoint':
-        if 'routed_cluster' not in data:
-            data['routed_cluster'] = None
+        # Backward compat for older checkpoints
+        for key in [
+            'routed_cluster', 'language', 'outline_validated',
+            'script_validated', 'phase', 'diagnostic_invocations'
+        ]:
+            if key not in data:
+                if key in ('outline_validated', 'script_validated'):
+                    data[key] = False
+                elif key in ('phase', 'diagnostic_invocations'):
+                    data[key] = 0
+                else:
+                    data[key] = None
         return cls(**data)
 
     @classmethod
@@ -348,278 +310,763 @@ class TaskCheckpoint:
             iteration=0, env_name=None, env_yaml_path=None,
             script_path=None, sbatch_path=None, current_job_id=None,
             last_error=None, env_created=False, dry_run_succeeded=False,
-            created_at=now, updated_at=now, routed_cluster=None
+            created_at=now, updated_at=now, routed_cluster=None,
+            language=None, outline_validated=False, script_validated=False,
+            phase=0, diagnostic_invocations=0
         )
 
 
 # =============================================================================
-# SUB-AGENT
+# SUB-AGENT v1.2.0
 # =============================================================================
 
 class ScriptFirstSubAgentV3:
     """
-    Complete SubAgent v3.2.2 with dual cluster routing, cleanup, and resume.
+    Sub-Agent v1.2.0 — 4-phase lifecycle with diagnostic agent integration.
 
-    v3.2.1 — No hardcoded model names. Model resolved via
-    utils.model_config.resolve_model() with priority:
-      1. Explicit parameter (from workflow)
-      2. OLLAMA_MODEL environment variable (from RUN script)
-      3. config.yaml → ollama.model
-      4. Fallback constant in utils/model_config.py
-
-    v3.2.2 — Fix C: Pip fallback for conda packages. Parses code_hints
-    for pip: sections, maintains known pip-only package list, and retries
-    failed conda packages with pip inside the environment.
+    Phase 1: Script Generation (validated two-pass)
+    Phase 2: Environment Creation (script-informed, LLM-reviewed)
+    Phase 3: Sbatch Generation (language-aware, submission-tested)
+    Phase 4: Execution + Diagnostic Agent Loop
 
     All LLM calls use invoke_resilient() with exponential backoff retry.
     No artificial timeouts — the 3-day SLURM wall time is the only limit.
-
-    Token budget (must match master_agent.py / config.yaml):
-      - MAX_CONTEXT_TOKENS:    25,000
-      - MAX_TOOL_OUTPUT_TOKENS: 12,000
-      - MIN_TOKENS_FOR_RETRY:   3,000
     """
 
+    # Token budget (matches config.yaml context.max_tokens_per_task)
     MAX_CONTEXT_TOKENS = 25_000
-    MAX_TOOL_OUTPUT_TOKENS = 12_000
     MIN_TOKENS_FOR_RETRY = 3_000
 
-    JOB_POLL_INTERVAL = 30
-    JOB_TIMEOUT = 259200  # 3 days in seconds (matches SLURM wall time)
+    # Phase limits
+    MAX_OUTLINE_ATTEMPTS = 3
+    MAX_IMPLEMENTATION_ATTEMPTS = 3
+    MAX_ENV_REPAIR_ITERATIONS = 15
+    MAX_PHASE4_ITERATIONS = 15
 
     def __init__(
         self,
-        agent_id: str,
+        agent_id: str = "sub_agent",
         sandbox=None,
         conda_tools=None,
         slurm_tools=None,
         ollama_model: str = None,
         ollama_base_url: str = None,
         use_slurm: bool = True,
-        slurm_config: Dict[str, Any] = None,
-        project_root: str = ".",
+        slurm_config: Dict = None,
+        project_root: str = None,
         cleanup_env_on_success: bool = True,
-        **kwargs
+        diagnostic_memory=None,
     ):
         self.agent_id = agent_id
-
-        # Resolve model via centralized config (no hardcoded names)
-        resolved_model = resolve_model(ollama_model)
-        resolved_url = resolve_base_url(ollama_base_url)
-
-        self.llm = OllamaLLM(model=resolved_model, base_url=resolved_url)
-        self.ollama_base_url = resolved_url
-
         self.sandbox = sandbox
+        self.conda_tools = conda_tools
+        self.slurm_tools = slurm_tools
         self.use_slurm = use_slurm
+        self.slurm_config = slurm_config or {}
         self.cleanup_env_on_success = cleanup_env_on_success
+        self.diagnostic_memory = diagnostic_memory
 
-        # Load cluster configuration (v3.2: dual cluster routing)
-        self.cluster_config = ClusterConfig()
+        # Resolve model (no hardcoded names)
+        resolved_model = resolve_model(ollama_model)
+        self.ollama_base_url = resolve_base_url(ollama_base_url)
+        self.llm = OllamaLLM(
+            model=resolved_model, base_url=self.ollama_base_url
+        )
 
-        # Merge any passed slurm_config (overrides cluster defaults)
-        self.slurm_overrides = slurm_config or {}
-
-        # Set project root
-        if sandbox:
+        # Project root
+        if project_root:
+            self.project_root = Path(project_root)
+        elif sandbox:
             self.project_root = Path(sandbox.project_dir)
         else:
-            self.project_root = Path(project_root)
+            self.project_root = Path('.')
 
-        # Checkpoint directory
-        self.checkpoint_dir = self.project_root / 'temp' / 'checkpoints'
-        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        # Cluster config
+        self.cluster_config = ClusterConfig()
 
-        # Context management
-        self.context_mgr = ContextManager(
-            max_context_tokens=self.MAX_CONTEXT_TOKENS,
-            max_tool_output_tokens=self.MAX_TOOL_OUTPUT_TOKENS,
-            llm_for_summarization=self.llm
-        )
-        self.context_window = self.context_mgr.create_context_window(agent_id)
+        # Context manager
+        self.context_mgr = ContextManager()
 
+        # Checkpoint
         self.checkpoint: Optional[TaskCheckpoint] = None
 
-        for key, value in kwargs.items():
-            setattr(self, key, value)
+        # Disk manager (lazy init)
+        self._disk_manager = None
 
     # =========================================================================
-    # CHECKPOINT MANAGEMENT
-    # =========================================================================
-
-    def _get_checkpoint_path(self, task_id: str) -> Path:
-        safe_id = re.sub(r'[^\w\-]', '_', task_id)[:50]
-        return self.checkpoint_dir / f"{safe_id}_checkpoint.json"
-
-    def _save_checkpoint(self):
-        if not self.checkpoint:
-            return
-        self.checkpoint.updated_at = datetime.now().isoformat()
-        path = self._get_checkpoint_path(self.checkpoint.task_id)
-        with open(path, 'w') as f:
-            json.dump(self.checkpoint.to_dict(), f, indent=2)
-
-    def _load_checkpoint(self, task_id: str) -> Optional[TaskCheckpoint]:
-        path = self._get_checkpoint_path(task_id)
-        if not path.exists():
-            return None
-        try:
-            with open(path) as f:
-                return TaskCheckpoint.from_dict(json.load(f))
-        except Exception:
-            return None
-
-    def _delete_checkpoint(self, task_id: str):
-        path = self._get_checkpoint_path(task_id)
-        if path.exists():
-            path.unlink()
-
-    def _update_checkpoint(self, **kwargs):
-        if not self.checkpoint:
-            return
-        for key, value in kwargs.items():
-            if hasattr(self.checkpoint, key):
-                setattr(self.checkpoint, key, value)
-        self._save_checkpoint()
-
-    # =========================================================================
-    # MAIN EXECUTION
+    # MAIN ENTRY POINT
     # =========================================================================
 
     def execute(
-        self,
-        subtask: Dict[str, Any],
-        env_name: str = None,
-        prior_attempts: int = 0,
-        **kwargs
+        self, subtask: Dict, env_name: str = None
     ) -> Dict[str, Any]:
+        """
+        Execute a subtask through the 4-phase lifecycle.
 
+        v1.2.0: Phases are sequential with independent error handling.
+        Each phase can be resumed from checkpoint.
+
+        Args:
+            subtask: Dict with id, description, packages, input_files,
+                     output_files, code_hints, requires_gpu, etc.
+            env_name: Optional base env name (not used in v1.2.0, each
+                      step gets its own env).
+
+        Returns:
+            Dict with success, task_id, and phase-specific results.
+        """
         task_id = subtask.get('id', 'unknown')
-        description = subtask.get('description', subtask.get('title', 'Unknown'))
-        requires_gpu = subtask.get('requires_gpu', False)
 
-        # v3.2: Route task to appropriate cluster
-        routed_slurm = self.cluster_config.get_slurm_for_task(
-            task_description=description,
-            requires_gpu=requires_gpu
-        )
-        routed_cluster = routed_slurm.get(
-            'cluster_name', self.cluster_config.cluster_name
-        )
+        # Initialize or resume checkpoint
+        self.checkpoint = self._load_or_create_checkpoint(task_id)
 
-        print(f"\n[{task_id}] Routed to cluster: {routed_cluster}")
-        if routed_slurm.get('gpu_available'):
-            print(f"  GPU: {routed_slurm.get('gpu_directive')}")
-            print(
-                f"  CPUs: {routed_slurm.get('cpus_per_task')}, "
-                f"No --mem (GPU node)"
-            )
-        else:
-            print(
-                f"  CPUs: {routed_slurm.get('cpus_per_task')}, "
-                f"Memory: {routed_slurm.get('memory')}"
-            )
-
-        # Check for checkpoint (resume)
-        existing = self._load_checkpoint(task_id)
-        if existing:
-            print(f"\n{'='*60}")
-            print(f"[{task_id}] RESUMING FROM CHECKPOINT")
-            print(
-                f"  Status: {existing.status}, "
-                f"Iteration: {existing.iteration}"
-            )
-            print(f"{'='*60}")
-            self.checkpoint = existing
-
-            if existing.status == TaskStatus.COMPLETED.value:
-                return self._success_result(
-                    task_id, message="Already completed", resumed=True
-                )
-
-            if existing.status == TaskStatus.FAILED.value:
-                self.checkpoint.iteration = 0
-                self.checkpoint.status = TaskStatus.NOT_STARTED.value
-        else:
-            self.checkpoint = TaskCheckpoint.new(task_id)
-
-        # Store routed cluster in checkpoint
-        self._update_checkpoint(routed_cluster=routed_cluster)
-
-        agent_logger.log_task_start(
-            agent_name=self.agent_id,
-            task_id=task_id,
-            description=f"v3.2.1: {description[:100]}",
-            attempt=self.checkpoint.iteration + 1
-        )
-
-        # Check existing outputs
+        # Check if already completed
         if self._check_existing_outputs(subtask).get('already_complete'):
             self._delete_checkpoint(task_id)
             return self._success_result(
                 task_id, message="Outputs exist", skipped=True
             )
 
-        # =================================================================
-        # STEP 1: Generate artifacts (uses routed cluster for sbatch)
-        # =================================================================
-        if (not self.checkpoint.script_path
-                or not Path(self.checkpoint.script_path).exists()):
-            print(f"\n[{task_id}] Generating artifacts...")
-            self._update_checkpoint(status=TaskStatus.GENERATING.value)
+        # Route to cluster
+        routed_slurm = self.cluster_config.get_slurm_for_task(
+            task_description=subtask.get('description', ''),
+            requires_gpu=subtask.get('requires_gpu', False),
+            packages=subtask.get('packages', []),
+        )
+        routed_cluster = routed_slurm.get(
+            'cluster_name', self.cluster_config.cluster_name
+        )
+        self._update_checkpoint(routed_cluster=routed_cluster)
 
-            artifacts = self._generate_all_artifacts(subtask, routed_slurm)
-            if not artifacts['success']:
-                self._update_checkpoint(
-                    status=TaskStatus.FAILED.value,
-                    last_error=artifacts.get('error')
-                )
-                return self._failure_result(
-                    task_id,
-                    f"Artifact generation failed: {artifacts.get('error')}"
-                )
+        try:
+            # =============================================================
+            # PHASE 1: Script Generation
+            # =============================================================
+            if self.checkpoint.phase < 1:
+                result = self._phase_1_generate_script(subtask)
+                if not result['success']:
+                    self._update_checkpoint(status=TaskStatus.FAILED.value)
+                    return self._failure_result(
+                        task_id, f"Phase 1 failed: {result.get('error')}"
+                    )
+                self._update_checkpoint(phase=1)
 
-            self._update_checkpoint(
-                env_yaml_path=artifacts['env_yaml_path'],
-                script_path=artifacts['script_path'],
-                sbatch_path=artifacts['sbatch_path'],
-                env_name=artifacts['env_name']
+            # =============================================================
+            # PHASE 2: Environment Creation
+            # =============================================================
+            if self.checkpoint.phase < 2:
+                result = self._phase_2_create_environment(subtask)
+                if not result['success']:
+                    self._update_checkpoint(status=TaskStatus.FAILED.value)
+                    return self._failure_result(
+                        task_id, f"Phase 2 failed: {result.get('error')}"
+                    )
+                self._update_checkpoint(phase=2)
+
+            # =============================================================
+            # PHASE 3: Sbatch Generation
+            # =============================================================
+            if self.checkpoint.phase < 3:
+                result = self._phase_3_generate_sbatch(
+                    subtask, routed_slurm
+                )
+                if not result['success']:
+                    self._update_checkpoint(status=TaskStatus.FAILED.value)
+                    return self._failure_result(
+                        task_id, f"Phase 3 failed: {result.get('error')}"
+                    )
+                self._update_checkpoint(phase=3)
+
+            # =============================================================
+            # PHASE 4: Execution + Diagnostic Loop
+            # =============================================================
+            result = self._phase_4_execute_and_monitor(
+                subtask, routed_cluster, routed_slurm
             )
-            print(f"  ✓ Cluster: {routed_cluster}")
-            print(f"  ✓ Partition: {routed_slurm.get('partition')}")
-            print(f"  ✓ Script: {artifacts['script_path']}")
-            print(f"  ✓ Sbatch: {artifacts['sbatch_path']}")
+            return result
 
-        # =================================================================
-        # STEP 2: Create conda environment
-        # =================================================================
-        if not self.checkpoint.env_created:
-            print(f"\n[{task_id}] Creating conda environment...")
-            self._update_checkpoint(status=TaskStatus.CREATING_ENV.value)
+        except Exception as e:
+            logger.error(f"[{task_id}] Unhandled exception: {e}")
+            self._update_checkpoint(
+                status=TaskStatus.FAILED.value,
+                last_error=str(e)
+            )
+            return self._failure_result(task_id, f"Unhandled: {e}")
 
-            env_result = self._create_conda_environment()
-            if env_result.get('success'):
-                self._update_checkpoint(env_created=True)
-                print(f"  ✓ Environment ready: {self.checkpoint.env_name}")
+    # =========================================================================
+    # PHASE 1: SCRIPT GENERATION (Validated Two-Pass)
+    # =========================================================================
+
+    def _phase_1_generate_script(self, subtask: Dict) -> Dict[str, Any]:
+        """Generate and validate the analysis script.
+
+        Two-pass approach:
+          1a. Generate outline from subtask
+          1b. Validate outline against subtask goals
+          1c. Generate full script from validated outline
+          1d. Validate script against outline + subtask
+        """
+        task_id = subtask.get('id', 'task')
+        safe_id = re.sub(r'[^\w\-]', '_', task_id)[:30]
+        desc = subtask.get('description', '')
+
+        # Detect language from subtask
+        language = self._detect_language(subtask)
+        ext = {'python': 'py', 'r': 'R', 'bash': 'sh',
+               'perl': 'pl', 'java': 'java'}.get(language, 'py')
+
+        script_path = self.project_root / 'scripts' / f"{safe_id}.{ext}"
+        script_path.parent.mkdir(parents=True, exist_ok=True)
+
+        print(f"\n[{task_id}] Phase 1: Script Generation ({language})")
+
+        # Skip if script already exists and is validated
+        if (self.checkpoint.script_path
+                and Path(self.checkpoint.script_path).exists()
+                and self.checkpoint.script_validated):
+            print(f"  ✓ Script already validated: {self.checkpoint.script_path}")
+            return {'success': True}
+
+        # Step 1a+1b: Outline generation with validation
+        if not self.checkpoint.outline_validated:
+            self._update_checkpoint(
+                status=TaskStatus.GENERATING_OUTLINE.value
+            )
+            outline = self._generate_and_validate_outline(subtask, language)
+            if not outline:
+                return {
+                    'success': False,
+                    'error': 'Could not generate validated outline'
+                }
+            self._update_checkpoint(outline_validated=True)
+        else:
+            # Reconstruct outline from existing script context
+            outline = subtask.get('expanded_plan', desc)
+
+        # Step 1c+1d: Implementation with validation
+        self._update_checkpoint(status=TaskStatus.GENERATING_SCRIPT.value)
+        script_content = self._generate_and_validate_script(
+            subtask, outline, language
+        )
+        if not script_content:
+            return {
+                'success': False,
+                'error': 'Could not generate validated script'
+            }
+
+        # Save script
+        script_path.write_text(script_content)
+        env_name = f"agi_{safe_id}"
+        env_yaml_path = str(
+            self.project_root / 'envs' / f"{safe_id}.yml"
+        )
+
+        self._update_checkpoint(
+            script_path=str(script_path),
+            script_validated=True,
+            language=language,
+            env_name=env_name,
+            env_yaml_path=env_yaml_path,
+        )
+        print(f"  ✓ Script saved: {script_path}")
+        print(f"  ✓ Language: {language}")
+        return {'success': True}
+
+    def _generate_and_validate_outline(
+        self, subtask: Dict, language: str
+    ) -> Optional[str]:
+        """Generate an outline and validate it against subtask goals."""
+        desc = subtask.get('description', '')
+        inputs = subtask.get('input_files', [])
+        outputs = subtask.get('output_files', [])
+        packages = subtask.get('packages', [])
+
+        for attempt in range(self.MAX_OUTLINE_ATTEMPTS):
+            self._update_checkpoint(
+                status=TaskStatus.GENERATING_OUTLINE.value
+            )
+
+            prompt = f"""Create a structured outline for a {language} script.
+
+TASK: {desc}
+INPUT FILES: {', '.join(inputs) if inputs else 'None specified'}
+OUTPUT FILES: {', '.join(outputs) if outputs else 'None specified'}
+PACKAGES: {', '.join(packages) if packages else 'As needed'}
+
+Produce a numbered outline with:
+1. All imports/library loads needed
+2. Each processing step in order
+3. What each step does and why
+4. Expected inputs and outputs for each step
+5. Error handling approach
+
+Return ONLY the outline, no code."""
+
+            try:
+                outline = invoke_resilient(
+                    self.llm, prompt,
+                    ollama_base_url=self.ollama_base_url,
+                    max_retries=20,
+                    initial_backoff=30.0,
+                )
+            except LLMInvocationError as e:
+                logger.warning(f"Outline generation failed: {e}")
+                continue
+
+            # Validate
+            self._update_checkpoint(
+                status=TaskStatus.VALIDATING_OUTLINE.value
+            )
+            validation = self._validate_outline(outline, subtask)
+
+            if validation.get('valid'):
+                print(f"  ✓ Outline validated (attempt {attempt + 1})")
+                return outline
             else:
-                print(f"  ⚠ Warning: {env_result.get('error')}")
+                print(
+                    f"  ⚠ Outline validation failed (attempt {attempt + 1}): "
+                    f"{validation.get('issues', '')[:100]}"
+                )
 
-        # =================================================================
-        # MAIN LOOP
-        # =================================================================
+        return None
+
+    def _validate_outline(
+        self, outline: str, subtask: Dict
+    ) -> Dict[str, Any]:
+        """LLM validation of outline against subtask goals."""
+        desc = subtask.get('description', '')
+        outputs = subtask.get('output_files', [])
+
+        prompt = f"""Validate this script outline against the assigned task.
+
+TASK: {desc}
+EXPECTED OUTPUTS: {', '.join(outputs) if outputs else 'Not specified'}
+
+OUTLINE:
+{outline}
+
+Check:
+1. Does it address every requirement in the task?
+2. Are any required steps missing?
+3. Will it produce the expected outputs?
+4. Does it introduce anything not requested?
+
+Respond with EXACTLY one of:
+VALID: The outline fully addresses the task.
+INVALID: [specific issues]"""
+
+        try:
+            response = invoke_resilient(
+                self.llm, prompt,
+                ollama_base_url=self.ollama_base_url,
+                max_retries=10,
+                initial_backoff=15.0,
+            )
+            if response.strip().upper().startswith('VALID'):
+                return {'valid': True}
+            return {'valid': False, 'issues': response}
+        except LLMInvocationError:
+            # On LLM failure, accept the outline
+            return {'valid': True}
+
+    def _generate_and_validate_script(
+        self, subtask: Dict, outline: str, language: str
+    ) -> Optional[str]:
+        """Generate the full script from outline, then validate."""
+        desc = subtask.get('description', '')
+        packages = subtask.get('packages', [])
+        inputs = subtask.get('input_files', [])
+        outputs = subtask.get('output_files', [])
+
+        for attempt in range(self.MAX_IMPLEMENTATION_ATTEMPTS):
+            self._update_checkpoint(
+                status=TaskStatus.GENERATING_SCRIPT.value
+            )
+
+            if language == 'python':
+                prompt = self._build_python_script_prompt(
+                    desc, outline, packages, inputs, outputs
+                )
+            elif language == 'r':
+                prompt = self._build_r_script_prompt(
+                    desc, outline, packages, inputs, outputs
+                )
+            else:
+                prompt = self._build_generic_script_prompt(
+                    desc, outline, packages, inputs, outputs, language
+                )
+
+            try:
+                response = invoke_resilient(
+                    self.llm, prompt,
+                    ollama_base_url=self.ollama_base_url,
+                    max_retries=20,
+                    initial_backoff=30.0,
+                )
+            except LLMInvocationError as e:
+                logger.warning(f"Script generation failed: {e}")
+                continue
+
+            # Extract code from response
+            content = self._extract_code_from_response(response, language)
+            if not content or len(content) < 50:
+                continue
+
+            # Ensure required structure for Python
+            if language == 'python' and 'AGI_DRY_RUN' not in content:
+                content = self._prepend_python_header(content, subtask)
+
+            # Validate
+            self._update_checkpoint(
+                status=TaskStatus.VALIDATING_SCRIPT.value
+            )
+            validation = self._validate_script(content, outline, subtask)
+
+            if validation.get('valid'):
+                print(f"  ✓ Script validated (attempt {attempt + 1})")
+                return content
+            else:
+                print(
+                    f"  ⚠ Script validation failed (attempt {attempt + 1}): "
+                    f"{validation.get('issues', '')[:100]}"
+                )
+
+        # Return last generated content even if validation failed
+        if content and len(content) > 50:
+            logger.warning("Returning unvalidated script after max attempts")
+            return content
+        return None
+
+    def _validate_script(
+        self, script: str, outline: str, subtask: Dict
+    ) -> Dict[str, Any]:
+        """LLM validation of script against outline and subtask."""
+        desc = subtask.get('description', '')
+
+        prompt = f"""Validate this script against its outline and task.
+
+TASK: {desc[:500]}
+
+OUTLINE:
+{outline[:1000]}
+
+SCRIPT:
+```
+{script[:4000]}
+```
+
+Check:
+1. Does it implement every step from the outline?
+2. Does it match the task goals?
+3. Are expected outputs produced?
+4. Is the code syntactically correct?
+
+Respond with EXACTLY one of:
+VALID: The script correctly implements the task.
+INVALID: [specific issues]"""
+
+        try:
+            response = invoke_resilient(
+                self.llm, prompt,
+                ollama_base_url=self.ollama_base_url,
+                max_retries=10,
+                initial_backoff=15.0,
+            )
+            if response.strip().upper().startswith('VALID'):
+                return {'valid': True}
+            return {'valid': False, 'issues': response}
+        except LLMInvocationError:
+            return {'valid': True}
+
+    # =========================================================================
+    # PHASE 2: ENVIRONMENT CREATION (Script-Informed, LLM-Reviewed)
+    # =========================================================================
+
+    def _phase_2_create_environment(
+        self, subtask: Dict
+    ) -> Dict[str, Any]:
+        """Build a conda environment informed by the actual script content.
+
+        Steps:
+          2a. LLM dependency review of the entire script
+          2b. YAML generation with conda/pip routing
+          2c. Environment build
+          2d. Repair loop (max 15 iterations)
+        """
+        task_id = subtask.get('id', 'task')
+        print(f"\n[{task_id}] Phase 2: Environment Creation")
+
+        if self.checkpoint.env_created:
+            print(f"  ✓ Environment already created: {self.checkpoint.env_name}")
+            return {'success': True}
+
+        # Proactive disk check
+        self._ensure_disk_space()
+
+        script_path = Path(self.checkpoint.script_path)
+        language = self.checkpoint.language or 'python'
+        env_name = self.checkpoint.env_name
+        env_yaml_path = Path(self.checkpoint.env_yaml_path)
+        env_yaml_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Read script content
+        script_content = script_path.read_text() if script_path.exists() else ""
+
+        # Step 2a: LLM dependency review
+        self._update_checkpoint(status=TaskStatus.REVIEWING_DEPS.value)
+        print(f"  → Reviewing dependencies via LLM...")
+
+        try:
+            from utils.dependency_parser import (
+                build_dependency_review_prompt,
+                parse_dependency_response,
+                generate_env_yaml,
+            )
+            dep_prompt = build_dependency_review_prompt(
+                script_content, language
+            )
+            dep_response = invoke_resilient(
+                self.llm, dep_prompt,
+                ollama_base_url=self.ollama_base_url,
+                max_retries=15,
+                initial_backoff=20.0,
+            )
+            dep_list = parse_dependency_response(dep_response)
+
+            # Step 2b: Generate YAML
+            env_yaml = generate_env_yaml(dep_list, env_name)
+
+        except (ImportError, LLMInvocationError) as e:
+            logger.warning(
+                f"LLM dependency review failed ({e}), "
+                f"falling back to regex-based extraction"
+            )
+            env_yaml = self._generate_env_yaml_fallback(
+                subtask, script_content, env_name, language
+            )
+
+        env_yaml_path.write_text(env_yaml)
+        print(f"  ✓ Environment YAML: {env_yaml_path}")
+
+        # Step 2c: Build environment
+        self._update_checkpoint(status=TaskStatus.BUILDING_ENV.value)
+        build_result = self._create_conda_environment()
+
+        if build_result.get('success'):
+            self._update_checkpoint(env_created=True)
+            print(f"  ✓ Environment ready: {env_name}")
+            return {'success': True}
+
+        # Step 2d: Repair loop
+        print(f"  ⚠ Build failed, entering repair loop...")
+        self._update_checkpoint(status=TaskStatus.REPAIRING_ENV.value)
+
+        for repair_attempt in range(self.MAX_ENV_REPAIR_ITERATIONS):
+            if not self._can_continue():
+                break
+
+            error = build_result.get('error', '')
+            print(f"  → Repair attempt {repair_attempt + 1}: {error[:100]}")
+
+            repaired = self._repair_environment(error, env_yaml_path, env_name)
+            if not repaired:
+                return {
+                    'success': False,
+                    'error': f"Env repair exhausted: {error[:200]}"
+                }
+
+            # Retry build
+            build_result = self._create_conda_environment()
+            if build_result.get('success'):
+                self._update_checkpoint(env_created=True)
+                print(f"  ✓ Environment ready after repair: {env_name}")
+                return {'success': True}
+
+        return {
+            'success': False,
+            'error': f"Env build failed after {self.MAX_ENV_REPAIR_ITERATIONS} repairs"
+        }
+
+    def _repair_environment(
+        self, error: str, yaml_path: Path, env_name: str
+    ) -> bool:
+        """Attempt to repair a failed environment build.
+
+        Handles: disk quota, package not found, conflicts.
+        Returns True if a repair action was taken (caller should retry).
+        """
+        error_lower = error.lower()
+
+        # Disk quota
+        if 'no space' in error_lower or 'quota' in error_lower:
+            self._ensure_disk_space(force=True)
+            return True
+
+        # Package not found on conda → move to pip
+        not_found = re.findall(
+            r'PackagesNotFoundError.*?- (\S+)',
+            error, re.DOTALL
+        )
+        if not not_found:
+            not_found = re.findall(
+                r"nothing provides.*?needed by (\S+)", error_lower
+            )
+        if not not_found:
+            not_found = re.findall(
+                r'ResolvePackageNotFound.*?- (\S+)', error, re.DOTALL
+            )
+
+        if not_found and yaml and yaml_path.exists():
+            content = yaml_path.read_text()
+            for pkg in not_found:
+                pkg_clean = re.split(r'[><=!]', pkg)[0].strip()
+                if not pkg_clean:
+                    continue
+                # Move from conda deps to pip
+                if self.conda_tools:
+                    self.conda_tools.remove_package_from_yaml(
+                        str(yaml_path), pkg_clean
+                    )
+                    self.conda_tools.update_yaml_with_package(
+                        str(yaml_path), pkg_clean, section="pip"
+                    )
+                    print(f"    Moved {pkg_clean} to pip section")
+            return True
+
+        # Conflict → ask LLM for version resolution
+        if 'conflict' in error_lower:
+            try:
+                fix_prompt = f"""A conda environment build failed with this error:
+
+{error[:1500]}
+
+Suggest specific version pins or alternative packages to resolve the conflict.
+Return a list of changes, one per line, in format:
+REMOVE: package_name
+ADD_CONDA: package_name==version
+ADD_PIP: package_name==version"""
+
+                response = invoke_resilient(
+                    self.llm, fix_prompt,
+                    ollama_base_url=self.ollama_base_url,
+                    max_retries=10,
+                    initial_backoff=15.0,
+                )
+
+                if yaml and yaml_path.exists() and self.conda_tools:
+                    for line in response.strip().split('\n'):
+                        line = line.strip()
+                        if line.startswith('REMOVE:'):
+                            pkg = line.split(':', 1)[1].strip()
+                            self.conda_tools.remove_package_from_yaml(
+                                str(yaml_path), pkg
+                            )
+                        elif line.startswith('ADD_CONDA:'):
+                            pkg = line.split(':', 1)[1].strip()
+                            self.conda_tools.update_yaml_with_package(
+                                str(yaml_path), pkg, section="conda"
+                            )
+                        elif line.startswith('ADD_PIP:'):
+                            pkg = line.split(':', 1)[1].strip()
+                            self.conda_tools.update_yaml_with_package(
+                                str(yaml_path), pkg, section="pip"
+                            )
+                return True
+            except (LLMInvocationError, Exception) as e:
+                logger.warning(f"LLM conflict resolution failed: {e}")
+
+        # Pip install failure → try alternative
+        if 'pip' in error_lower and 'failed' in error_lower:
+            return True  # Retry may succeed after network transient
+
+        return False
+
+    # =========================================================================
+    # PHASE 3: SBATCH GENERATION (Language-Aware)
+    # =========================================================================
+
+    def _phase_3_generate_sbatch(
+        self, subtask: Dict, routed_slurm: Dict
+    ) -> Dict[str, Any]:
+        """Generate the sbatch script with language-aware execution command.
+
+        Uses a language dispatch table and cluster-routed SLURM settings.
+        Tests submission for immediate config failures.
+        """
+        task_id = subtask.get('id', 'task')
+        safe_id = re.sub(r'[^\w\-]', '_', task_id)[:30]
+
+        print(f"\n[{task_id}] Phase 3: Sbatch Generation")
+
+        if (self.checkpoint.sbatch_path
+                and Path(self.checkpoint.sbatch_path).exists()):
+            print(f"  ✓ Sbatch already exists: {self.checkpoint.sbatch_path}")
+            return {'success': True}
+
+        sbatch_path = (
+            self.project_root / 'slurm' / 'scripts' / f"{safe_id}.sbatch"
+        )
+        sbatch_path.parent.mkdir(parents=True, exist_ok=True)
+
+        sbatch_content = self._generate_sbatch_script(
+            safe_id,
+            Path(self.checkpoint.script_path),
+            self.checkpoint.env_name,
+            Path(self.checkpoint.env_yaml_path),
+            subtask, routed_slurm,
+            dry_run=True,
+        )
+        sbatch_path.write_text(sbatch_content)
+        self._update_checkpoint(
+            sbatch_path=str(sbatch_path),
+            status=TaskStatus.GENERATING_SBATCH.value,
+        )
+
+        print(f"  ✓ Sbatch: {sbatch_path}")
+        print(f"  ✓ Cluster: {routed_slurm.get('cluster_name')}")
+        print(f"  ✓ Partition: {routed_slurm.get('partition')}")
+        return {'success': True}
+
+    # =========================================================================
+    # PHASE 4: EXECUTION + DIAGNOSTIC AGENT LOOP
+    # =========================================================================
+
+    def _phase_4_execute_and_monitor(
+        self,
+        subtask: Dict,
+        routed_cluster: str,
+        routed_slurm: Dict,
+    ) -> Dict[str, Any]:
+        """Execute the job and iterate with diagnostic agent on failures.
+
+        v1.2.0: Replaces the old _reflect_and_update loop with
+        DiagnosticAgent invocation that produces structured FixPrescriptions.
+        """
+        task_id = subtask.get('id', 'task')
+        print(f"\n[{task_id}] Phase 4: Execution & Monitoring")
+
         while self._can_continue():
             self.checkpoint.iteration += 1
             self._update_checkpoint(
                 status=TaskStatus.RUNNING_DRYRUN.value,
-                iteration=self.checkpoint.iteration
+                iteration=self.checkpoint.iteration,
             )
 
-            print(f"\n[{task_id}] Iteration {self.checkpoint.iteration} - DRY RUN")
+            print(
+                f"\n[{task_id}] Iteration {self.checkpoint.iteration} "
+                f"— DRY RUN"
+            )
 
             try:
                 # Submit job
                 submit_result = self._submit_slurm_job()
                 if not submit_result['success']:
+                    # Try to fix sbatch config
+                    fixed = self._fix_sbatch_submission_error(
+                        submit_result.get('error', ''), routed_slurm
+                    )
+                    if fixed:
+                        continue
                     self._update_checkpoint(
                         last_error=submit_result.get('error')
                     )
@@ -627,25 +1074,28 @@ class ScriptFirstSubAgentV3:
 
                 self._update_checkpoint(
                     status=TaskStatus.WAITING_JOB.value,
-                    current_job_id=submit_result['job_id']
+                    current_job_id=submit_result['job_id'],
                 )
                 print(f"  ✓ Job submitted: {submit_result['job_id']}")
 
-                # Wait for completion
+                # Wait
                 print(f"  → Waiting for job...")
                 wait_result = self._wait_for_job()
                 logs = self._collect_job_logs()
 
-                analysis = self._analyze_job_result(wait_result, logs, subtask)
+                # Analyze
+                analysis = self._analyze_job_result(
+                    wait_result, logs, subtask
+                )
 
                 if analysis['success']:
+                    # === DRY RUN SUCCESS → PRODUCTION RUN ===
                     print(f"  ✓ DRY RUN SUCCEEDED!")
                     self._update_checkpoint(
                         dry_run_succeeded=True,
-                        status=TaskStatus.RUNNING_PROD.value
+                        status=TaskStatus.RUNNING_PROD.value,
                     )
 
-                    # Production run
                     print(f"\n[{task_id}] PRODUCTION RUN")
                     self._regenerate_sbatch(dry_run=False)
 
@@ -684,38 +1134,52 @@ class ScriptFirstSubAgentV3:
                                 job_id=self.checkpoint.current_job_id,
                                 iterations=self.checkpoint.iteration,
                                 routed_cluster=routed_cluster,
-                                report=report
+                                report=report,
                             )
 
                 else:
-                    # Reflect and update
-                    print(
-                        f"  ✗ Failed: "
-                        f"{analysis.get('error_summary', 'Unknown')[:100]}"
+                    # === FAILURE → INVOKE DIAGNOSTIC AGENT ===
+                    error_summary = analysis.get(
+                        'error_summary',
+                        analysis.get('error_type', 'Unknown')
                     )
+                    print(f"  ✗ Failed: {error_summary[:100]}")
                     self._update_checkpoint(
-                        status=TaskStatus.REFLECTING.value,
-                        last_error=analysis.get('error_summary')
+                        status=TaskStatus.DIAGNOSING.value,
+                        last_error=error_summary,
                     )
 
-                    reflect = self._reflect_and_update(
-                        subtask, analysis, logs
+                    # Invoke diagnostic agent
+                    prescription = self._invoke_diagnostic_agent(
+                        analysis, logs, subtask
                     )
-                    if reflect.get('should_escalate'):
+
+                    # Apply fix
+                    applied = self._apply_fix_prescription(
+                        prescription, subtask, routed_slurm
+                    )
+
+                    if applied.get('should_escalate'):
                         self._update_checkpoint(
                             status=TaskStatus.FAILED.value
                         )
                         return self._failure_result(
                             task_id,
-                            f"Escalating: {reflect.get('reason')}"
+                            f"Escalating: {prescription.explanation[:200]}"
                         )
 
-                    if reflect['success']:
-                        print(f"  ✓ Script updated, retrying...")
+                    if applied.get('env_rebuilt'):
+                        # Env was rebuilt, need fresh sbatch too
                         self._regenerate_sbatch(dry_run=True)
+
+                    if applied.get('script_updated'):
+                        self._regenerate_sbatch(dry_run=True)
+
+                    print(f"  ✓ Fix applied, retrying...")
 
             except Exception as e:
                 self._update_checkpoint(last_error=str(e))
+                logger.error(f"[{task_id}] Exception in Phase 4: {e}")
                 print(f"  ✗ Exception: {e}")
 
         # Context exhausted
@@ -726,296 +1190,277 @@ class ScriptFirstSubAgentV3:
                 f"Context exhausted after "
                 f"{self.checkpoint.iteration} iterations"
             ),
-            checkpoint_preserved=True
+            checkpoint_preserved=True,
         )
 
     # =========================================================================
-    # ARTIFACT GENERATION
+    # DIAGNOSTIC AGENT INTEGRATION (v1.2.0)
     # =========================================================================
 
-    def _generate_all_artifacts(
-        self, subtask: Dict, routed_slurm: Dict = None
-    ) -> Dict[str, Any]:
-        """Generate env.yml, script.py, and sbatch with routed cluster settings."""
-        task_id = subtask.get('id', 'task')
-        safe_id = re.sub(r'[^\w\-]', '_', task_id)[:30]
+    def _invoke_diagnostic_agent(
+        self,
+        analysis: Dict[str, Any],
+        logs: Dict[str, str],
+        subtask: Dict,
+    ) -> 'FixPrescription':
+        """Instantiate a DiagnosticAgent and investigate the failure.
 
-        env_yaml_path = self.project_root / 'envs' / f"{safe_id}.yml"
-        script_path = self.project_root / 'scripts' / f"{safe_id}.py"
-        sbatch_path = (
-            self.project_root / 'slurm' / 'scripts' / f"{safe_id}.sbatch"
+        Each invocation gets a fresh 25K token budget. The diagnostic agent
+        checks its solution memory first, then investigates if needed.
+        """
+        from agents.diagnostic_agent import DiagnosticAgent, FixPrescription
+
+        self.checkpoint.diagnostic_invocations += 1
+        self._update_checkpoint(
+            diagnostic_invocations=self.checkpoint.diagnostic_invocations
         )
-        env_name = f"agi_{safe_id}"
-
-        for p in [env_yaml_path, script_path, sbatch_path]:
-            p.parent.mkdir(parents=True, exist_ok=True)
-
-        # 1. Environment YAML (open-source channels only)
-        env_yaml = self._generate_env_yaml(subtask, env_name)
-        env_yaml_path.write_text(env_yaml)
-
-        # 2. Python script (uses invoke_resilient)
-        script_result = self._generate_python_script(subtask)
-        if not script_result['success']:
-            return script_result
-        script_path.write_text(script_result['content'])
-
-        # 3. Sbatch script with ROUTED cluster settings
-        if not routed_slurm:
-            routed_slurm = self.cluster_config.get_slurm_for_task(
-                task_description=subtask.get('description', ''),
-                requires_gpu=subtask.get('requires_gpu', False)
-            )
-
-        sbatch = self._generate_sbatch_script(
-            safe_id, script_path, env_name, env_yaml_path,
-            subtask, routed_slurm, dry_run=True
-        )
-        sbatch_path.write_text(sbatch)
-
-        return {
-            'success': True,
-            'env_yaml_path': str(env_yaml_path),
-            'script_path': str(script_path),
-            'sbatch_path': str(sbatch_path),
-            'env_name': env_name,
-        }
-
-    def _generate_env_yaml(self, subtask: Dict, env_name: str) -> str:
-        """Generate conda environment YAML with intelligent pip routing.
-
-        v3.2.2 Fix C: The original implementation routed ALL packages to
-        conda deps, causing failures for pip-only packages like popv,
-        celltypist, and scvi-tools that are not available on conda-forge
-        or bioconda. This version:
-
-        1. Parses code_hints from the user's prompt for explicit pip: sections
-        2. Checks against KNOWN_PIP_ONLY set for packages not on conda channels
-        3. Routes git URLs and / paths to pip (unchanged from v3.2.1)
-        4. Everything else goes to conda deps (unchanged from v3.2.1)
-
-        Open-source channels only (no defaults/main - commercial license).
-        """
-        # ── Known pip-only packages ───────────────────────────────────────
-        # These are NOT available on conda-forge or bioconda and MUST be
-        # installed via pip. This list should be expanded as needed.
-        KNOWN_PIP_ONLY = {
-            'popv', 'celltypist', 'decoupler', 'episcanpy',
-            'scanpy-scripts', 'scvi-tools', 'scvi', 'scvelo',
-            'cellbender', 'cellxgene-census', 'cellxgene',
-            'pertpy', 'muon', 'moscot', 'squidpy',
-            'cell2location', 'tangram-sc', 'stereopy',
-            'commot', 'spatialdm', 'stlearn',
-        }
-
-        packages = subtask.get('packages', [])
-        code_hints = subtask.get('code_hints', [])
-
-        # Extract pip packages specified in user's prompt code hints
-        pip_from_hints = self._extract_pip_packages_from_hints(code_hints)
-
-        conda_deps = ['python>=3.10']
-        pip_pkgs = []
-
-        for pkg in packages:
-            # Strip version specifiers for matching (keep for output)
-            pkg_name = re.split(r'[><=!~]', pkg)[0].strip().lower()
-
-            if '/' in pkg or pkg.startswith('git+'):
-                # Git URLs and paths always go to pip
-                pip_pkgs.append(pkg)
-            elif pkg_name in KNOWN_PIP_ONLY:
-                # Known pip-only packages
-                pip_pkgs.append(pkg)
-            elif pkg_name in pip_from_hints:
-                # User explicitly specified this as a pip package
-                pip_pkgs.append(pkg)
-            else:
-                # Default: conda dependency
-                conda_deps.append(pkg)
-
-        # Also add any pip-from-hints packages not already in the list
-        for hint_pkg in pip_from_hints:
-            if hint_pkg not in [re.split(r'[><=!~]', p)[0].strip().lower()
-                                for p in pip_pkgs]:
-                # Check if it's already in conda_deps
-                conda_names = [re.split(r'[><=!~]', d)[0].strip().lower()
-                               for d in conda_deps]
-                if hint_pkg not in conda_names:
-                    pip_pkgs.append(hint_pkg)
-
-        # Open-source channels only (no defaults/main - commercial license)
-        lines = [
-            f"name: {env_name}",
-            "channels:",
-            "  - conda-forge",
-            "  - bioconda",
-            "  - nodefaults",
-            "dependencies:",
-        ]
-        for d in conda_deps:
-            lines.append(f"  - {d}")
-
-        if pip_pkgs:
-            lines.extend(["  - pip", "  - pip:"])
-            for p in pip_pkgs:
-                lines.append(f"    - {p}")
-
-        # Log routing decisions for debugging
-        if pip_pkgs:
-            agent_logger.log_reflection(
-                agent_name=self.agent_id,
-                task_id="env_yaml",
-                reflection=(
-                    f"Env {env_name}: "
-                    f"{len(conda_deps)-1} conda deps, "
-                    f"{len(pip_pkgs)} pip deps "
-                    f"(pip: {', '.join(pip_pkgs[:5])})"
-                )
-            )
-
-        return '\n'.join(lines) + '\n'
-
-    def _extract_pip_packages_from_hints(
-        self, code_hints: List[str]
-    ) -> set:
-        """Parse code_hints for explicit pip package specifications.
-
-        v3.2.2 Fix C: User prompts often contain conda YAML snippets like:
-
-            dependencies:
-              - scanpy>=1.9.0
-              - pip
-              - pip:
-                - popv>=0.9.0
-
-        This method extracts packages listed under 'pip:' sections in any
-        code hint block, returning them as a set of lowercase package names
-        (without version specifiers) for matching.
-        """
-        pip_packages = set()
-
-        for hint in code_hints:
-            # Strategy 1: Parse as YAML if possible
-            if yaml and ('pip:' in hint or 'pip :' in hint):
-                try:
-                    parsed = yaml.safe_load(hint)
-                    if isinstance(parsed, dict):
-                        deps = parsed.get('dependencies', [])
-                        for dep in deps:
-                            if isinstance(dep, dict) and 'pip' in dep:
-                                for pip_pkg in dep['pip']:
-                                    name = re.split(r'[><=!~]', str(pip_pkg))[0].strip().lower()
-                                    if name:
-                                        pip_packages.add(name)
-                except Exception:
-                    pass
-
-            # Strategy 2: Regex fallback for pip: sections
-            # Matches indented items after a "- pip:" or "pip:" line
-            pip_section = re.search(
-                r'(?:^|\n)\s*-?\s*pip\s*:\s*\n((?:\s+- .+\n?)+)',
-                hint, re.MULTILINE
-            )
-            if pip_section:
-                for line in pip_section.group(1).split('\n'):
-                    line = line.strip().lstrip('- ').strip()
-                    if line:
-                        name = re.split(r'[><=!~]', line)[0].strip().lower()
-                        if name and name != 'pip':
-                            pip_packages.add(name)
-
-        return pip_packages
-
-    def _generate_python_script(self, subtask: Dict) -> Dict[str, Any]:
-        """Generate the Python script for this subtask.
-
-        v3.2.1: Uses invoke_resilient with exponential backoff retry.
-        Survives transient Ollama 500 errors without hanging.
-        """
-        desc = subtask.get('description', '')
-        packages = subtask.get('packages', [])
-        inputs = subtask.get('input_files', [])
-        outputs = subtask.get('output_files', [])
-
-        prompt = f"""Generate a Python script for this task.
-
-TASK: {desc}
-PACKAGES: {', '.join(packages)}
-INPUTS: {', '.join(inputs)}
-OUTPUTS: {', '.join(outputs)}
-
-REQUIRED STRUCTURE:
-```python
-#!/usr/bin/env python3
-import os
-from pathlib import Path
-
-DRY_RUN = os.environ.get('AGI_DRY_RUN', 'true').lower() == 'true'
-PROJECT_ROOT = Path(os.environ.get('PROJECT_DIR', '.')).resolve()
-os.chdir(PROJECT_ROOT)
-
-print(f"[MODE] DRY_RUN={{DRY_RUN}}, PROJECT_ROOT={{PROJECT_ROOT}}")
-
-def main():
-    # Your code here
-    # Wrap saves with: if not DRY_RUN: save() else: print("[DRY-RUN] Would save...")
-    print("SUCCESS: Task completed")
-
-if __name__ == "__main__":
-    main()
-```
-
-Generate ONLY the Python code."""
 
         try:
-            response = invoke_resilient(
-                self.llm,
-                prompt,
+            diag = DiagnosticAgent(
+                agent_id=f"{self.agent_id}_diag_{self.checkpoint.diagnostic_invocations}",
+                step_id=self.checkpoint.task_id,
+                project_root=str(self.project_root),
+                conda_tools=self.conda_tools,
+                slurm_tools=self.slurm_tools,
+                ollama_model=None,  # resolve_model() handles this
                 ollama_base_url=self.ollama_base_url,
-                max_retries=20,
-                initial_backoff=30.0,
+                solution_memory=self.diagnostic_memory,
+                env_name=self.checkpoint.env_name,
+                env_yaml_path=self.checkpoint.env_yaml_path,
             )
-            content = re.sub(
-                r'^```(?:python)?\n?', '', response, flags=re.MULTILINE
+
+            prescription = diag.investigate(
+                error_classification=analysis,
+                logs=logs,
+                subtask_description=subtask.get('description', ''),
             )
-            content = re.sub(
-                r'\n?```$', '', content, flags=re.MULTILINE
-            ).strip()
 
-            if 'AGI_DRY_RUN' not in content:
-                content = self._prepend_header(content, subtask)
+            logger.info(
+                f"Diagnostic result: fix_type={prescription.fix_type}, "
+                f"confidence={prescription.confidence}, "
+                f"from_memory={prescription.from_memory}"
+            )
+            return prescription
 
-            return {'success': True, 'content': content}
-        except LLMInvocationError as e:
+        except Exception as e:
+            logger.error(f"Diagnostic agent failed: {e}")
+            return FixPrescription(
+                fix_type="escalate",
+                explanation=f"Diagnostic agent crashed: {e}",
+                error_type=analysis.get('error_type', 'unknown'),
+            )
+
+    def _apply_fix_prescription(
+        self,
+        prescription: 'FixPrescription',
+        subtask: Dict,
+        routed_slurm: Dict,
+    ) -> Dict[str, Any]:
+        """Apply a structured fix from the diagnostic agent.
+
+        Returns dict with:
+          should_escalate: True if we should give up
+          env_rebuilt: True if env was rebuilt (needs fresh sbatch)
+          script_updated: True if script was modified
+        """
+        from agents.diagnostic_agent import FixPrescription
+
+        result = {
+            'should_escalate': False,
+            'env_rebuilt': False,
+            'script_updated': False,
+        }
+
+        fix_type = prescription.fix_type
+
+        if fix_type == "escalate":
+            result['should_escalate'] = True
+            return result
+
+        if fix_type == "env_updated":
+            # Diagnostic agent already installed the package(s)
+            # Just need to retry the job
+            if prescription.packages_installed:
+                print(
+                    f"    Packages installed: "
+                    f"{', '.join(prescription.packages_installed)}"
+                )
+            return result
+
+        if fix_type == "edit_code":
+            # Apply code changes to the script
+            for change in prescription.changes:
+                if change.get('action') == 'replace_script':
+                    fixed_content = change.get('fixed_content', '')
+                    if fixed_content and self.checkpoint.script_path:
+                        Path(self.checkpoint.script_path).write_text(
+                            fixed_content
+                        )
+                        result['script_updated'] = True
+                        print(f"    Script updated with diagnostic fix")
+                elif change.get('action') == 'fix_path':
+                    # Path fix suggestion — needs script rewrite
+                    result['script_updated'] = True
+            return result
+
+        if fix_type == "change_config":
+            # Modify sbatch configuration
+            for change in prescription.changes:
+                suggestion = change.get('suggestion', '')
+                if 'memory' in suggestion.lower() and self.checkpoint.sbatch_path:
+                    # Double memory in sbatch
+                    self._adjust_sbatch_memory(factor=2)
+                    print(f"    Sbatch memory doubled")
+                elif 'partition' in suggestion.lower():
+                    # Re-route cluster
+                    pass
+            return result
+
+        if fix_type == "rebuild_env":
+            # Reset env and rebuild
+            self._update_checkpoint(env_created=False)
+            result['env_rebuilt'] = True
+            rebuild = self._phase_2_create_environment(subtask)
+            if rebuild['success']:
+                self._update_checkpoint(env_created=True)
+            return result
+
+        if fix_type == "add_package":
+            # Package was already added by diagnostic agent
+            return result
+
+        return result
+
+    # =========================================================================
+    # ERROR ANALYSIS (v1.2.0 — Expanded Categories)
+    # =========================================================================
+
+    def _analyze_job_result(
+        self, job_result: Dict, logs: Dict[str, str], subtask: Dict
+    ) -> Dict[str, Any]:
+        """Classify job outcome into specific error types.
+
+        v1.2.0: Expanded from 5 to 12 error categories. Now also
+        extracts the specific error message for diagnostic agent use.
+        """
+        stdout = logs.get('stdout', '')
+        stderr = logs.get('stderr', '')
+
+        if 'SUCCESS: Task completed' in stdout and job_result.get('success'):
+            return {'success': True}
+
+        combined = f"{stdout}\n{stderr}"
+        combined_lower = combined.lower()
+
+        # Error classification patterns (ordered by specificity)
+        patterns = {
+            'missing_package': [
+                r'ModuleNotFoundError: No module named',
+                r'ImportError: No module named',
+                r'ImportError: cannot import name',
+            ],
+            'syntax_error': [
+                r'SyntaxError:', r'IndentationError:',
+            ],
+            'data_structure_error': [
+                r'KeyError:', r'IndexError:',
+                r'ValueError:.*(?:shape|column|dimension|expected)',
+            ],
+            'memory_error': [
+                r'MemoryError', r'OutOfMemoryError',
+                r'oom-kill', r'OUT_OF_MEMORY',
+            ],
+            'gpu_error': [
+                r'CUDA error', r'CUDA out of memory',
+                r'RuntimeError:.*CUDA', r'GPU.*not available',
+            ],
+            'disk_quota_error': [
+                r'No space left on device', r'Disk quota exceeded',
+                r'OSError: \[Errno 28\]',
+            ],
+            'binary_not_found': [
+                r'command not found',
+                r'FileNotFoundError.*(?:samtools|bedtools|bcftools|bwa)',
+            ],
+            'permission_error': [
+                r'PermissionError:', r'\[Errno 13\]',
+            ],
+            'network_error': [
+                r'ConnectionError:', r'URLError:',
+                r'TimeoutError:.*download',
+                r'HTTPError: 5\d\d',
+            ],
+            'sbatch_config_error': [
+                r'Invalid partition', r'Invalid account',
+                r'invalid resource specification',
+            ],
+            'runtime_logic_error': [
+                r'AssertionError:', r'TypeError:',
+                r'AttributeError:', r'NameError:',
+                r'ZeroDivisionError:',
+            ],
+            'code_error': [
+                r'Traceback \(most recent call last\)',
+                r'Error in .*\.R:',
+            ],
+        }
+
+        for error_type, pats in patterns.items():
+            for p in pats:
+                m = re.search(p, combined, re.IGNORECASE)
+                if m:
+                    # Extract the actual error message (last meaningful line)
+                    error_message = self._extract_error_message(
+                        stderr or stdout
+                    )
+                    return {
+                        'success': False,
+                        'error_type': error_type,
+                        'error_message': error_message,
+                        'error_summary': f"{error_type}: {error_message[:200]}",
+                    }
+
+        if not job_result.get('success'):
             return {
                 'success': False,
-                'error': f"LLM invocation failed after all retries: {e}"
+                'error_type': 'unknown',
+                'error_message': stderr[-500:] if stderr else 'Unknown error',
+                'error_summary': stderr[-500:] or 'Unknown error',
             }
-        except Exception as e:
-            return {'success': False, 'error': str(e)}
 
-    def _prepend_header(self, script: str, subtask: Dict) -> str:
-        header = f'''#!/usr/bin/env python3
-"""Task: {subtask.get('id', 'unknown')}"""
-import os
-from pathlib import Path
+        return {'success': True}
 
-DRY_RUN = os.environ.get('AGI_DRY_RUN', 'true').lower() == 'true'
-PROJECT_ROOT = Path(os.environ.get('PROJECT_DIR', '.')).resolve()
-os.chdir(PROJECT_ROOT)
+    def _extract_error_message(self, text: str) -> str:
+        """Extract the most relevant error line from output."""
+        lines = text.strip().split('\n')
+        # Walk backwards to find the actual error
+        for line in reversed(lines):
+            line = line.strip()
+            if line and not line.startswith('File ') and not line.startswith('Traceback'):
+                if any(kw in line for kw in [
+                    'Error', 'error', 'Exception', 'FAILED',
+                    'ModuleNotFoundError', 'ImportError',
+                ]):
+                    return line
+        # Fallback: last non-empty line
+        for line in reversed(lines):
+            if line.strip():
+                return line.strip()
+        return text[-200:] if text else "Unknown error"
 
-print(f"[MODE] DRY_RUN={{DRY_RUN}}, PROJECT_ROOT={{PROJECT_ROOT}}")
-
-'''
-        return header + re.sub(r'^#!/usr/bin/env python3?\n?', '', script)
+    # =========================================================================
+    # SBATCH GENERATION (Language-Aware)
+    # =========================================================================
 
     def _generate_sbatch_script(
         self, task_id: str, script_path: Path, env_name: str,
         env_yaml_path: Path, subtask: Dict, routed_slurm: Dict,
         dry_run: bool = True
     ) -> str:
-        """Generate sbatch script using ROUTED cluster settings."""
+        """Generate sbatch script using ROUTED cluster settings.
+
+        v1.2.0: Language dispatch table for execution commands.
+        """
         partition = routed_slurm.get('partition', 'compute1')
         account = routed_slurm.get('account')
         nodes = routed_slurm.get('nodes', 1)
@@ -1033,6 +1478,17 @@ print(f"[MODE] DRY_RUN={{DRY_RUN}}, PROJECT_ROOT={{PROJECT_ROOT}}")
         log_dir.mkdir(parents=True, exist_ok=True)
 
         job_name = f"agi_{task_id}" + ("_dryrun" if dry_run else "_prod")
+
+        # Language dispatch
+        language = self.checkpoint.language or 'python'
+        dispatch = {
+            'python': f'python "{script_path}"',
+            'r': f'Rscript "{script_path}"',
+            'bash': f'bash "{script_path}"',
+            'perl': f'perl "{script_path}"',
+            'java': f'java "{script_path}"',
+        }
+        exec_cmd = dispatch.get(language, f'python "{script_path}"')
 
         # Build SBATCH directives
         lines = [
@@ -1073,6 +1529,7 @@ print(f"[MODE] DRY_RUN={{DRY_RUN}}, PROJECT_ROOT={{PROJECT_ROOT}}")
             "#" + "=" * 70,
             f"# Cluster: {selected_cluster}{gpu_note}",
             f"# Task: {task_id}",
+            f"# Language: {language}",
             f"# Mode: {'DRY-RUN' if dry_run else 'PRODUCTION'}",
             f"# Partition: {partition}, CPUs: {cpus}",
         ])
@@ -1109,287 +1566,207 @@ print(f"[MODE] DRY_RUN={{DRY_RUN}}, PROJECT_ROOT={{PROJECT_ROOT}}")
             "",
             'echo ">>> Checking environment..."',
             'if ! conda env list | grep -q "^${CONDA_ENV} "; then',
-            '    echo ">>> Creating environment: ${CONDA_ENV}"',
-            (
-                '    conda env create -f "${ENV_YAML}" -n "${CONDA_ENV}" '
-                '|| { echo "ERROR: env create failed"; exit 1; }'
-            ),
+            '    echo ">>> Creating environment from YAML..."',
+            '    conda env create -f "${ENV_YAML}" -n "${CONDA_ENV}" || {',
+            '        echo "ERROR: Failed to create environment"',
+            '        exit 1',
+            '    }',
             'fi',
             "",
-            'echo ">>> Activating: ${CONDA_ENV}"',
+            'echo ">>> Activating ${CONDA_ENV}..."',
             'conda activate "${CONDA_ENV}"',
-            'echo ">>> Python: $(which python)"',
             "",
-            "# Environment variables",
+        ])
+
+        # GPU-specific: unset SLURM vars that interfere
+        if is_gpu:
+            lines.extend([
+                '# Unset SLURM GPU vars that interfere with frameworks',
+                'unset CUDA_VISIBLE_DEVICES 2>/dev/null || true',
+                'unset ROCR_VISIBLE_DEVICES 2>/dev/null || true',
+                "",
+            ])
+
+        # Set environment variables
+        lines.extend([
+            '# Environment variables',
             f'export AGI_DRY_RUN="{"true" if dry_run else "false"}"',
             f'export PROJECT_DIR="{self.project_root}"',
-            'echo ">>> AGI_DRY_RUN=${AGI_DRY_RUN}"',
             "",
-            "# Run script",
-            f'cd "{self.project_root}"',
-            f'conda run -n "${{CONDA_ENV}}" python "{script_path}"',
+            f'echo ">>> Running {language} script..."',
+            f'echo ">>> DRY_RUN=$AGI_DRY_RUN"',
             "",
-            "EXIT_CODE=$?",
+            exec_cmd,
             "",
-            "echo '=============================================='",
-            "echo 'End: '$(date)",
-            "echo 'Exit code: '$EXIT_CODE",
-            "echo '=============================================='",
-            "",
-            f'touch "{log_dir}/{job_name}_${{SLURM_JOB_ID}}.complete"',
-            "exit $EXIT_CODE",
+            'echo ""',
+            'echo "=============================================="',
+            'echo "Done: $(date)"',
+            'echo "=============================================="',
         ])
 
         return '\n'.join(lines) + '\n'
 
+    def _fix_sbatch_submission_error(
+        self, error: str, routed_slurm: Dict
+    ) -> bool:
+        """Try to fix common sbatch submission errors.
+
+        Rule-based repair for known SLURM config issues.
+        Returns True if a fix was applied.
+        """
+        if not self.checkpoint or not self.checkpoint.sbatch_path:
+            return False
+
+        path = Path(self.checkpoint.sbatch_path)
+        if not path.exists():
+            return False
+
+        content = path.read_text()
+        fixed = False
+
+        # Invalid partition
+        if 'Invalid partition' in error:
+            # Fall back to default partition
+            content = re.sub(
+                r'#SBATCH --partition=\S+',
+                f"#SBATCH --partition={routed_slurm.get('partition', 'compute1')}",
+                content
+            )
+            fixed = True
+
+        # Memory not allowed on GPU
+        if '--mem' in error and 'not allowed' in error.lower():
+            content = re.sub(r'#SBATCH --mem=\S+\n', '', content)
+            fixed = True
+
+        if fixed:
+            path.write_text(content)
+        return fixed
+
+    def _adjust_sbatch_memory(self, factor: int = 2):
+        """Multiply the --mem value in the sbatch by a factor."""
+        if not self.checkpoint or not self.checkpoint.sbatch_path:
+            return
+        path = Path(self.checkpoint.sbatch_path)
+        if not path.exists():
+            return
+
+        content = path.read_text()
+        m = re.search(r'#SBATCH --mem=(\d+)([GMK]?)', content)
+        if m:
+            val = int(m.group(1)) * factor
+            unit = m.group(2) or 'G'
+            content = re.sub(
+                r'#SBATCH --mem=\S+',
+                f"#SBATCH --mem={val}{unit}",
+                content
+            )
+            path.write_text(content)
+
     # =========================================================================
-    # CONDA MANAGEMENT
+    # ENVIRONMENT MANAGEMENT
     # =========================================================================
 
     def _create_conda_environment(self) -> Dict[str, Any]:
-        """Create conda environment from YAML with pip fallback.
-
-        v3.2.2 Fix C: If conda env create fails (e.g., a package like popv
-        is not on conda-forge), this method now:
-        1. Attempts to create a minimal env without the failing packages
-        2. Retries failed packages individually with pip install
-        3. Reports which packages were installed via pip fallback
-        """
+        """Create conda env from YAML. Pip fallback on failure."""
         if not self.checkpoint or not self.checkpoint.env_yaml_path:
-            return {'success': False, 'error': 'No env yaml'}
+            return {'success': False, 'error': 'No env YAML path'}
 
+        env_yaml_path = self.checkpoint.env_yaml_path
         env_name = self.checkpoint.env_name
-        env_yaml = Path(self.checkpoint.env_yaml_path)
 
-        if not env_yaml.exists():
-            return {'success': False, 'error': f'YAML not found: {env_yaml}'}
+        if self.conda_tools:
+            result = self.conda_tools.create_environment(
+                yaml_path=env_yaml_path,
+                env_name=env_name,
+            )
+            return result
 
+        # Fallback: direct subprocess
         try:
-            # Check if env already exists
             result = subprocess.run(
-                ['conda', 'env', 'list'],
-                capture_output=True, text=True, timeout=60
-            )
-            if env_name in result.stdout:
-                return {'success': True, 'already_exists': True}
-
-            # Try creating the full environment
-            result = subprocess.run(
-                ['conda', 'env', 'create', '-f', str(env_yaml), '-n', env_name],
-                capture_output=True, text=True, timeout=600
+                ['conda', 'env', 'create', '-f', env_yaml_path,
+                 '-n', env_name, '--yes'],
+                capture_output=True, text=True, timeout=1200,
             )
 
-            if result.returncode == 0 or 'already exists' in result.stderr:
+            if result.returncode == 0:
                 return {'success': True}
 
-            # ── Conda failed — attempt pip fallback ───────────────────────
+            # Try pip fallback for failed packages
             stderr = result.stderr
-            print(f"  ⚠ Conda env create failed, attempting pip fallback...")
-            agent_logger.log_reflection(
-                agent_name=self.agent_id,
-                task_id="conda_fallback",
-                reflection=f"Conda env create failed: {stderr[:300]}"
+            failed = re.findall(
+                r'PackagesNotFoundError.*?- (\S+)', stderr, re.DOTALL
             )
-
-            # Parse which packages failed from stderr
-            failed_pkgs = self._parse_failed_conda_packages(stderr, env_yaml)
-
-            if not failed_pkgs:
-                # Can't determine what failed — return original error
-                return {'success': False, 'error': stderr[:500]}
-
-            # Create a stripped YAML without the failing packages
-            stripped_yaml = self._create_stripped_yaml(env_yaml, failed_pkgs)
-            if stripped_yaml:
-                stripped_path = env_yaml.with_suffix('.stripped.yml')
-                stripped_path.write_text(stripped_yaml)
-
-                # Try creating env with stripped YAML
-                result2 = subprocess.run(
-                    ['conda', 'env', 'create', '-f', str(stripped_path),
-                     '-n', env_name],
-                    capture_output=True, text=True, timeout=600
+            if failed:
+                # Remove failed packages from YAML, rebuild, pip install them
+                return self._pip_fallback_build(
+                    env_yaml_path, env_name, failed, stderr
                 )
 
-                if result2.returncode != 0 and 'already exists' not in result2.stderr:
-                    return {
-                        'success': False,
-                        'error': f"Stripped env also failed: {result2.stderr[:300]}"
-                    }
-
-            # Now pip install the failed packages into the env
-            pip_installed = []
-            pip_failed = []
-            for pkg in failed_pkgs:
-                pip_result = subprocess.run(
-                    ['conda', 'run', '-n', env_name,
-                     'pip', 'install', pkg],
-                    capture_output=True, text=True, timeout=300
-                )
-                if pip_result.returncode == 0:
-                    pip_installed.append(pkg)
-                    print(f"    ✓ pip installed: {pkg}")
-                else:
-                    pip_failed.append(pkg)
-                    print(f"    ✗ pip failed: {pkg}")
-
-            if pip_failed:
-                agent_logger.log_reflection(
-                    agent_name=self.agent_id,
-                    task_id="conda_fallback",
-                    reflection=(
-                        f"Pip fallback partial: "
-                        f"installed={pip_installed}, failed={pip_failed}"
-                    )
-                )
-                return {
-                    'success': False,
-                    'error': (
-                        f"Pip fallback failed for: {', '.join(pip_failed)}. "
-                        f"Installed via pip: {', '.join(pip_installed)}"
-                    )
-                }
-
-            agent_logger.log_reflection(
-                agent_name=self.agent_id,
-                task_id="conda_fallback",
-                reflection=(
-                    f"Pip fallback succeeded: {', '.join(pip_installed)}"
-                )
-            )
-            return {
-                'success': True,
-                'pip_fallback': pip_installed,
-            }
-
+            return {'success': False, 'error': stderr[-500:]}
         except Exception as e:
             return {'success': False, 'error': str(e)}
 
-    def _parse_failed_conda_packages(
-        self, stderr: str, env_yaml_path: Path
-    ) -> List[str]:
-        """Extract package names that caused conda env create to fail.
+    def _pip_fallback_build(
+        self, yaml_path: str, env_name: str,
+        failed_packages: List[str], original_error: str
+    ) -> Dict[str, Any]:
+        """Remove failed packages from YAML, rebuild, pip install them."""
+        if not yaml or not Path(yaml_path).exists():
+            return {'success': False, 'error': original_error}
 
-        Parses common conda error patterns:
-        - "PackagesNotFoundError: The following packages are not available..."
-        - "ResolvePackageNotFound: ..."
-        - "Nothing provides <pkg> needed by ..."
-        - "UnsatisfiableError: ..."
-        """
-        failed = []
+        with open(yaml_path) as f:
+            env_data = yaml.safe_load(f)
 
-        # Pattern 1: PackagesNotFoundError / ResolvePackageNotFound
-        not_found = re.findall(
-            r'[-–]\s*([a-zA-Z0-9_\-]+(?:[><=!]+\S*)?)',
-            stderr
-        )
-        # Filter to only actual package names (not flags or noise)
-        for pkg in not_found:
-            name = re.split(r'[><=!~]', pkg)[0].strip()
-            if name and len(name) > 1 and not name.startswith('-'):
-                if name.lower() not in {'the', 'following', 'packages', 'not',
-                                         'available', 'from', 'current', 'channels'}:
-                    failed.append(name)
+        # Remove failed from dependencies
+        deps = env_data.get('dependencies', [])
+        cleaned_deps = []
+        for dep in deps:
+            if isinstance(dep, str):
+                name = re.split(r'[><=!]', dep)[0].strip()
+                if name not in failed_packages:
+                    cleaned_deps.append(dep)
+            else:
+                cleaned_deps.append(dep)
+        env_data['dependencies'] = cleaned_deps
 
-        # Pattern 2: "nothing provides <pkg>"
-        nothing_provides = re.findall(
-            r'nothing provides\s+([a-zA-Z0-9_\-]+)', stderr, re.IGNORECASE
-        )
-        failed.extend(nothing_provides)
+        # Write cleaned YAML
+        with open(yaml_path, 'w') as f:
+            yaml.dump(env_data, f, default_flow_style=False)
 
-        # Pattern 3: If we can read the YAML, cross-ref with known pip-only
-        if not failed and env_yaml_path.exists():
+        # Rebuild
+        try:
+            result = subprocess.run(
+                ['conda', 'env', 'create', '-f', yaml_path,
+                 '-n', env_name, '--yes', '--force'],
+                capture_output=True, text=True, timeout=1200,
+            )
+            if result.returncode != 0:
+                return {'success': False, 'error': result.stderr[-500:]}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+        # Pip install failed packages
+        for pkg in failed_packages:
             try:
-                content = env_yaml_path.read_text()
-                if yaml:
-                    parsed = yaml.safe_load(content)
-                    deps = parsed.get('dependencies', [])
-                    for dep in deps:
-                        if isinstance(dep, str):
-                            name = re.split(r'[><=!~]', dep)[0].strip().lower()
-                            # Check against the known pip-only set
-                            KNOWN_PIP_ONLY = {
-                                'popv', 'celltypist', 'decoupler', 'episcanpy',
-                                'scanpy-scripts', 'scvi-tools', 'scvi', 'scvelo',
-                                'cellbender', 'cellxgene-census', 'cellxgene',
-                                'pertpy', 'muon', 'moscot', 'squidpy',
-                                'cell2location', 'tangram-sc', 'stereopy',
-                                'commot', 'spatialdm', 'stlearn',
-                            }
-                            if name in KNOWN_PIP_ONLY:
-                                failed.append(dep)
+                subprocess.run(
+                    ['conda', 'run', '-n', env_name,
+                     'pip', 'install', pkg],
+                    capture_output=True, text=True, timeout=300,
+                )
+                # Update YAML pip section
+                if self.conda_tools:
+                    self.conda_tools.update_yaml_with_package(
+                        yaml_path, pkg, section="pip"
+                    )
             except Exception:
                 pass
 
-        # Deduplicate
-        seen = set()
-        unique = []
-        for pkg in failed:
-            name = re.split(r'[><=!~]', pkg)[0].strip().lower()
-            if name not in seen:
-                seen.add(name)
-                unique.append(pkg)
-
-        return unique
-
-    def _create_stripped_yaml(
-        self, original_yaml: Path, remove_packages: List[str]
-    ) -> Optional[str]:
-        """Create a copy of the env YAML with specified packages removed."""
-        try:
-            content = original_yaml.read_text()
-            remove_names = {
-                re.split(r'[><=!~]', p)[0].strip().lower()
-                for p in remove_packages
-            }
-
-            if yaml:
-                parsed = yaml.safe_load(content)
-                if not parsed or 'dependencies' not in parsed:
-                    return None
-
-                new_deps = []
-                for dep in parsed['dependencies']:
-                    if isinstance(dep, str):
-                        name = re.split(r'[><=!~]', dep)[0].strip().lower()
-                        if name not in remove_names:
-                            new_deps.append(dep)
-                    elif isinstance(dep, dict):
-                        # pip: section — also strip removed packages
-                        if 'pip' in dep:
-                            new_pip = [
-                                p for p in dep['pip']
-                                if re.split(r'[><=!~]', str(p))[0].strip().lower()
-                                not in remove_names
-                            ]
-                            if new_pip:
-                                new_deps.append({'pip': new_pip})
-                        else:
-                            new_deps.append(dep)
-
-                parsed['dependencies'] = new_deps
-                import io
-                buf = io.StringIO()
-                yaml.dump(parsed, buf, default_flow_style=False)
-                return buf.getvalue()
-            else:
-                # Fallback: line-by-line removal (no yaml module)
-                lines = content.split('\n')
-                filtered = []
-                for line in lines:
-                    skip = False
-                    for pkg_name in remove_names:
-                        if re.search(rf'^\s*-\s*{re.escape(pkg_name)}', line):
-                            skip = True
-                            break
-                    if not skip:
-                        filtered.append(line)
-                return '\n'.join(filtered)
-
-        except Exception:
-            return None
+        return {'success': True}
 
     def _cleanup_conda_environment(self) -> Dict[str, Any]:
+        """Remove the conda environment, preserving the YAML."""
         if not self.checkpoint or not self.checkpoint.env_name:
             return {'success': True}
 
@@ -1452,62 +1829,60 @@ print(f"[MODE] DRY_RUN={{DRY_RUN}}, PROJECT_ROOT={{PROJECT_ROOT}}")
             return {'success': False, 'error': str(e)}
 
     def _wait_for_job(self) -> Dict[str, Any]:
+        """Poll squeue until job completes."""
         if not self.checkpoint or not self.checkpoint.current_job_id:
             return {'success': False, 'error': 'No job ID'}
 
         job_id = self.checkpoint.current_job_id
-        start = time.time()
+        poll_interval = self.slurm_config.get('poll_interval', 30)
+        max_polls = self.slurm_config.get('max_poll_attempts', 8640)
 
-        while time.time() - start < self.JOB_TIMEOUT:
-            status = self._get_job_status(job_id)
+        for _ in range(max_polls):
+            try:
+                result = subprocess.run(
+                    ['squeue', '-j', job_id, '-h', '-o', '%T'],
+                    capture_output=True, text=True, timeout=30,
+                )
+                state = result.stdout.strip()
 
-            if status['state'] == 'COMPLETED':
-                return {'success': True, 'state': 'COMPLETED'}
+                if not state:
+                    # Job finished — check sacct
+                    sacct = subprocess.run(
+                        ['sacct', '-j', job_id, '-n', '-o',
+                         'State', '-X'],
+                        capture_output=True, text=True, timeout=30,
+                    )
+                    final_state = sacct.stdout.strip().split('\n')[0].strip()
+                    success = final_state in ('COMPLETED',)
+                    return {
+                        'success': success,
+                        'state': final_state,
+                        'job_id': job_id,
+                    }
 
-            if status['state'] in [
-                'FAILED', 'CANCELLED', 'TIMEOUT', 'NODE_FAIL'
-            ]:
-                return {'success': False, 'state': status['state']}
+                if state in ('FAILED', 'CANCELLED', 'TIMEOUT',
+                             'NODE_FAIL', 'PREEMPTED', 'OUT_OF_MEMORY'):
+                    return {
+                        'success': False,
+                        'state': state,
+                        'job_id': job_id,
+                    }
 
-            if status['state'] == 'UNKNOWN':
-                log_dir = self.project_root / 'slurm' / 'logs'
-                for marker in log_dir.glob(f"*_{job_id}.complete"):
-                    return {'success': True, 'state': 'COMPLETED'}
+            except Exception:
+                pass
 
-            elapsed = int(time.time() - start)
-            if elapsed % 60 == 0:
-                print(f"    ... Job {job_id}: {status['state']} ({elapsed}s)")
-            time.sleep(self.JOB_POLL_INTERVAL)
+            time.sleep(poll_interval)
 
-        return {'success': False, 'state': 'TIMEOUT'}
-
-    def _get_job_status(self, job_id: str) -> Dict[str, Any]:
-        try:
-            result = subprocess.run(
-                ['squeue', '-j', job_id, '-h', '-o', '%T'],
-                capture_output=True, text=True, timeout=30
-            )
-            if result.stdout.strip():
-                return {'state': result.stdout.strip()}
-
-            result = subprocess.run(
-                ['sacct', '-j', job_id, '-n', '-o', 'State', '-P'],
-                capture_output=True, text=True, timeout=30
-            )
-            if result.stdout.strip():
-                return {'state': result.stdout.strip().split('\n')[0]}
-
-            return {'state': 'UNKNOWN'}
-        except Exception:
-            return {'state': 'UNKNOWN'}
+        return {'success': False, 'state': 'POLL_TIMEOUT', 'job_id': job_id}
 
     def _collect_job_logs(self) -> Dict[str, str]:
+        """Collect stdout/stderr from SLURM log files."""
         logs = {'stdout': '', 'stderr': ''}
         if not self.checkpoint or not self.checkpoint.current_job_id:
             return logs
 
-        log_dir = self.project_root / 'slurm' / 'logs'
         job_id = self.checkpoint.current_job_id
+        log_dir = self.project_root / 'slurm' / 'logs'
 
         for f in log_dir.glob(f"*_{job_id}.out"):
             try:
@@ -1549,138 +1924,311 @@ print(f"[MODE] DRY_RUN={{DRY_RUN}}, PROJECT_ROOT={{PROJECT_ROOT}}")
         path.write_text(content)
 
     # =========================================================================
-    # ANALYSIS
+    # SCRIPT GENERATION HELPERS
     # =========================================================================
 
-    def _analyze_job_result(
-        self, job_result: Dict, logs: Dict[str, str], subtask: Dict
-    ) -> Dict[str, Any]:
-        stdout = logs.get('stdout', '')
-        stderr = logs.get('stderr', '')
+    def _detect_language(self, subtask: Dict) -> str:
+        """Detect script language from subtask metadata."""
+        desc = (subtask.get('description', '') + ' '
+                + ' '.join(subtask.get('packages', []))).lower()
 
-        if 'SUCCESS: Task completed' in stdout and job_result.get('success'):
-            return {'success': True}
+        r_keywords = [
+            'seurat', 'bioconductor', 'singlecellexperiment',
+            'rscript', 'ggplot', 'dplyr', 'tidyverse',
+            'deseq2', 'edger', 'limma',
+        ]
+        bash_keywords = ['bash', 'shell script', 'pipeline of commands']
 
-        combined = f"{stdout}\n{stderr}".lower()
+        for kw in r_keywords:
+            if kw in desc:
+                return 'r'
+        for kw in bash_keywords:
+            if kw in desc:
+                return 'bash'
+        return 'python'
 
-        patterns = {
-            'missing_package': [
-                r'modulenotfounderror', r'no module named'
-            ],
-            'file_not_found': [
-                r'filenotfounderror', r'no such file'
-            ],
-            'syntax_error': [
-                r'syntaxerror', r'indentationerror'
-            ],
-            'memory_error': [
-                r'memoryerror', r'out of memory', r'oom'
-            ],
-            'gpu_error': [
-                r'cuda error', r'cuda out of memory',
-                r'gpu.*not available'
-            ],
+    def _build_python_script_prompt(
+        self, desc, outline, packages, inputs, outputs
+    ) -> str:
+        return f"""Generate a complete Python script based on this validated outline.
+
+TASK: {desc}
+PACKAGES: {', '.join(packages)}
+INPUTS: {', '.join(inputs) if inputs else 'None'}
+OUTPUTS: {', '.join(outputs) if outputs else 'None'}
+
+OUTLINE:
+{outline}
+
+REQUIRED STRUCTURE:
+```python
+#!/usr/bin/env python3
+import os
+from pathlib import Path
+
+DRY_RUN = os.environ.get('AGI_DRY_RUN', 'true').lower() == 'true'
+PROJECT_ROOT = Path(os.environ.get('PROJECT_DIR', '.')).resolve()
+os.chdir(PROJECT_ROOT)
+
+print(f"[MODE] DRY_RUN={{DRY_RUN}}, PROJECT_ROOT={{PROJECT_ROOT}}")
+
+def main():
+    # Implement every step from the outline
+    # Wrap saves with: if not DRY_RUN: save() else: print("[DRY-RUN] Would save...")
+    print("SUCCESS: Task completed")
+
+if __name__ == "__main__":
+    main()
+```
+
+Generate ONLY the complete Python code."""
+
+    def _build_r_script_prompt(
+        self, desc, outline, packages, inputs, outputs
+    ) -> str:
+        return f"""Generate a complete R script based on this validated outline.
+
+TASK: {desc}
+PACKAGES: {', '.join(packages)}
+INPUTS: {', '.join(inputs) if inputs else 'None'}
+OUTPUTS: {', '.join(outputs) if outputs else 'None'}
+
+OUTLINE:
+{outline}
+
+REQUIRED STRUCTURE:
+- Load all required libraries at the top
+- Set PROJECT_ROOT from environment variable
+- Implement every step from the outline
+- Print "SUCCESS: Task completed" on completion
+
+Generate ONLY the R code."""
+
+    def _build_generic_script_prompt(
+        self, desc, outline, packages, inputs, outputs, language
+    ) -> str:
+        return f"""Generate a complete {language} script based on this outline.
+
+TASK: {desc}
+OUTLINE: {outline}
+
+Requirements:
+- Implement every step from the outline
+- Print "SUCCESS: Task completed" on completion
+
+Generate ONLY the {language} code."""
+
+    def _extract_code_from_response(
+        self, response: str, language: str
+    ) -> str:
+        """Extract code from LLM response, stripping markdown fences."""
+        lang_tags = {
+            'python': ['python', 'py'],
+            'r': ['r', 'R'],
+            'bash': ['bash', 'sh'],
+            'perl': ['perl'],
+            'java': ['java'],
+        }
+        tags = lang_tags.get(language, [language])
+
+        # Try extracting from code blocks
+        for tag in tags + ['']:
+            pattern = rf'```{tag}\s*\n(.*?)\n```'
+            m = re.search(pattern, response, re.DOTALL | re.IGNORECASE)
+            if m:
+                return m.group(1).strip()
+
+        # No code block found — strip any remaining fences
+        content = re.sub(
+            r'^```(?:\w+)?\n?', '', response, flags=re.MULTILINE
+        )
+        content = re.sub(
+            r'\n?```$', '', content, flags=re.MULTILINE
+        ).strip()
+        return content
+
+    def _prepend_python_header(self, script: str, subtask: Dict) -> str:
+        header = f'''#!/usr/bin/env python3
+"""Task: {subtask.get('id', 'unknown')}"""
+import os
+from pathlib import Path
+
+DRY_RUN = os.environ.get('AGI_DRY_RUN', 'true').lower() == 'true'
+PROJECT_ROOT = Path(os.environ.get('PROJECT_DIR', '.')).resolve()
+os.chdir(PROJECT_ROOT)
+
+print(f"[MODE] DRY_RUN={{DRY_RUN}}, PROJECT_ROOT={{PROJECT_ROOT}}")
+
+'''
+        return header + re.sub(r'^#!/usr/bin/env python3?\n?', '', script)
+
+    # =========================================================================
+    # ENVIRONMENT YAML FALLBACK
+    # =========================================================================
+
+    def _generate_env_yaml_fallback(
+        self, subtask: Dict, script_content: str,
+        env_name: str, language: str
+    ) -> str:
+        """Generate env YAML when LLM dependency review is unavailable.
+
+        Falls back to regex-based import extraction + known pip-only routing.
+        Preserved from v3.2.2 Fix C.
+        """
+        KNOWN_PIP_ONLY = {
+            'popv', 'celltypist', 'scvi-tools', 'decoupler',
+            'episcanpy', 'cell2location', 'tangram',
+            'squidpy', 'magic-impute', 'bbknn',
+            'scrublet', 'doubletdetection', 'scanorama',
+            'harmonypy', 'mnnpy', 'pyscenic',
         }
 
-        for error_type, pats in patterns.items():
-            for p in pats:
-                if re.search(p, combined):
-                    return {
-                        'success': False,
-                        'error_type': error_type,
-                        'error_summary': f"{error_type}: see logs",
-                    }
+        packages = set(subtask.get('packages', []))
 
-        if not job_result.get('success'):
-            return {
-                'success': False,
-                'error_summary': stderr[-500:] or 'Unknown error'
-            }
+        # Extract imports from script
+        if language == 'python':
+            for m in re.finditer(
+                r'^\s*(?:import|from)\s+(\w+)', script_content, re.MULTILINE
+            ):
+                packages.add(m.group(1))
 
-        return {'success': True}
+        # Parse code_hints for pip: sections
+        hint_pip = set()
+        for hint in subtask.get('code_hints', []):
+            if isinstance(hint, str):
+                pip_section = re.search(
+                    r'pip:\s*\n((?:\s+- .+\n?)+)', hint, re.MULTILINE
+                )
+                if pip_section:
+                    for line in pip_section.group(1).split('\n'):
+                        line = line.strip().lstrip('- ').strip()
+                        if line:
+                            name = re.split(r'[><=!~]', line)[0].strip().lower()
+                            if name and name != 'pip':
+                                hint_pip.add(name)
 
-    def _reflect_and_update(
-        self, subtask: Dict, analysis: Dict, logs: Dict[str, str]
-    ) -> Dict[str, Any]:
-        """Reflect on failure and update the script.
+        # Route packages
+        conda_deps = []
+        pip_deps = []
+        stdlib = {
+            'os', 'sys', 're', 'json', 'pathlib', 'math',
+            'collections', 'itertools', 'functools', 'datetime',
+            'subprocess', 'typing', 'logging', 'io', 'csv',
+            'glob', 'shutil', 'time', 'copy', 'warnings',
+            'argparse', 'pickle', 'hashlib', 'tempfile',
+            'multiprocessing', 'threading', 'unittest',
+        }
 
-        v3.2.1: Uses invoke_resilient with exponential backoff retry.
-        Survives transient Ollama 500 errors without hanging.
-        """
-        if not self.checkpoint or not self.checkpoint.script_path:
-            return {'success': False, 'error': 'No script'}
+        for pkg in packages:
+            pkg_lower = pkg.lower()
+            if pkg_lower in stdlib:
+                continue
+            if pkg_lower in KNOWN_PIP_ONLY or pkg_lower in hint_pip:
+                pip_deps.append(pkg)
+            elif '/' in pkg or pkg.startswith('git+'):
+                pip_deps.append(pkg)
+            else:
+                conda_deps.append(pkg)
 
-        script_path = Path(self.checkpoint.script_path)
-        if not script_path.exists():
-            return {'success': False, 'error': 'Script not found'}
+        # Build YAML
+        python_version = '3.10'
+        lines = [
+            f"name: {env_name}",
+            "channels:",
+            "  - nodefaults",
+            "  - conda-forge",
+            "  - bioconda",
+            "dependencies:",
+            f"  - python={python_version}",
+            "  - pip",
+        ]
+        for dep in sorted(set(conda_deps)):
+            lines.append(f"  - {dep}")
 
-        current = script_path.read_text()
+        if pip_deps:
+            lines.append("  - pip:")
+            for dep in sorted(set(pip_deps)):
+                lines.append(f"    - {dep}")
 
-        prompt = f"""Fix this Python script.
+        return '\n'.join(lines) + '\n'
 
-ERROR: {analysis.get('error_type', 'unknown')}
+    # =========================================================================
+    # DISK MANAGEMENT
+    # =========================================================================
 
-STDERR:
-```
-{logs.get('stderr', '')[-2000:]}
-```
+    def _ensure_disk_space(self, force: bool = False):
+        """Proactive disk space check and cleanup."""
+        try:
+            from utils.disk_manager import DiskManager
+            if self._disk_manager is None:
+                self._disk_manager = DiskManager()
+            if force:
+                self._disk_manager.emergency_cleanup()
+            else:
+                self._disk_manager.proactive_cleanup()
+        except ImportError:
+            # DiskManager not available, try direct cleanup
+            if force:
+                try:
+                    subprocess.run(
+                        ['conda', 'clean', '--all', '--yes'],
+                        capture_output=True, timeout=120,
+                    )
+                except Exception:
+                    pass
 
-SCRIPT:
-```python
-{current}
-```
+    # =========================================================================
+    # CHECKPOINT MANAGEMENT
+    # =========================================================================
 
-Provide the COMPLETE fixed script between ### FIXED ### and ### END ###"""
+    def _load_or_create_checkpoint(
+        self, task_id: str
+    ) -> TaskCheckpoint:
+        checkpoint_dir = self.project_root / 'temp' / 'checkpoints'
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_path = checkpoint_dir / f"{task_id}.json"
+
+        if checkpoint_path.exists():
+            try:
+                with open(checkpoint_path) as f:
+                    data = json.load(f)
+                cp = TaskCheckpoint.from_dict(data)
+                print(
+                    f"  ✓ Resumed checkpoint: phase={cp.phase}, "
+                    f"iter={cp.iteration}, status={cp.status}"
+                )
+                return cp
+            except Exception as e:
+                logger.warning(f"Checkpoint load failed: {e}")
+
+        return TaskCheckpoint.new(task_id)
+
+    def _update_checkpoint(self, **kwargs):
+        if not self.checkpoint:
+            return
+
+        for key, val in kwargs.items():
+            if hasattr(self.checkpoint, key):
+                setattr(self.checkpoint, key, val)
+
+        self.checkpoint.updated_at = datetime.now().isoformat()
+
+        checkpoint_dir = self.project_root / 'temp' / 'checkpoints'
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        path = checkpoint_dir / f"{self.checkpoint.task_id}.json"
 
         try:
-            response = invoke_resilient(
-                self.llm,
-                prompt,
-                ollama_base_url=self.ollama_base_url,
-                max_retries=15,
-                initial_backoff=20.0,
-            )
-
-            match = re.search(
-                r'### FIXED ###\s*```python\s*(.*?)\s*```\s*### END ###',
-                response, re.DOTALL
-            )
-            if not match:
-                match = re.search(
-                    r'```python\s*(.*?)\s*```', response, re.DOTALL
-                )
-
-            if match:
-                fixed = match.group(1).strip()
-                if fixed and len(fixed) > 50:
-                    script_path.write_text(fixed)
-                    return {'success': True}
-
-            return {'success': False, 'error': 'Could not extract fix'}
-        except LLMInvocationError as e:
-            return {
-                'success': False,
-                'error': f"LLM invocation failed after all retries: {e}"
-            }
+            with open(path, 'w') as f:
+                json.dump(self.checkpoint.to_dict(), f, indent=2)
         except Exception as e:
-            return {'success': False, 'error': str(e)}
+            logger.warning(f"Checkpoint save failed: {e}")
 
-    def _generate_completion_report(
-        self, subtask: Dict, logs: Dict, outputs: Dict,
-        routed_cluster: str = None
-    ) -> str:
-        cluster = routed_cluster or (
-            self.checkpoint.routed_cluster if self.checkpoint else 'unknown'
+    def _delete_checkpoint(self, task_id: str):
+        path = (
+            self.project_root / 'temp' / 'checkpoints' / f"{task_id}.json"
         )
-        return (
-            f"# Task: "
-            f"{self.checkpoint.task_id if self.checkpoint else 'unknown'}\n"
-            f"Completed: {datetime.now().isoformat()}\n"
-            f"Cluster: {cluster}\n"
-            f"Iterations: "
-            f"{self.checkpoint.iteration if self.checkpoint else 0}\n"
-            f"Outputs: {', '.join(outputs.get('found_files', []))}\n"
-        )
+        if path.exists():
+            path.unlink()
 
     # =========================================================================
     # HELPERS
@@ -1739,7 +2287,27 @@ Provide the COMPLETE fixed script between ### FIXED ### and ### END ###"""
         )
         return result
 
+    def _generate_completion_report(
+        self, subtask: Dict, logs: Dict, outputs: Dict,
+        routed_cluster: str = None
+    ) -> str:
+        cluster = routed_cluster or (
+            self.checkpoint.routed_cluster if self.checkpoint else 'unknown'
+        )
+        return (
+            f"# Task: "
+            f"{self.checkpoint.task_id if self.checkpoint else 'unknown'}\n"
+            f"Completed: {datetime.now().isoformat()}\n"
+            f"Cluster: {cluster}\n"
+            f"Language: {self.checkpoint.language or 'python'}\n"
+            f"Iterations: "
+            f"{self.checkpoint.iteration if self.checkpoint else 0}\n"
+            f"Diagnostic invocations: "
+            f"{self.checkpoint.diagnostic_invocations if self.checkpoint else 0}\n"
+            f"Outputs: {', '.join(outputs.get('found_files', []))}\n"
+        )
 
-# Aliases
+
+# Aliases for backward compatibility
 ScriptFirstSubAgent = ScriptFirstSubAgentV3
 SubAgentV3 = ScriptFirstSubAgentV3

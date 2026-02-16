@@ -1,12 +1,12 @@
 # =============================================================================
-# AGI Pipeline v3.2 - Cluster Configuration
+# AGI Pipeline v1.2.0 - Cluster Configuration
 # =============================================================================
 # 
 # PRIMARY TARGET: ARC HPC Cluster (GPU + CPU)
 # FALLBACK: Zeus CPU Cluster (preserved for backward compatibility)
 #
 # Architecture:
-#   - Master pipeline runs on ARC GPU node (Ollama + qwen3-coder-next:latest)
+#   - Master pipeline runs on ARC GPU node (Ollama + qwen3-coder:latest)
 #   - Subtask scripts routed to GPU or CPU partitions based on task needs
 #   - AGI_CLUSTER sets DEFAULT subtask target (compute1 for CPU tasks)
 #   - AGI_GPU_CLUSTER sets GPU subtask target (gpu1v100 for GPU tasks)
@@ -15,6 +15,9 @@
 #   - Do NOT specify --mem on GPU partitions (causes allocation failures)
 #   - Use --gres=gpu:N format (not --gpus N)
 #   - Standard GPU request: --gres=gpu:1 -N 1 -n 1 -c 80
+#
+# CHANGELOG v1.2.0:
+#   - Added language_dispatch section for Phase 3 multi-language sbatch gen
 #
 # =============================================================================
 
@@ -292,3 +295,77 @@ gpu_packages:
   - accelerate
   - deepspeed
   - triton
+
+# =============================================================================
+# LANGUAGE DISPATCH (v1.2.0 - Phase 3 Multi-Language Sbatch Generation)
+# =============================================================================
+# Defines how to execute scripts in each supported language within an sbatch.
+# Used by Phase 3 (sbatch generation) to produce the correct execution command,
+# shebang line, and any pre-execution steps (compilation, permissions).
+#
+# The sub-agent's _generate_sbatch_for_language() method reads this table.
+# The dispatch table in utils/dependency_parser.py mirrors this data for use
+# outside of sbatch generation (diagnostic agent, language detection).
+#
+# Fields:
+#   command       — Execution command template. {script} is replaced with the
+#                   script path relative to project root.
+#   shebang       — Shebang line for the generated sbatch wrapper (not the
+#                   analysis script itself — the sbatch already has #!/bin/bash).
+#                   This is informational for the sub-agent's script generation.
+#   comment_prefix — Comment syntax for the language (used when adding headers).
+#   permissions   — File permissions to set before execution (null = none needed).
+#   compile_first — Compilation command to run before execution (null = none).
+#                   {script} is replaced with the script path.
+#   conda_base    — Base conda package required for this language runtime.
+#                   Used by Phase 2 dependency extraction to ensure the runtime
+#                   is always included in the environment YAML.
+#   env_check_cmd — Command to verify a package is installed in the conda env.
+#                   {package} is replaced with the package name.
+# =============================================================================
+
+language_dispatch:
+  python:
+    command: "python {script}"
+    shebang: "#!/usr/bin/env python3"
+    comment_prefix: "#"
+    permissions: null
+    compile_first: null
+    conda_base: "python"
+    env_check_cmd: 'python -c "import {package}"'
+
+  r:
+    command: "Rscript {script}"
+    shebang: "#!/usr/bin/env Rscript"
+    comment_prefix: "#"
+    permissions: null
+    compile_first: null
+    conda_base: "r-base"
+    env_check_cmd: 'Rscript -e "library({package})"'
+
+  bash:
+    command: "bash {script}"
+    shebang: "#!/bin/bash"
+    comment_prefix: "#"
+    permissions: "+x"
+    compile_first: null
+    conda_base: null
+    env_check_cmd: "which {package}"
+
+  perl:
+    command: "perl {script}"
+    shebang: "#!/usr/bin/env perl"
+    comment_prefix: "#"
+    permissions: null
+    compile_first: null
+    conda_base: "perl"
+    env_check_cmd: 'perl -e "use {package}"'
+
+  java:
+    command: "java -cp . {script}"
+    shebang: null
+    comment_prefix: "//"
+    permissions: null
+    compile_first: "javac {script}"
+    conda_base: "openjdk"
+    env_check_cmd: null
