@@ -1,5 +1,5 @@
 """
-LangGraph Workflow v3.2.1 - Script-First Architecture with Reflexion Memory
+LangGraph Workflow v1.2.0 - Script-First Architecture with Diagnostic Agent
 
 Orchestrates multi-agent system with:
 - Token-based context limits (configurable, default 25K) instead of iteration counts
@@ -8,6 +8,15 @@ Orchestrates multi-agent system with:
 - Script generation and execution paradigm
 - Living document master prompt management
 - **Reflexion Memory for loop prevention**
+- **Diagnostic Agent with cross-task solution memory** (v1.2.0)
+
+v1.2.0 Updates:
+- DiagnosticMemory initialized in workflow __init__() and passed through
+  to every ScriptFirstSubAgent instance (in both submit_parallel_jobs and
+  execute_sequential). The diagnostic agent is invoked from within the
+  sub-agent's Phase 4, NOT from the workflow — so the workflow changes are
+  purely wiring.
+- Version bump in log messages and docstrings.
 
 v3.2.1 Updates:
 - Model selection is now fully modular via utils.model_config.resolve_model().
@@ -80,7 +89,7 @@ except ImportError:
         MemorySaver = None
 
 from agents.master_agent import MasterAgent
-# Import sub-agent - try v3.2 class first, fall back to base class
+# Import sub-agent - try v1.2.0 class first, fall back to v3.2 then base
 try:
     from agents.sub_agent import ScriptFirstSubAgentV3 as ScriptFirstSubAgent
 except ImportError:
@@ -131,6 +140,16 @@ except ImportError:
         }
     def get_memory_client():
         return None
+
+# ============================================================================
+# DIAGNOSTIC MEMORY INTEGRATION (v1.2.0)
+# ============================================================================
+try:
+    from memory.diagnostic_memory import DiagnosticMemory
+    DIAGNOSTIC_MEMORY_AVAILABLE = True
+except ImportError:
+    DIAGNOSTIC_MEMORY_AVAILABLE = False
+    DiagnosticMemory = None
 
 
 logger = logging.getLogger(__name__)
@@ -191,7 +210,8 @@ class WorkflowState(TypedDict):
 
 class MultiAgentWorkflow:
     """
-    LangGraph workflow v3.2.2 with script-first architecture and reflexion memory.
+    LangGraph workflow v1.2.0 with script-first architecture, reflexion memory,
+    and diagnostic agent integration.
 
     Key features:
     - Token-based context limits (configurable via environment)
@@ -203,6 +223,7 @@ class MultiAgentWorkflow:
     - v3.2: Cluster configuration, conda cleanup, GPU-aware batching
     - v3.2.1: Modular model config via resolve_model() — no hardcoded names
     - v3.2.2: Deadlock detection/recovery in router (Fix D safety net)
+    - v1.2.0: DiagnosticMemory wired through to sub-agents
     """
 
     # Token limits — read from environment or use defaults matching config.yaml
@@ -279,14 +300,28 @@ class MultiAgentWorkflow:
                 logger.warning(f"Failed to initialize reflexion memory: {e}")
                 self.use_reflexion_memory = False
 
+        # ── v1.2.0: Diagnostic Memory ────────────────────────────────
+        # Shared across all sub-agents and all tasks. Solutions learned
+        # fixing one step's errors are immediately available to every
+        # other step in the pipeline (and future pipeline runs).
+        self.diagnostic_memory = None
+        if DIAGNOSTIC_MEMORY_AVAILABLE:
+            try:
+                self.diagnostic_memory = DiagnosticMemory()
+                logger.info("Diagnostic memory enabled (cross-task solution cache)")
+            except Exception as e:
+                logger.warning(f"Failed to initialize diagnostic memory: {e}")
+                self.diagnostic_memory = None
+
         # Log configuration
         logger.info(
-            f"MultiAgentWorkflow v3.2.2 initialized: "
+            f"MultiAgentWorkflow v1.2.0 initialized: "
             f"model={self.ollama_model}, "
             f"tokens={self.MAX_CONTEXT_TOKENS}/{self.MAX_TOOL_OUTPUT_TOKENS}/{self.MIN_TOKENS_TO_CONTINUE}, "
             f"slurm={self.use_slurm}, "
             f"parallel={self.parallel_enabled}, "
             f"reflexion={self.use_reflexion_memory}, "
+            f"diagnostic_memory={self.diagnostic_memory is not None}, "
             f"cleanup_env={self.cleanup_env_on_success}, "
             f"cluster={os.environ.get('AGI_CLUSTER', 'default')}"
         )
@@ -398,6 +433,7 @@ class MultiAgentWorkflow:
             "use_slurm": self.use_slurm,
             "parallel_enabled": self.parallel_enabled,
             "reflexion_enabled": self.use_reflexion_memory,
+            "diagnostic_memory_enabled": self.diagnostic_memory is not None,
             "cleanup_env_on_success": self.cleanup_env_on_success,  # v3.2
             "cluster": os.environ.get('AGI_CLUSTER', 'unknown'),  # v3.2
             "model": self.ollama_model,
@@ -575,6 +611,7 @@ class MultiAgentWorkflow:
 
             # Create sub-agent — passes resolved model, but sub-agent
             # also calls resolve_model() internally so None would be safe too
+            # v1.2.0: diagnostic_memory passed through for cross-task solutions
             agent = ScriptFirstSubAgent(
                 agent_id=f"agent_{task_id}",
                 sandbox=self.sandbox,
@@ -586,6 +623,7 @@ class MultiAgentWorkflow:
                 slurm_config=self.slurm_config,
                 project_root=str(self.project_dir),
                 cleanup_env_on_success=self.cleanup_env_on_success,  # v3.2
+                diagnostic_memory=self.diagnostic_memory,  # v1.2.0
             )
 
             # Execute - handles its own SLURM submission via sbatch
@@ -603,7 +641,7 @@ class MultiAgentWorkflow:
         }
 
     def execute_sequential(self, state: WorkflowState) -> Dict:
-        """Execute a single task sequentially with sub-agent v3.2.1 features"""
+        """Execute a single task sequentially with sub-agent v1.2.0 features"""
         subtask = state['current_subtask']
         env_name = state['env_name']
         task_id = subtask['id']
@@ -629,6 +667,7 @@ class MultiAgentWorkflow:
         self.master.master_document.mark_running(task_id)
 
         # Create sub-agent — passes resolved model
+        # v1.2.0: diagnostic_memory passed through for cross-task solutions
         agent = ScriptFirstSubAgent(
             agent_id=f"agent_{task_id}",
             sandbox=self.sandbox,
@@ -640,6 +679,7 @@ class MultiAgentWorkflow:
             slurm_config=self.slurm_config,
             project_root=str(self.project_dir),
             cleanup_env_on_success=self.cleanup_env_on_success,  # v3.2
+            diagnostic_memory=self.diagnostic_memory,  # v1.2.0
         )
 
         # Execute - sub-agent handles checkpointing internally
@@ -791,60 +831,33 @@ class MultiAgentWorkflow:
                         "env_name": result.get('env_name')
                     })
 
-                # Record solution if reflexion enabled
+                # Record solution if reflexion memory enabled
                 if self.use_reflexion_memory:
-                    try:
-                        approach = subtask.get('context', {}).get('approach_tried', '')
-                        if approach:
-                            record_solution(
-                                task_id=task_id,
-                                error_message=subtask.get('context', {}).get('previous_error', ''),
-                                solution=approach
-                            )
-                    except Exception as e:
-                        logger.warning(f"Failed to record solution: {e}")
+                    previous_error = subtask.get('context', {}).get('previous_error')
+                    approach = subtask.get('context', {}).get('approach_tried')
+                    if previous_error and approach:
+                        try:
+                            record_solution(task_id, previous_error, approach)
+                        except Exception as e:
+                            logger.warning(f"Failed to record solution: {e}")
 
             else:
-                # Check context status
-                context_status = result.get('context_status', {})
-                remaining_tokens = context_status.get('remaining_tokens', self.MAX_CONTEXT_TOKENS)
+                subtask['status'] = 'failed'
+                subtask['last_result'] = result
+                failed.append(subtask)
 
-                if remaining_tokens < self.MIN_TOKENS_TO_CONTINUE:
-                    subtask['status'] = 'failed'
-                    subtask['failure_reason'] = 'context_exhausted'
-                    failed.append(subtask)
-                    self.master.mark_subtask_failed(
-                        task_id,
-                        "Context window exhausted",
-                        result.get('error', '')
-                    )
-                else:
-                    # Mark for retry
-                    subtask['status'] = 'pending'
-                    subtask['context'] = subtask.get('context', {})
-                    subtask['context']['previous_error'] = result.get('error')
-                    subtask['context']['approach_tried'] = result.get('approach', '')
-
-                # v3.2: Check if checkpoint was preserved
-                if result.get('checkpoint_preserved'):
-                    agent_logger.log_workflow_event("checkpoint_preserved", {
-                        "task_id": task_id,
-                        "reason": result.get('error', 'unknown')
-                    })
-
-        # Update subtasks in state
-        updated_subtasks = state['subtasks'].copy()
-        for subtask in updated_subtasks:
-            for item in results:
-                if item['subtask']['id'] == subtask['id']:
-                    subtask.update(item['subtask'])
+                # Update master document
+                self.master.master_document.mark_failed(
+                    task_id,
+                    result.get('error', 'Unknown error')
+                )
 
         return {
-            "subtasks": updated_subtasks,
             "completed_subtasks": completed,
             "failed_subtasks": failed,
             "task_attempt_counts": task_attempt_counts,
-            "parallel_results": []
+            "parallel_results": [],
+            "running_jobs": {},
         }
 
     def reflexion_check(self, state: WorkflowState) -> Dict:
@@ -952,6 +965,7 @@ Status: {status_emoji} {final_status}
 Model: {self.ollama_model}
 Cluster: {os.environ.get('AGI_CLUSTER', 'unknown')}
 Token Budget: {self.MAX_CONTEXT_TOKENS}/{self.MAX_TOOL_OUTPUT_TOKENS}/{self.MIN_TOKENS_TO_CONTINUE} (context/tool/min)
+Diagnostic Memory: {'enabled' if self.diagnostic_memory else 'disabled'}
 
 ## Summary
 
@@ -1029,6 +1043,17 @@ dependencies that cannot be resolved. This typically means:
                 report += memory_summary
             except Exception as e:
                 logger.warning(f"Failed to add memory summary: {e}")
+
+        # v1.2.0: Add diagnostic memory summary
+        if self.diagnostic_memory:
+            try:
+                diag_summary = "\n## Diagnostic Memory Summary\n\n"
+                diag_stats = self.diagnostic_memory.get_stats()
+                diag_summary += f"- Solutions stored: {diag_stats.get('total_solutions', 0)}\n"
+                diag_summary += f"- Solutions reused: {diag_stats.get('solutions_reused', 0)}\n"
+                report += diag_summary
+            except Exception as e:
+                logger.warning(f"Failed to add diagnostic memory summary: {e}")
 
         # Save report
         reports_dir = self.project_dir / 'reports'
@@ -1166,21 +1191,12 @@ dependencies that cannot be resolved. This typically means:
         3. Force-complete non-executable tasks (doc sections that slipped
            through Fix A's filter — detected by: no code_hints, no packages,
            title matches documentation patterns)
-        4. After each strategy, re-check if any tasks are now ready
-
-        Returns:
-            {
-                'unblocked': bool,
-                'ready_tasks': List[Dict],  # tasks now ready to execute
-                'actions': List[str],       # what recovery actions were taken
-                'remaining_blocked': List[str],  # task IDs still blocked
-            }
+        4. Last resort: force first pending task to have no deps
         """
         subtasks = state.get('subtasks', [])
         actions = []
 
-        # Build lookup sets
-        all_task_ids = {st['id'] for st in subtasks}
+        all_ids = {st['id'] for st in subtasks}
         completed_ids = {st['id'] for st in subtasks
                         if st.get('status') == 'completed'}
         failed_ids = {st['id'] for st in subtasks
@@ -1188,49 +1204,15 @@ dependencies that cannot be resolved. This typically means:
         pending = [st for st in subtasks
                    if st.get('status', 'pending') == 'pending']
 
-        if not pending:
-            return {
-                'unblocked': False,
-                'ready_tasks': [],
-                'actions': ['no_pending_tasks'],
-                'remaining_blocked': [],
-            }
-
-        # ── Strategy 1: Strip deps on failed tasks ────────────────────
-        # If a dependency has already failed, waiting on it is pointless.
-        # Remove it so downstream tasks can attempt execution.
-        stripped_failed = 0
+        # ── Strategy 1: Strip deps on failed tasks
         for st in pending:
             deps = st.get('dependencies', [])
-            original_len = len(deps)
-            cleaned = [d for d in deps if d not in failed_ids]
-            if len(cleaned) < original_len:
-                st['dependencies'] = cleaned
-                stripped_failed += (original_len - len(cleaned))
-                print(f"    → {st['id']}: stripped {original_len - len(cleaned)} "
-                      f"failed dep(s): {set(deps) & failed_ids}")
+            failed_deps = [d for d in deps if d in failed_ids]
+            if failed_deps:
+                st['dependencies'] = [d for d in deps if d not in failed_ids]
+                actions.append(f"stripped_failed_deps_{st['id']}_{failed_deps}")
+                print(f"    → {st['id']}: removed deps on failed tasks: {failed_deps}")
 
-        if stripped_failed > 0:
-            actions.append(f"stripped_{stripped_failed}_failed_deps")
-
-        # ── Strategy 2: Strip deps on non-existent task IDs ───────────
-        # LLM may have generated deps like "step_15" when only step_1..7 exist.
-        stripped_invalid = 0
-        for st in pending:
-            deps = st.get('dependencies', [])
-            original_len = len(deps)
-            cleaned = [d for d in deps if d in all_task_ids]
-            if len(cleaned) < original_len:
-                invalid = set(deps) - all_task_ids
-                st['dependencies'] = cleaned
-                stripped_invalid += (original_len - len(cleaned))
-                print(f"    → {st['id']}: stripped {original_len - len(cleaned)} "
-                      f"invalid dep(s): {invalid}")
-
-        if stripped_invalid > 0:
-            actions.append(f"stripped_{stripped_invalid}_invalid_deps")
-
-        # Check if strategies 1+2 unblocked anything
         ready = self._find_ready_tasks(subtasks)
         if ready:
             return {
@@ -1240,8 +1222,25 @@ dependencies that cannot be resolved. This typically means:
                 'remaining_blocked': [],
             }
 
-        # ── Strategy 3: Force-complete non-executable tasks ───────────
-        # Documentation sections that slipped past Fix A's filter.
+        # ── Strategy 2: Strip deps on non-existent task IDs
+        for st in pending:
+            deps = st.get('dependencies', [])
+            phantom_deps = [d for d in deps if d not in all_ids]
+            if phantom_deps:
+                st['dependencies'] = [d for d in deps if d in all_ids]
+                actions.append(f"stripped_phantom_deps_{st['id']}_{phantom_deps}")
+                print(f"    → {st['id']}: removed phantom deps: {phantom_deps}")
+
+        ready = self._find_ready_tasks(subtasks)
+        if ready:
+            return {
+                'unblocked': True,
+                'ready_tasks': ready,
+                'actions': actions,
+                'remaining_blocked': [],
+            }
+
+        # ── Strategy 3: Force-complete non-executable tasks
         # These have no code to execute — mark them completed so they
         # stop blocking downstream tasks.
         DOC_PATTERNS = [

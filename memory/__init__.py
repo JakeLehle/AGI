@@ -32,6 +32,8 @@ from .reflexion_memory import (
     SolutionRecord,
 )
 
+from .diagnostic_memory import DiagnosticMemory, SolutionEntry, BOOTSTRAP_SOLUTIONS
+
 from .config import get_mem0_config
 
 __all__ = [
@@ -39,6 +41,9 @@ __all__ = [
     "FailureType", 
     "FailureRecord",
     "SolutionRecord",
+    "DiagnosticMemory", 
+    "SolutionEntry",
+    "BOOTSTRAP_SOLUTIONS",
     "get_mem0_config",
 ]
 

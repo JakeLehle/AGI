@@ -1,7 +1,7 @@
 # =============================================================================
-# Multi-Agent System Configuration v3.2.1
+# Multi-Agent System Configuration v1.2.0
 # =============================================================================
-# Supports script-first architecture with token-based context management
+# Supports four-phase sub-agent lifecycle with integrated diagnostic agent
 #
 # Target: ARC GPU cluster
 # Context: 32K tokens (OLLAMA_CONTEXT_LENGTH=32768 set in RUN script)
@@ -23,6 +23,16 @@
 #   System-wide: edit FALLBACK_MODEL in utils/model_config.py
 #
 # Same chain applies to ollama.base_url via resolve_base_url().
+#
+# CHANGELOG v1.2.0:
+# ---------------------------------
+# - Added diagnostic_agent section (Phase 4 diagnostic agent config)
+# - Added disk_management section (proactive/reactive quota management)
+# - Added script_generation section (Phase 1 two-pass validation)
+# - Increased agents.max_retries 12 → 15
+# - Added java to supported_languages
+# - Expanded failure_diagnosis.patterns with new error types
+# - Added diagnostic_memory to reflexion section
 # =============================================================================
 
 # =============================================================================
@@ -92,9 +102,10 @@ context:
 # Agent Settings
 # =============================================================================
 agents:
-  # Legacy setting - kept for backward compatibility
-  # Context exhaustion (not iteration count) determines retry limits
-  max_retries: 12
+  # v1.2.0: Increased from 12 → 15 to match diagnostic agent retry budget.
+  # Context exhaustion (not iteration count) determines actual retry limits,
+  # but this caps the maximum number of phase-4 retry cycles per subtask.
+  max_retries: 15
 
   timeout_seconds: 300
   enable_dynamic_tools: true
@@ -119,11 +130,13 @@ agents:
     max_script_generations: 5
 
   # Supported languages for script generation
+  # v1.2.0: Added java — dispatch table in utils/dependency_parser.py
   supported_languages:
     - python
     - r
     - bash
     - perl
+    - java
 
   # Language detection keywords
   language_detection:
@@ -146,6 +159,160 @@ agents:
       - "bash"
       - "shell"
       - ".sh"
+    java:
+      - "java"
+      - "gatk"
+      - "picard"
+      - ".jar"
+
+# =============================================================================
+# Script Generation — Phase 1 (v1.2.0)
+# =============================================================================
+# Two-pass validated script generation:
+#   1a. LLM generates structured outline from subtask
+#   1b. LLM validates outline matches subtask goals (max N attempts)
+#   1c. LLM generates full implementation from validated outline
+#   1d. LLM validates implementation covers outline (max N attempts)
+#
+# Each validation gate retries up to max_*_attempts before escalating.
+# =============================================================================
+script_generation:
+  # Maximum attempts to produce a valid outline before escalating
+  max_outline_attempts: 3
+
+  # Maximum attempts to produce a valid implementation before escalating
+  max_implementation_attempts: 3
+
+  # Supported languages — mirrors agents.supported_languages but kept here
+  # for explicit Phase 1 configuration. The dispatch table in
+  # utils/dependency_parser.py defines execution commands per language.
+  supported_languages:
+    - python
+    - r
+    - bash
+    - perl
+    - java
+
+# =============================================================================
+# Diagnostic Agent — Phase 4 (v1.2.0)
+# =============================================================================
+# The diagnostic agent is invoked when a subtask execution fails. It has
+# its own token budget (separate from the sub-agent's 25K) and can perform
+# limited direct actions (package installs, diagnostic commands) while
+# returning prescriptions for code/config changes.
+#
+# Memory: Uses DiagnosticMemory (memory/diagnostic_memory.py) with a
+# separate Qdrant collection (agi_diagnostic_solutions) that is shared
+# globally across all tasks and projects.
+#
+# Environment variables (set in RUN_AGI_PIPELINE_*.sh):
+#   AGI_DIAGNOSTIC_TOKENS             Token budget per invocation
+#   AGI_DIAGNOSTIC_MAX_RETRIES        Max investigation iterations
+#   AGI_DIAGNOSTIC_MAX_COMMANDS       Max diagnostic bash commands
+#   AGI_SOLUTION_MEMORY_THRESHOLD     Similarity threshold for known fixes
+# =============================================================================
+diagnostic_agent:
+  # Master switch — set false to disable diagnostic agent and fall back
+  # to the legacy _reflect_and_update() approach
+  enabled: true
+
+  # Token budget for each diagnostic agent invocation.
+  # Each invocation gets a fresh context window of this size.
+  # The sub-agent can invoke the diagnostic agent multiple times across
+  # its 15 retry iterations — each gets a fresh budget.
+  max_tokens_per_invocation: 25000
+
+  # Maximum retry/investigation iterations per single error investigation.
+  # The diagnostic agent may run diagnostic commands, install packages,
+  # and iterate on its hypothesis up to this many times per invocation.
+  max_retries_per_error: 15
+
+  # Maximum number of diagnostic bash commands the agent can execute
+  # per invocation (prevents runaway command loops)
+  max_diagnostic_commands: 10
+
+  # Similarity threshold for DiagnosticMemory lookups.
+  # If a stored solution has similarity >= this AND success_count > 1,
+  # the diagnostic agent applies it directly without investigation.
+  solution_memory_threshold: 0.85
+
+  # Whether to bootstrap DiagnosticMemory with known solutions on first run.
+  # See memory/diagnostic_memory.py → BOOTSTRAP_SOLUTIONS for the seed data.
+  bootstrap_on_first_run: true
+
+  # Error types the diagnostic agent handles.
+  # Errors not in this list are escalated immediately.
+  handled_error_types:
+    - missing_package
+    - code_error
+    - syntax_error
+    - runtime_logic_error
+    - data_structure_error
+    - memory_error
+    - gpu_error
+    - disk_quota_error
+    - binary_not_found
+    - permission_error
+    - file_not_found
+    - network_error
+    - sbatch_config_error
+    - conda_error
+
+  # Direct actions the diagnostic agent can take without returning a
+  # prescription (low-risk, high-frequency fixes)
+  direct_actions:
+    - conda_install        # Install a package into existing env
+    - pip_install          # pip install into existing env
+    - conda_clean          # Clean conda cache for disk quota
+    - run_diagnostic_cmd   # Execute diagnostic bash commands
+    - run_diagnostic_script  # Execute small Python/R diagnostic scripts
+    - update_env_yaml      # Add/remove packages from env YAML
+
+  # Actions that require the sub-agent to apply (high-risk, needs full
+  # task context)
+  prescription_actions:
+    - edit_code            # Modify analysis script
+    - change_config        # Modify sbatch configuration
+    - rebuild_env          # Full environment rebuild from updated YAML
+    - escalate             # Give up — error is unrecoverable
+
+# =============================================================================
+# Disk Management (v1.2.0)
+# =============================================================================
+# Manages the limited home directory space (~100GB) on HPC clusters where
+# conda environments can quickly consume available quota.
+#
+# Environment variables (set in RUN_AGI_PIPELINE_*.sh):
+#   AGI_HOME_QUOTA_GB                 Total home quota
+#   AGI_DISK_CLEANUP_THRESHOLD_GB     Proactive cleanup trigger
+#   AGI_DISK_EMERGENCY_THRESHOLD_GB   Emergency cleanup trigger
+# =============================================================================
+disk_management:
+  # Master switch
+  enabled: true
+
+  # Total home directory quota in GB
+  home_quota_gb: 100
+
+  # When free space drops below this, run proactive cleanup before builds.
+  # This runs conda clean --all --yes and removes stale agi_* environments.
+  proactive_cleanup_threshold_gb: 15
+
+  # When free space drops below this, trigger emergency cleanup.
+  # More aggressive: also cleans pip cache and removes all non-active envs.
+  emergency_cleanup_threshold_gb: 5
+
+  # Estimated size of a typical conda environment build in GB.
+  # Used by ensure_space_for_build() to determine if there's enough room.
+  estimated_env_size_gb: 5
+
+  # Prefix for conda environments created by the AGI pipeline.
+  # Used to identify stale environments for cleanup.
+  stale_env_prefix: "agi_"
+
+  # Whether to clean up conda environments after successful task completion.
+  # The env YAML is always preserved for rebuilds — only the actual env is removed.
+  cleanup_env_on_success: true
 
 # =============================================================================
 # Master Prompt Document
@@ -321,6 +488,10 @@ resource_profiles:
 # =============================================================================
 # Failure Diagnosis (Pattern-based auto-recovery)
 # =============================================================================
+# v1.2.0: Expanded with new error types that the diagnostic agent classifies.
+# The regex patterns here are used for initial classification; the diagnostic
+# agent performs deeper analysis within its investigation protocol.
+# =============================================================================
 failure_diagnosis:
   patterns:
     module_not_found:
@@ -358,6 +529,43 @@ failure_diagnosis:
       action: "retry_different_node"
       description: "SLURM node failure"
 
+    # --- v1.2.0: New patterns for diagnostic agent classification -----------
+
+    data_structure_error:
+      regex: "(KeyError|IndexError|ValueError.*shape|AttributeError.*'NoneType'|'DataFrame' object has no attribute)"
+      action: "diagnose_data"
+      description: "Data structure mismatch or unexpected format"
+
+    binary_not_found:
+      regex: "(command not found|No such file or directory.*bin/|which: no .+ in)"
+      action: "install_binary"
+      description: "Missing system binary or CLI tool"
+
+    disk_quota_error:
+      regex: "(No space left on device|Disk quota exceeded|OSError.*ENOSPC)"
+      action: "cleanup_disk"
+      description: "Disk full or quota exceeded"
+
+    network_error:
+      regex: "(ConnectionError|URLError|TimeoutError.*connect|SSLError|requests.exceptions)"
+      action: "retry_network"
+      description: "Network connectivity issue"
+
+    runtime_logic_error:
+      regex: "(AssertionError|ZeroDivisionError|RecursionError|StopIteration)"
+      action: "diagnose_code"
+      description: "Runtime logic error in analysis script"
+
+    sbatch_config_error:
+      regex: "(sbatch: error|Invalid partition|invalid account|Batch job submission failed)"
+      action: "fix_sbatch"
+      description: "SLURM sbatch configuration error"
+
+    r_error:
+      regex: "(Error in .+ : |Execution halted|there is no package called)"
+      action: "diagnose_r"
+      description: "R script execution error"
+
 # =============================================================================
 # Workflow Settings
 # =============================================================================
@@ -376,3 +584,37 @@ workflow:
   parallel:
     enabled: true
     max_parallel_jobs: 10
+
+# =============================================================================
+# Reflexion Memory
+# =============================================================================
+# Per-task memory for preventing retry loops.
+# Config file: config/mem0_config.yaml
+# Backend: Mem0 + embedded Qdrant (collection: agi_reflexion_memory)
+# =============================================================================
+reflexion:
+  enabled: true
+
+  # Similarity threshold — approaches above this are considered duplicates
+  similarity_threshold: 0.85
+
+  # v1.2.0: Diagnostic solution memory (global, cross-task knowledge base)
+  # Backend: Mem0 + embedded Qdrant (collection: agi_diagnostic_solutions)
+  # See memory/diagnostic_memory.py
+  diagnostic_memory:
+    enabled: true
+
+    # Separate Qdrant collection for diagnostic solutions
+    collection_name: "agi_diagnostic_solutions"
+
+    # Similarity threshold for confident solution match
+    # When a stored solution exceeds this AND success_count > 1,
+    # the diagnostic agent applies it without investigation
+    similarity_threshold: 0.85
+
+    # Auto-prune solutions unused for this many days
+    # Solutions with success_count >= 3 are kept regardless
+    prune_stale_days: 90
+
+    # Bootstrap with known solutions on first initialization
+    bootstrap_on_first_run: true
