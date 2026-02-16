@@ -37,7 +37,7 @@ ollama:
   #   - Must leave room for KV cache at full context length
   #   - qwen3-coder:32b  ≈ 20 GiB weights → fits with ~10 GiB for 32K KV cache
   #   - qwen3-coder-next ≈ 48 GiB → requires CPU offload, causes 500 errors
-  model: "qwen3-coder:32b"
+  model: "qwen3-coder:latest"
 
   # Ollama API endpoint — level 3 in the resolution chain.
   # Overridden by CLI --ollama-url (level 1) or OLLAMA_HOST env var (level 2).
@@ -227,7 +227,6 @@ clusters:
     description: "Default CPU partition - 65 nodes, 3-day max"
     default_partition: "compute1"
     default_cpus: 20
-    default_memory: "64G"
     default_time: "1-00:00:00"
     has_gpu: false
 
@@ -263,13 +262,11 @@ clusters:
 resource_profiles:
   default:
     cpus: 20
-    memory: "64G"
     time: "1-00:00:00"
     gpus: 0
 
   lightweight:
     cpus: 4
-    memory: "16G"
     time: "02:00:00"
     gpus: 0
     keywords:
@@ -281,7 +278,6 @@ resource_profiles:
 
   bioinformatics:
     cpus: 20
-    memory: "64G"
     time: "1-00:00:00"
     gpus: 0
     keywords:
@@ -296,7 +292,6 @@ resource_profiles:
 
   heavy_compute:
     cpus: 40
-    memory: "128G"
     time: "2-00:00:00"
     gpus: 0
     keywords:

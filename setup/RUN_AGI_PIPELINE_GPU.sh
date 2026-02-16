@@ -29,7 +29,7 @@
 # To override the model for a single run without editing this file:
 #   sbatch --export=ALL,OLLAMA_MODEL=llama3.1:70b setup/RUN_AGI_PIPELINE_GPU.sh
 #
-# The default below (qwen3-coder:32b) is chosen because:
+# The default below (qwen3-coder:latest) is chosen because:
 #   - Weights ≈ 20 GiB (Q4_K_M) → fits on V100S-32GB with room for KV cache
 #   - qwen3-coder-next ≈ 48 GiB → requires CPU offload, causes Ollama 500 errors
 #
@@ -64,7 +64,7 @@
 #     - arc_dgxa100   : dgxa100, 3 nodes, DGX A100
 #
 AGI_CLUSTER="${AGI_CLUSTER:-arc_compute1}"
-AGI_GPU_CLUSTER="${AGI_GPU_CLUSTER:-arc_gpu1v100}"
+AGI_GPU_CLUSTER="${AGI_GPU_CLUSTER:-arc_gpu2v100}"
 
 # ============================================================================
 # PROJECT CONFIGURATION
@@ -103,7 +103,7 @@ CONDA_ENV="${CONDA_ENV:-AGI}"
 #   qwen3-coder-next ≈ 48 GiB weights → CPU offload required, 500 errors   ✗
 # ============================================================================
 
-OLLAMA_MODEL="${OLLAMA_MODEL:-qwen3-coder:32b}"
+OLLAMA_MODEL="${OLLAMA_MODEL:-qwen3-coder:latest}"
 
 # Ollama context window — must match config.yaml → ollama.model_context_length
 OLLAMA_CONTEXT_LENGTH="${OLLAMA_CONTEXT_LENGTH:-32768}"
