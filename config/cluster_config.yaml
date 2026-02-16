@@ -183,7 +183,6 @@ clusters:
       nodes: 1
       ntasks: 1
       cpus_per_task: 20
-      memory: "64G"
       time: "1-00:00:00"
     
     limits:
@@ -207,7 +206,6 @@ clusters:
       nodes: 1
       ntasks: 1
       cpus_per_task: 20
-      memory: "64G"
       time: "1-00:00:00"
     
     limits:
@@ -231,7 +229,6 @@ clusters:
       nodes: 1
       ntasks: 1
       cpus_per_task: 20
-      memory: "64G"
       time: "1-00:00:00"
     
     limits:
