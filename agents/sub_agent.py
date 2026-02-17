@@ -1676,7 +1676,7 @@ ADD_PIP: package_name==version"""
         env_name = self.checkpoint.env_name
 
         if self.conda_tools:
-            result = self.conda_tools.create_environment(
+            result = self.conda_tools.create_from_yaml(
                 yaml_path=env_yaml_path,
                 env_name=env_name,
             )
@@ -2244,12 +2244,28 @@ print(f"[MODE] DRY_RUN={{DRY_RUN}}, PROJECT_ROOT={{PROJECT_ROOT}}")
         outputs = subtask.get('output_files', [])
         if not outputs:
             return {'already_complete': False}
-        existing = [
-            str(self.project_root / f)
-            for f in outputs
-            if (self.project_root / f).exists()
-        ]
-        return {'already_complete': len(existing) == len(outputs)}
+
+
+        existing = []
+        for f in outputs:
+            p = self.project_root / f
+            if p.exists() and p.stat().st_size > 0:
+                existing.append(str(p)
+
+
+        already_complete = len(existing) == len(outputs)
+
+        if already_complete:
+            logger.info(
+                f"[{subtask.get('id', '?')}] All {len(outputs)} output files"
+                f"already exist - skipping execution"
+            )
+
+        return {
+            'already_complete': already_complete,
+            'existing_files': existing,
+            'missing_files': [f for f in outputs if str(self.project_root / f) not in existing]
+        }
 
     def _verify_outputs(self, subtask: Dict) -> Dict[str, Any]:
         outputs = subtask.get('output_files', [])
