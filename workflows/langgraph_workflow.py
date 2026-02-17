@@ -588,6 +588,7 @@ class MultiAgentWorkflow:
         batch = state['parallel_batch']
         env_name = state['env_name']
         running_jobs = {}
+        immediate_results = []
 
         for subtask in batch:
             task_id = subtask['id']
@@ -631,13 +632,25 @@ class MultiAgentWorkflow:
 
             if result.get('job_id'):
                 running_jobs[task_id] = result['job_id']
-            elif result.get('success'):
-                # Task completed without needing SLURM (e.g., resumed from checkpoint)
-                logger.info(f"Task {task_id} completed immediately (possibly resumed)")
+            else:
+                # v1.2.1: Capture ALL synchronous results (success or failure)
+                immediate_results.append({
+                    "subtask": subtask,
+                    "result": result
+                })
+                if result.get('success'):
+                    logger.info(f"Task {task_id} completed immediately (skipped={result.get('skipped', False)})")
+                    self.master.mark_subtask_complete(
+                        task_id,
+                        result.get('outputs', {}),
+                        result.get('report', '')
+                else:
+                    logger.warning(f"Task {task_id} failed synchronously: {result.get('error', 'unknown')[:200]}")
+ 
 
         return {
             "running_jobs": running_jobs,
-            "parallel_results": []
+            "parallel_results": immediate_results
         }
 
     def execute_sequential(self, state: WorkflowState) -> Dict:
@@ -700,10 +713,12 @@ class MultiAgentWorkflow:
         """Wait for all parallel SLURM jobs to complete"""
         running_jobs = state.get('running_jobs', {})
 
-        if not running_jobs:
-            return {"parallel_results": []}
+        existing_results = state.get('parallel_results', [])
 
-        results = []
+        if not running_jobs:
+            return {"parallel_results": exsiting_results}
+
+        results = list(exsiting_results)
         poll_interval = self.slurm_config.get("poll_interval", 10)
         max_attempts = self.slurm_config.get("max_poll_attempts", 720)
 
