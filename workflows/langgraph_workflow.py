@@ -643,7 +643,7 @@ class MultiAgentWorkflow:
                     self.master.mark_subtask_complete(
                         task_id,
                         result.get('outputs', {}),
-                        result.get('report', '')
+                        result.get('report', ''))
                 else:
                     logger.warning(f"Task {task_id} failed synchronously: {result.get('error', 'unknown')[:200]}")
  

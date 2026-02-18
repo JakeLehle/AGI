@@ -2250,7 +2250,7 @@ print(f"[MODE] DRY_RUN={{DRY_RUN}}, PROJECT_ROOT={{PROJECT_ROOT}}")
         for f in outputs:
             p = self.project_root / f
             if p.exists() and p.stat().st_size > 0:
-                existing.append(str(p)
+                existing.append(str(p))
 
 
         already_complete = len(existing) == len(outputs)
