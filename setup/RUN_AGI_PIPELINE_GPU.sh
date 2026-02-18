@@ -11,12 +11,20 @@
 #SBATCH --error=slurm_logs/agi_%j.err
 
 ###############################################################################
-# AGI Multi-Agent Pipeline v1.2.0 — ARC GPU Submission Script
+# AGI Multi-Agent Pipeline v1.2.2 — ARC GPU Submission Script
 #
 # Runs the MASTER PIPELINE on an ARC GPU node for fast LLM inference.
 # Subtask scripts are submitted to CPU or GPU partitions as needed.
 #
-# v1.2.0 NEW FEATURES:
+# v1.2.2 CHANGES:
+# ----------------
+#   - OLLAMA_NUM_PARALLEL: Enables concurrent LLM request processing so
+#     multiple sub-agent threads can generate scripts simultaneously.
+#     Default: 4 (matches max_parallel_agents thread pool size).
+#     VRAM budget: 2×V100S-32GB (64 GiB) supports 4 parallel slots safely.
+#   - Version bumps in display and summary sections.
+#
+# v1.2.0 FEATURES:
 # ---------------------
 #   - Diagnostic Agent: Cross-task error diagnosis with global solution memory
 #   - Diagnostic Memory: Persistent knowledge base of validated fixes
@@ -126,6 +134,30 @@ EMBEDDING_MODEL="${EMBEDDING_MODEL:-nomic-embed-text}"
 USE_REFLEXION_MEMORY="${USE_REFLEXION_MEMORY:-true}"
 
 # ============================================================================
+# OLLAMA PARALLEL CONFIGURATION (v1.2.2 — NEW)
+# ============================================================================
+# Number of concurrent LLM requests Ollama processes simultaneously.
+# Each parallel slot consumes additional KV cache memory:
+#
+#   Per-slot KV cache: ~3-4 GiB (at 32K context with qwen3-coder:latest)
+#   Model weights:     ~20 GiB (shared across all slots)
+#
+# VRAM budget by hardware:
+#   1× V100S-32GB (32 GiB):         2 safe, 3 tight
+#   2× V100S-32GB (64 GiB total):   4 safe, 6 possible
+#   CPU-only (1 TiB RAM):           4-6 safe (RAM is not the constraint)
+#
+# Must match or exceed max_parallel_agents in config.yaml (default: 4).
+# Requests exceeding this limit queue in OLLAMA_MAX_QUEUE (default 512)
+# and are processed as slots free up — no requests are lost.
+#
+# To override for a single run:
+#   sbatch --export=ALL,OLLAMA_NUM_PARALLEL=2 setup/RUN_AGI_PIPELINE_GPU.sh
+# ============================================================================
+
+OLLAMA_NUM_PARALLEL="${OLLAMA_NUM_PARALLEL:-4}"
+
+# ============================================================================
 # CONTEXT LIMITS (v3.2 Architecture)
 # ============================================================================
 
@@ -231,7 +263,7 @@ CLEANUP_ENV_ON_SUCCESS="${CLEANUP_ENV_ON_SUCCESS:-true}"
 
 echo ""
 echo "============================================================================"
-echo "  AGI Multi-Agent Pipeline v1.2.0"
+echo "  AGI Multi-Agent Pipeline v1.2.2"
 echo "============================================================================"
 echo "  Job ID:              ${SLURM_JOB_ID:-interactive}"
 echo "  Node:                $(hostname)"
@@ -243,6 +275,7 @@ echo "  Project Dir:         ${PROJECT_DIR}"
 echo "  Prompt File:         ${PROMPT_FILE}"
 echo "  Model:               ${OLLAMA_MODEL}"
 echo "  Context Length:       ${OLLAMA_CONTEXT_LENGTH}"
+echo "  Parallel Slots:      ${OLLAMA_NUM_PARALLEL}"
 echo "  ---"
 echo "  Diagnostic Agent:    ${DIAGNOSTIC_AGENT_ENABLED}"
 echo "  Diagnostic Memory:   bootstrap=${DIAGNOSTIC_MEMORY_BOOTSTRAP}, threshold=${SOLUTION_MEMORY_THRESHOLD}"
@@ -368,6 +401,10 @@ export OLLAMA_MODELS="${OLLAMA_MODELS:-/work/sdz852/ollama/models}"
 export OLLAMA_KEEP_ALIVE="10m"
 export OLLAMA_CONTEXT_LENGTH="${OLLAMA_CONTEXT_LENGTH}"
 
+# v1.2.2: Parallel LLM request processing
+# This must be exported BEFORE ollama serve starts so the server picks it up.
+export OLLAMA_NUM_PARALLEL="${OLLAMA_NUM_PARALLEL}"
+
 # v3.2.1: Export OLLAMA_MODEL so resolve_model() picks it up at level 2 (env)
 # for any component that doesn't receive it via CLI --model.
 export OLLAMA_MODEL="${OLLAMA_MODEL}"
@@ -417,6 +454,7 @@ echo "    AGI_CLUSTER=${AGI_CLUSTER}"
 echo "    AGI_GPU_CLUSTER=${AGI_GPU_CLUSTER}"
 echo "    AGI_CLUSTER_CONFIG=${AGI_CLUSTER_CONFIG}"
 echo "    OLLAMA_MODEL=${OLLAMA_MODEL}"
+echo "    OLLAMA_NUM_PARALLEL=${OLLAMA_NUM_PARALLEL}"
 echo "    AGI_DIAGNOSTIC_AGENT_ENABLED=${AGI_DIAGNOSTIC_AGENT_ENABLED}"
 echo "    AGI_DISK_MONITOR_ENABLED=${AGI_DISK_MONITOR_ENABLED}"
 
@@ -458,11 +496,14 @@ PYEOF
 
 echo ""
 echo ">>> Starting Ollama server..."
+echo "    OLLAMA_NUM_PARALLEL=${OLLAMA_NUM_PARALLEL} (concurrent request slots)"
 
 OLLAMA_LOG="${PROJECT_DIR}/logs/ollama_${SLURM_JOB_ID:-$$}.log"
 
 if curl -s http://127.0.0.1:11434/api/tags > /dev/null 2>&1; then
     echo "    Ollama already running"
+    echo "    ⚠ NOTE: OLLAMA_NUM_PARALLEL only takes effect on server start."
+    echo "    If the running server has a different setting, restart Ollama."
 else
     ollama serve > "${OLLAMA_LOG}" 2>&1 &
     OLLAMA_PID=$!
@@ -564,7 +605,7 @@ fi
 
 echo ""
 echo "============================================================================"
-echo "  Running AGI Pipeline v1.2.0"
+echo "  Running AGI Pipeline v1.2.2"
 echo "============================================================================"
 echo "  Master Node:            $(hostname) (GPU)"
 echo "  Subtask CPU Target:     ${AGI_CLUSTER}"
@@ -572,6 +613,7 @@ echo "  Subtask GPU Target:     ${AGI_GPU_CLUSTER}"
 echo "  Project:                ${PROJECT_DIR}"
 echo "  Model:                  ${OLLAMA_MODEL}"
 echo "  Context Length:          ${OLLAMA_CONTEXT_LENGTH}"
+echo "  Parallel Slots:         ${OLLAMA_NUM_PARALLEL}"
 echo "  ---"
 echo "  Diagnostic Agent:       ${DIAGNOSTIC_AGENT_ENABLED} (max=${DIAGNOSTIC_MAX_INVOCATIONS}, budget=${DIAGNOSTIC_TOKEN_BUDGET}t)"
 echo "  Solution Memory:        threshold=${SOLUTION_MEMORY_THRESHOLD}"
@@ -670,13 +712,14 @@ fi
 
 echo ""
 echo "============================================================================"
-echo "  Job Complete — v1.2.0"
+echo "  Job Complete — v1.2.2"
 echo "============================================================================"
 echo "  End Time:       $(date)"
 echo "  Exit Code:      ${PIPELINE_EXIT_CODE}"
 echo "  Cluster:        ${AGI_CLUSTER}"
 echo "  GPU Cluster:    ${AGI_GPU_CLUSTER}"
 echo "  Model:          ${OLLAMA_MODEL}"
+echo "  Parallel Slots: ${OLLAMA_NUM_PARALLEL}"
 echo "  Diagnostic:     ${DIAGNOSTIC_AGENT_ENABLED}"
 echo ""
 echo "  Outputs:        ${PROJECT_DIR}/"

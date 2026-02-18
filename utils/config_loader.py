@@ -263,6 +263,7 @@ class ConfigLoader:
             'max_parallel_jobs': parallel.get('max_parallel_jobs', 10),
             'max_threads': parallel.get('max_threads', 4),
             'max_batch_size': parallel.get('max_batch_size', 5),
+            'max_parallel_agents': parallel.get('max_parallel_agents', 4),
             'parallel_strategy': parallel.get('parallel_strategy', 'dependency_based'),
             'min_tasks_for_parallel': parallel.get('min_tasks_for_parallel', 2)
         }
