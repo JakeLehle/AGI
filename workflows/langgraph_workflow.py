@@ -1,5 +1,5 @@
-"""
-LangGraph Workflow v1.2.0 - Script-First Architecture with Diagnostic Agent
+i"""
+LangGraph Workflow v1.2.2 - Script-First Architecture with Diagnostic Agent
 
 Orchestrates multi-agent system with:
 - Token-based context limits (configurable, default 25K) instead of iteration counts
@@ -9,6 +9,22 @@ Orchestrates multi-agent system with:
 - Living document master prompt management
 - **Reflexion Memory for loop prevention**
 - **Diagnostic Agent with cross-task solution memory** (v1.2.0)
+
+v1.2.2 Updates:
+- FIX F: submit_parallel_jobs now uses ThreadPoolExecutor for true concurrent
+  task execution. Each task runs its full 4-phase lifecycle in its own thread.
+  max_parallel_agents (default 4) controls thread pool size. Individual thread
+  crashes are isolated — one task failing cannot affect sibling tasks.
+- FIX G: Progress-first routing in route_after_execution. Priority order:
+  (1) dispatch ready tasks, (2) review failures, (3) exit. ESCALATE from
+  master_review and reflexion_check no longer terminates the pipeline — it
+  marks the task as permanently failed and returns to the main loop. The
+  pipeline only exits when all tasks are completed, permanently failed, or
+  blocked by failed dependencies.
+- FIX H: Tasks with failed dependencies get status 'blocked' instead of
+  having their deps stripped. _break_deadlock Strategy 1 (strip failed deps)
+  removed. New 'blocked' status provides clear traceability in the final
+  report showing exactly which failed dependency prevents each blocked task.
 
 v1.2.0 Updates:
 - DiagnosticMemory initialized in workflow __init__() and passed through
@@ -210,7 +226,7 @@ class WorkflowState(TypedDict):
 
 class MultiAgentWorkflow:
     """
-    LangGraph workflow v1.2.0 with script-first architecture, reflexion memory,
+    LangGraph workflow v1.2.2 with script-first architecture, reflexion memory,
     and diagnostic agent integration.
 
     Key features:
@@ -224,6 +240,8 @@ class MultiAgentWorkflow:
     - v3.2.1: Modular model config via resolve_model() — no hardcoded names
     - v3.2.2: Deadlock detection/recovery in router (Fix D safety net)
     - v1.2.0: DiagnosticMemory wired through to sub-agents
+    - v1.2.2: True parallel execution (Fix F), progress-first routing (Fix G),
+              blocked-by-failure status (Fix H)
     """
 
     # Token limits — read from environment or use defaults matching config.yaml
@@ -242,6 +260,7 @@ class MultiAgentWorkflow:
         slurm_config: Dict[str, Any] = None,
         use_reflexion_memory: bool = True,
         cleanup_env_on_success: bool = True,  # v3.2: Cleanup conda envs after success
+        max_parallel_agents: int = 4,          # v1.2.2: Thread pool size
     ):
         # v3.2.1: Resolve model and URL via centralized config (no hardcoded names)
         self.ollama_model = resolve_model(ollama_model)
@@ -253,6 +272,7 @@ class MultiAgentWorkflow:
         self.slurm_config = slurm_config or {}
         self.use_reflexion_memory = use_reflexion_memory and REFLEXION_AVAILABLE
         self.cleanup_env_on_success = cleanup_env_on_success  # v3.2
+        self.max_parallel_agents = max_parallel_agents  # v1.2.2
 
         # Initialize sandbox
         self.sandbox = Sandbox(self.project_dir)
@@ -315,11 +335,12 @@ class MultiAgentWorkflow:
 
         # Log configuration
         logger.info(
-            f"MultiAgentWorkflow v1.2.0 initialized: "
+            f"MultiAgentWorkflow v1.2.2 initialized: "
             f"model={self.ollama_model}, "
             f"tokens={self.MAX_CONTEXT_TOKENS}/{self.MAX_TOOL_OUTPUT_TOKENS}/{self.MIN_TOKENS_TO_CONTINUE}, "
             f"slurm={self.use_slurm}, "
             f"parallel={self.parallel_enabled}, "
+            f"max_parallel_agents={self.max_parallel_agents}, "
             f"reflexion={self.use_reflexion_memory}, "
             f"diagnostic_memory={self.diagnostic_memory is not None}, "
             f"cleanup_env={self.cleanup_env_on_success}, "
@@ -388,25 +409,25 @@ class MultiAgentWorkflow:
             }
         )
 
-        # After reflexion check
+        # v1.2.2: escalate no longer exits — marks failed, returns to main loop
         workflow.add_conditional_edges(
             "reflexion_check",
             self.route_after_reflexion,
             {
                 "apply_solution": "execute_sequential",
-                "escalate": "generate_report",
+                "escalate": "identify_parallel",       # ← FIX G: was generate_report
                 "master_review": "master_review",
             }
         )
 
-        # After master review
+        # v1.2.2: all paths return to main loop — no early exit
         workflow.add_conditional_edges(
             "master_review",
             self.route_after_review,
             {
                 "retry": "identify_parallel",
                 "skip": "identify_parallel",
-                "escalate": "generate_report"
+                # "escalate" removed — route_after_review maps it to "skip"
             }
         )
 
@@ -432,6 +453,7 @@ class MultiAgentWorkflow:
             "env_name": env_name,
             "use_slurm": self.use_slurm,
             "parallel_enabled": self.parallel_enabled,
+            "max_parallel_agents": self.max_parallel_agents,
             "reflexion_enabled": self.use_reflexion_memory,
             "diagnostic_memory_enabled": self.diagnostic_memory is not None,
             "cleanup_env_on_success": self.cleanup_env_on_success,  # v3.2
@@ -584,73 +606,135 @@ class MultiAgentWorkflow:
             }
 
     def submit_parallel_jobs(self, state: WorkflowState) -> Dict:
-        """Submit parallel SLURM jobs (non-blocking)"""
+        """Submit parallel tasks with true concurrent execution.
+
+        v1.2.2 FIX F: Uses ThreadPoolExecutor to run all batch tasks
+        simultaneously. Each task gets its own thread running the full
+        4-phase sub-agent lifecycle. The method blocks until ALL tasks
+        in the batch have resolved (success, failure, or crash).
+
+        Thread safety:
+        - Each thread creates its own ScriptFirstSubAgent instance
+        - Master document writes protected by self._lock
+        - Ollama handles concurrent requests via OLLAMA_NUM_PARALLEL
+        - Checkpoint files are per-task (no conflicts)
+        - DiagnosticMemory is append-only (safe for concurrent reads/writes)
+        """
         batch = state['parallel_batch']
         env_name = state['env_name']
         running_jobs = {}
         immediate_results = []
 
-        for subtask in batch:
+        max_workers = min(self.max_parallel_agents, len(batch))
+
+        def _execute_task(subtask):
+            """Execute a single task in its own thread."""
             task_id = subtask['id']
+            try:
+                # Reflexion pre-check
+                if self.use_reflexion_memory and subtask.get('context', {}).get('retry_reason'):
+                    proposed = subtask.get('context', {}).get('retry_reason', '')
+                    check = check_before_retry(task_id, proposed)
+                    if not check["allowed"]:
+                        logger.warning(
+                            f"Task {task_id}: duplicate approach rejected "
+                            f"(similarity: {check['similarity']:.2f})"
+                        )
+                        subtask.setdefault('context', {})
+                        subtask['context']['avoid_approach'] = check['similar_approach']
+                        subtask['context']['duplicate_warning'] = True
 
-            # Check reflexion memory before retry
-            if self.use_reflexion_memory and subtask.get('context', {}).get('retry_reason'):
-                proposed_approach = subtask.get('context', {}).get('retry_reason', '')
-                check = check_before_retry(task_id, proposed_approach)
+                # Mark running (thread-safe via lock)
+                with self._lock:
+                    self.master.master_document.mark_running(task_id)
 
-                if not check["allowed"]:
-                    logger.warning(
-                        f"Task {task_id}: Proposed approach rejected as duplicate "
-                        f"(similarity: {check['similarity']:.2f})"
-                    )
-                    subtask['context'] = subtask.get('context', {})
-                    subtask['context']['avoid_approach'] = check['similar_approach']
-                    subtask['context']['duplicate_warning'] = True
+                # Create agent (each thread gets its own instance)
+                agent = ScriptFirstSubAgent(
+                    agent_id=f"agent_{task_id}",
+                    sandbox=self.sandbox,
+                    conda_tools=self.conda_tools,
+                    slurm_tools=self.slurm_tools,
+                    ollama_model=self.ollama_model,
+                    ollama_base_url=self.ollama_base_url,
+                    use_slurm=True,
+                    slurm_config=self.slurm_config,
+                    project_root=str(self.project_dir),
+                    cleanup_env_on_success=self.cleanup_env_on_success,
+                    diagnostic_memory=self.diagnostic_memory,
+                )
 
-            # Mark as running in master document
-            self.master.master_document.mark_running(task_id)
+                result = agent.execute(subtask, env_name=env_name)
+                return (subtask, result)
 
-            # Create sub-agent — passes resolved model, but sub-agent
-            # also calls resolve_model() internally so None would be safe too
-            # v1.2.0: diagnostic_memory passed through for cross-task solutions
-            agent = ScriptFirstSubAgent(
-                agent_id=f"agent_{task_id}",
-                sandbox=self.sandbox,
-                conda_tools=self.conda_tools,
-                slurm_tools=self.slurm_tools,
-                ollama_model=self.ollama_model,
-                ollama_base_url=self.ollama_base_url,
-                use_slurm=True,
-                slurm_config=self.slurm_config,
-                project_root=str(self.project_dir),
-                cleanup_env_on_success=self.cleanup_env_on_success,  # v3.2
-                diagnostic_memory=self.diagnostic_memory,  # v1.2.0
-            )
-
-            # Execute - handles its own SLURM submission via sbatch
-            result = agent.execute(subtask, env_name=env_name)
-
-            if result.get('job_id'):
-                running_jobs[task_id] = result['job_id']
-            else:
-                # v1.2.1: Capture ALL synchronous results (success or failure)
-                immediate_results.append({
-                    "subtask": subtask,
-                    "result": result
+            except Exception as e:
+                logger.error(f"Task {task_id}: thread crashed: {e}")
+                return (subtask, {
+                    'success': False,
+                    'error': f"Agent thread crashed: {e}",
                 })
-                if result.get('success'):
-                    logger.info(f"Task {task_id} completed immediately (skipped={result.get('skipped', False)})")
-                    self.master.mark_subtask_complete(
-                        task_id,
-                        result.get('outputs', {}),
-                        result.get('report', ''))
+
+        # Log batch launch
+        agent_logger.log_workflow_event("parallel_launch", {
+            "batch_size": len(batch),
+            "max_workers": max_workers,
+            "tasks": [s['id'] for s in batch],
+        })
+
+        # Launch all tasks concurrently
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(_execute_task, subtask): subtask['id']
+                for subtask in batch
+            }
+
+            for future in as_completed(futures):
+                task_id = futures[future]
+                try:
+                    subtask, result = future.result()
+                except Exception as e:
+                    # future.result() itself threw — should not happen given
+                    # the try/except inside _execute_task, but safety net
+                    logger.error(f"Task {task_id}: future exception: {e}")
+                    subtask = next(s for s in batch if s['id'] == task_id)
+                    result = {'success': False, 'error': f"Future exception: {e}"}
+
+                if result.get('job_id'):
+                    running_jobs[task_id] = result['job_id']
                 else:
-                    logger.warning(f"Task {task_id} failed synchronously: {result.get('error', 'unknown')[:200]}")
- 
+                    immediate_results.append({
+                        "subtask": subtask,
+                        "result": result,
+                    })
+                    # Update master doc (thread-safe via lock)
+                    with self._lock:
+                        if result.get('success'):
+                            logger.info(
+                                f"Task {task_id} completed immediately "
+                                f"(skipped={result.get('skipped', False)})"
+                            )
+                            self.master.mark_subtask_complete(
+                                task_id,
+                                result.get('outputs', {}),
+                                result.get('report', ''))
+                        else:
+                            logger.warning(
+                                f"Task {task_id} failed: "
+                                f"{result.get('error', 'unknown')[:200]}")
+
+        # Log batch completion
+        if immediate_results:
+            n_success = sum(1 for r in immediate_results if r['result'].get('success'))
+            n_fail = len(immediate_results) - n_success
+            agent_logger.log_workflow_event("parallel_complete", {
+                "total": len(immediate_results),
+                "success": n_success,
+                "failed": n_fail,
+                "tasks": [r['subtask']['id'] for r in immediate_results],
+            })
 
         return {
             "running_jobs": running_jobs,
-            "parallel_results": immediate_results
+            "parallel_results": immediate_results,
         }
 
     def execute_sequential(self, state: WorkflowState) -> Dict:
@@ -716,9 +800,9 @@ class MultiAgentWorkflow:
         existing_results = state.get('parallel_results', [])
 
         if not running_jobs:
-            return {"parallel_results": exsiting_results}
+            return {"parallel_results": existing_results}
 
-        results = list(exsiting_results)
+        results = list(existing_results)
         poll_interval = self.slurm_config.get("poll_interval", 10)
         max_attempts = self.slurm_config.get("max_poll_attempts", 720)
 
@@ -943,6 +1027,9 @@ class MultiAgentWorkflow:
         v3.2.2 Fix D: Now reports 'deadlocked' status when the pipeline
         exits due to unrecoverable dependency cycles, instead of the
         misleading 'completed' status from v3.2.1.
+
+        v1.2.2 Fix H: Reports tasks with 'blocked' status separately,
+        showing which failed dependency prevents each blocked task.
         """
         completed = state.get('completed_subtasks', [])
         failed = state.get('failed_subtasks', [])
@@ -953,9 +1040,12 @@ class MultiAgentWorkflow:
         gpu_tasks = [s for s in all_subtasks if s.get('requires_gpu')]
         cpu_tasks = [s for s in all_subtasks if not s.get('requires_gpu')]
 
-        # v3.2.2: Count blocked tasks (pending with unsatisfied deps)
+        # v1.2.2: Include both 'pending' and 'blocked' statuses
         blocked_tasks = [s for s in all_subtasks
-                         if s.get('status', 'pending') == 'pending']
+                         if s.get('status') in ('pending', 'blocked')]
+
+        # v1.2.2: Count explicitly blocked (by failed deps)
+        explicitly_blocked = [s for s in all_subtasks if s.get('status') == 'blocked']
 
         # Determine final status string
         if is_deadlocked:
@@ -981,6 +1071,7 @@ Model: {self.ollama_model}
 Cluster: {os.environ.get('AGI_CLUSTER', 'unknown')}
 Token Budget: {self.MAX_CONTEXT_TOKENS}/{self.MAX_TOOL_OUTPUT_TOKENS}/{self.MIN_TOKENS_TO_CONTINUE} (context/tool/min)
 Diagnostic Memory: {'enabled' if self.diagnostic_memory else 'disabled'}
+Parallel Agents: {self.max_parallel_agents}
 
 ## Summary
 
@@ -988,6 +1079,7 @@ Diagnostic Memory: {'enabled' if self.diagnostic_memory else 'disabled'}
 - **Completed**: {len(completed)}
 - **Failed**: {len(failed)}
 - **Blocked**: {len(blocked_tasks)}
+- **Blocked by Failed Deps**: {len(explicitly_blocked)}
 - **Success Rate**: {len(completed) / max(len(all_subtasks), 1) * 100:.1f}%
 - **GPU Tasks**: {len(gpu_tasks)} ({len([s for s in gpu_tasks if s.get('status') == 'completed'])} completed)
 - **CPU Tasks**: {len(cpu_tasks)} ({len([s for s in cpu_tasks if s.get('status') == 'completed'])} completed)
@@ -1017,6 +1109,17 @@ dependencies that cannot be resolved. This typically means:
             report += "3. Verify Fix B sanitized the dependency DAG\n"
             report += "4. Re-run with `--verbose` to see dependency chain at decomposition\n\n"
 
+        # v1.2.2: Blocked-by-failure section (Fix H)
+        if explicitly_blocked:
+            report += "## ⊘ Tasks Blocked by Failed Dependencies\n\n"
+            report += "These tasks were not attempted because a required dependency "
+            report += "permanently failed.\n\n"
+            for st in explicitly_blocked:
+                blocked_by = st.get('blocked_by', [])
+                report += f"- **{st['id']}** ({st.get('title', 'N/A')[:60]})\n"
+                report += f"  Blocked by: {', '.join(blocked_by)}\n"
+            report += "\n"
+
         report += "## Task Details\n\n"
 
         for subtask in completed:
@@ -1035,7 +1138,9 @@ dependencies that cannot be resolved. This typically means:
 
         for subtask in blocked_tasks:
             gpu_flag = " [GPU]" if subtask.get('requires_gpu') else ""
-            report += f"### ⊘ {subtask['id']}{gpu_flag} (BLOCKED)\n"
+            blocked_by = subtask.get('blocked_by', [])
+            blocked_label = f" (blocked by: {', '.join(blocked_by)})" if blocked_by else ""
+            report += f"### ⊘ {subtask['id']}{gpu_flag} (BLOCKED{blocked_label})\n"
             report += f"{subtask.get('description', 'No description')[:200]}\n"
             report += f"**Deps**: {subtask.get('dependencies', [])}\n\n"
 
@@ -1200,8 +1305,13 @@ dependencies that cannot be resolved. This typically means:
         non-executable steps) and Fix B (sanitize dependencies) in
         master_agent.py are working correctly.
 
+        v1.2.2 FIX H: Strategy 1 (strip failed deps) REMOVED. Tasks with
+        failed dependencies stay blocked to maintain dependency integrity
+        and provide clear error traceability. Only true circular dependency
+        deadlocks are broken (Strategies 2-4).
+
         Recovery strategies (applied in order):
-        1. Strip deps pointing to failed task IDs (those tasks won't complete)
+        1. (REMOVED in v1.2.2 — failed-dep tasks now get 'blocked' status)
         2. Strip deps pointing to non-existent task IDs (bad LLM output)
         3. Force-complete non-executable tasks (doc sections that slipped
            through Fix A's filter — detected by: no code_hints, no packages,
@@ -1219,26 +1329,39 @@ dependencies that cannot be resolved. This typically means:
         pending = [st for st in subtasks
                    if st.get('status', 'pending') == 'pending']
 
-        # ── Strategy 1: Strip deps on failed tasks
+        # ── v1.2.2 FIX H: Separate "blocked by failure" from "true deadlock"
+        blocked_by_failure = []
+        potentially_deadlocked = []
         for st in pending:
-            deps = st.get('dependencies', [])
-            failed_deps = [d for d in deps if d in failed_ids]
-            if failed_deps:
-                st['dependencies'] = [d for d in deps if d not in failed_ids]
-                actions.append(f"stripped_failed_deps_{st['id']}_{failed_deps}")
-                print(f"    → {st['id']}: removed deps on failed tasks: {failed_deps}")
+            deps = set(st.get('dependencies', []))
+            if deps.intersection(failed_ids):
+                blocked_by_failure.append(st)
+            else:
+                potentially_deadlocked.append(st)
 
-        ready = self._find_ready_tasks(subtasks)
-        if ready:
+        # Mark failure-blocked tasks explicitly (they stay blocked, not stripped)
+        if blocked_by_failure:
+            for st in blocked_by_failure:
+                st['status'] = 'blocked'
+                st['blocked_by'] = [d for d in st.get('dependencies', [])
+                                    if d in failed_ids]
+                print(f"    → {st['id']}: blocked by failed deps: {st['blocked_by']}")
+            actions.append(f"marked_{len(blocked_by_failure)}_tasks_blocked_by_failures")
+
+        # If ALL pending tasks were blocked by failures, not a circular deadlock
+        if not potentially_deadlocked:
+            ready = self._find_ready_tasks(subtasks)
+            if ready:
+                return {'unblocked': True, 'ready_tasks': ready,
+                        'actions': actions, 'remaining_blocked': []}
             return {
-                'unblocked': True,
-                'ready_tasks': ready,
+                'unblocked': False, 'ready_tasks': [],
                 'actions': actions,
-                'remaining_blocked': [],
+                'remaining_blocked': [st['id'] for st in blocked_by_failure],
             }
 
         # ── Strategy 2: Strip deps on non-existent task IDs
-        for st in pending:
+        for st in potentially_deadlocked:
             deps = st.get('dependencies', [])
             phantom_deps = [d for d in deps if d not in all_ids]
             if phantom_deps:
@@ -1267,7 +1390,7 @@ dependencies that cannot be resolved. This typically means:
         ]
 
         force_completed = 0
-        for st in list(pending):  # copy list since we modify status
+        for st in list(potentially_deadlocked):  # copy list since we modify status
             title = st.get('title', '')
             code_hints = st.get('code_hints', [])
             packages = st.get('packages', [])
@@ -1366,46 +1489,103 @@ dependencies that cannot be resolved. This typically means:
         return ready
 
     def route_after_execution(self, state: WorkflowState) -> str:
-        """Route after execution"""
+        """Route after execution with progress-first priority.
+
+        v1.2.2 FIX G: Three-tier priority routing:
+          1. Ready tasks exist → "next_batch" (keep making progress)
+          2. Reviewable failures exist → "review" (attempt recovery)
+          3. Nothing actionable → "complete" (exit pipeline)
+
+        This ensures independent tasks always get attempted before the
+        pipeline spends time reviewing failures. The pipeline only exits
+        when ALL tasks are completed, permanently failed, or blocked.
+        """
         failed = state.get('failed_subtasks', [])
         subtasks = state.get('subtasks', [])
 
-        # Check for reviewable failures
-        for f in failed:
-            context_status = f.get('last_result', {}).get('context_status', {})
-            if context_status.get('remaining_tokens', 10000) >= self.MIN_TOKENS_TO_CONTINUE:
-                decision = "review"
-                agent_logger.log_workflow_event("transition", {
-                    "from": "handle_results",
-                    "to": decision,
-                    "reason": f"reviewable failure: {f.get('id')}",
-                    "remaining_tokens": context_status.get('remaining_tokens'),
-                })
-                return decision
+        # Compute current state
+        completed_ids = {st['id'] for st in subtasks
+                         if st.get('status') == 'completed'}
+        failed_ids = {st['id'] for st in subtasks
+                      if st.get('status') == 'failed'}
+        pending = [st for st in subtasks
+                   if st.get('status', 'pending') == 'pending']
 
-        # Check for more pending
-        pending = [st for st in subtasks if st.get('status') == 'pending']
-        if pending:
+        # Find tasks whose deps are all satisfied
+        ready = [
+            st for st in pending
+            if set(st.get('dependencies', [])).issubset(completed_ids)
+        ]
+
+        # PRIORITY 1: More work available → dispatch it
+        if ready:
             decision = "next_batch"
-        else:
-            decision = "complete"
+            agent_logger.log_workflow_event("transition", {
+                "from": "handle_results",
+                "to": decision,
+                "reason": f"{len(ready)} tasks ready",
+                "ready_tasks": [t['id'] for t in ready[:10]],
+                "pending_count": len(pending),
+                "failed_count": len(failed),
+                "completed_count": len(completed_ids),
+            })
+            return decision
 
+        # PRIORITY 2: No ready tasks but reviewable failures exist
+        reviewable = [
+            f for f in failed
+            if not f.get('_permanently_failed')
+            and not f.get('_unrecoverable')
+        ]
+
+        if reviewable:
+            decision = "review"
+            agent_logger.log_workflow_event("transition", {
+                "from": "handle_results",
+                "to": decision,
+                "reason": f"{len(reviewable)} reviewable failure(s), 0 ready tasks",
+                "reviewable_tasks": [f['id'] for f in reviewable[:5]],
+            })
+            return decision
+
+        # PRIORITY 3: Nothing actionable
+        # Mark tasks blocked by failed deps before exiting
+        for st in pending:
+            blocking_deps = [
+                dep for dep in st.get('dependencies', [])
+                if dep in failed_ids
+            ]
+            if blocking_deps:
+                st['status'] = 'blocked'
+                st['blocked_by'] = blocking_deps
+
+        decision = "complete"
+        blocked_count = len([st for st in subtasks if st.get('status') == 'blocked'])
         agent_logger.log_workflow_event("transition", {
             "from": "handle_results",
             "to": decision,
-            "pending_count": len(pending),
-            "failed_count": len(failed),
-            "completed_count": len(state.get('completed_subtasks', [])),
+            "reason": "no ready tasks, no reviewable failures",
+            "completed": len(completed_ids),
+            "failed": len(failed_ids),
+            "blocked": blocked_count,
         })
-
         return decision
 
     def route_after_reflexion(self, state: WorkflowState) -> str:
-        """Route after reflexion check"""
-        reflexion = state.get('reflexion', {})
+        """Route after reflexion check.
+
+        v1.2.2: escalate marks task as permanently failed and returns to
+        main loop instead of exiting pipeline.
+        """
+        reflexion = state.get('reflexion', create_initial_reflexion_state())
 
         if reflexion.get('should_escalate'):
-            decision = "escalate"
+            # v1.2.2: Mark permanently failed, don't exit pipeline
+            failed = state.get('failed_subtasks', [])
+            if failed:
+                failed[0]['_permanently_failed'] = True
+                failed[0]['_escalated'] = True
+            decision = "escalate"     # → identify_parallel (graph edge changed)
         elif reflexion.get('should_apply_solution'):
             decision = "apply_solution"
         else:
@@ -1421,16 +1601,32 @@ dependencies that cannot be resolved. This typically means:
         return decision
 
     def route_after_review(self, state: WorkflowState) -> str:
-        """Route after master review"""
+        """Route after master review.
+
+        v1.2.2: ESCALATE no longer exits the pipeline. All three decisions
+        return to identify_parallel:
+          RETRY    → reset task to pending, re-attempt in next batch
+          SKIP     → mark permanently failed, continue pipeline
+          ESCALATE → mark permanently failed, continue pipeline (same as SKIP)
+        """
         decision = state.get('master_decision', {})
         decision_type = decision.get('decision', 'SKIP')
 
         if decision_type == 'RETRY':
+            failed = state.get('failed_subtasks', [])
+            if failed:
+                failed[0]['status'] = 'pending'
+                failed[0].pop('last_result', None)
+                failed[0].pop('_permanently_failed', None)
             route = "retry"
-        elif decision_type == 'SKIP':
-            route = "skip"
         else:
-            route = "escalate"
+            # SKIP and ESCALATE both mark permanently failed
+            failed = state.get('failed_subtasks', [])
+            if failed:
+                failed[0]['_permanently_failed'] = True
+                if decision_type == 'ESCALATE':
+                    failed[0]['_escalated'] = True
+            route = "skip"
 
         agent_logger.log_workflow_event("transition", {
             "from": "master_review",

@@ -11,23 +11,12 @@ This system maintains separation between:
 All execution artifacts (logs, outputs, reports) go to PROJECT_DIR.
 AGI_ROOT stays clean and only contains the pipeline code.
 
-v3.2.1 Updates:
-- Model selection is now fully modular via utils.model_config.
-  No hardcoded model names anywhere in main.py.  Resolution priority:
-    1. CLI --model flag (explicit parameter)
-    2. OLLAMA_MODEL environment variable (set by RUN scripts)
-    3. config.yaml → ollama.model
-    4. Single fallback constant in utils/model_config.py
-  Same chain applies to --ollama-url via resolve_base_url().
+v1.2.2 Updates:
 
-v3.2 Updates:
-- ARC cluster as primary target (GPU + CPU partitions)
-- GPU-first architecture: master on GPU node, subtasks route to CPU or GPU
-- Dual cluster routing: AGI_CLUSTER (CPU) + AGI_GPU_CLUSTER (GPU subtasks)
-- Cluster configuration via cluster_config.yaml
-- Conda cleanup after successful task completion
-- State checkpointing for resume capability
-- Open-source conda channels only (no defaults/main)
+New --max-parallel-agents CLI argument to control sub-agent thread pool size.
+Separate from --max-parallel which controls SLURM job concurrency.
+max_parallel_agents passed through to MultiAgentWorkflow constructor.
+Resolves from: CLI --max-parallel-agents → config.yaml parallel.max_parallel_agents → default 4
 
 GPU NODE RULES (ARC):
 - Do NOT specify --mem on GPU partitions (causes allocation failures)
@@ -385,7 +374,8 @@ def print_banner(task: str, config: dict, project_dir: Path, cluster_info: dict 
         print(f"    Checkpointing: Enabled")
 
     if config.get("parallel", {}).get("enabled"):
-        print(f"\n  Parallel Execution: Enabled")
+        max_agents = config.get("parallel", {}).get("max_parallel_agents", 4)
+        print(f"\n  Parallel Execution: Enabled ({max_agents} concurrent agents)")    
 
     print(f"{'='*70}")
     print(f"\n  Task:")
@@ -559,8 +549,13 @@ Examples:
     # Parallel execution
     parser.add_argument("--parallel", action="store_true", help="Enable parallel subtask execution")
     parser.add_argument("--no-parallel", action="store_true", help="Disable parallel execution")
-    parser.add_argument("--max-parallel", type=int, help="Maximum parallel jobs")
-
+    parser.add_argument("--max-parallel", type=int, help="Maximum parallel SLURM jobs")
+    parser.add_argument(
+        "--max-parallel-agents", type=int, default=None,
+        help="Maximum concurrent sub-agent threads per batch (default: from config, typically 4). "
+             "Each thread runs one task's full 4-phase lifecycle. Must not exceed OLLAMA_NUM_PARALLEL."
+    )
+    
     # Other options
     parser.add_argument("--config", type=str, default="config/config.yaml", help="Path to config file")
     parser.add_argument("--dry-run", action="store_true", help="Print configuration without executing")
@@ -714,6 +709,19 @@ Examples:
     if args.no_cleanup_env:
         cleanup_env = False
 
+
+    # =========================================================================
+    # RESOLVE PARALLEL AGENTS (v1.2.2)
+    # =========================================================================
+    # max_parallel_agents controls the ThreadPoolExecutor size in
+    # submit_parallel_jobs(). Each thread runs one task's full 4-phase
+    # sub-agent lifecycle concurrently. Must not exceed OLLAMA_NUM_PARALLEL
+    # set in the RUN script.
+    max_parallel_agents = (
+        args.max_parallel_agents
+        or config.get('parallel', {}).get('max_parallel_agents', 4)
+    )
+
     # =========================================================================
     # BUILD SLURM JOB CONFIG
     # =========================================================================
@@ -844,6 +852,7 @@ Examples:
         if args.gpus:
             print("GPUs:", args.gpus, f"(--gres=gpu:{args.gpus})", args.gpu_type or "")
         print("Parallel:", "Enabled" if parallel_enabled else "Disabled")
+        print("Parallel Agents:", max_parallel_agents)
         print("\n--- v3.2 Subtask Routing ---")
         print("CPU Subtasks →", cluster_for_subtasks)
         print("GPU Subtasks →", gpu_cluster_for_subtasks)
@@ -876,6 +885,7 @@ Examples:
             slurm_config=slurm_job_config,
             use_reflexion_memory=config.get('reflexion', {}).get('enabled', True),
             cleanup_env_on_success=cleanup_env,
+            max_parallel_agents=max_parallel_agents,   # v1.2.2
         )
     except Exception as e:
         print(f"Error initializing workflow: {e}")

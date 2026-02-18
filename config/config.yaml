@@ -1,5 +1,5 @@
 # =============================================================================
-# Multi-Agent System Configuration v1.2.0
+# Multi-Agent System Configuration v1.2.2
 # =============================================================================
 # Supports four-phase sub-agent lifecycle with integrated diagnostic agent
 #
@@ -23,6 +23,13 @@
 #   System-wide: edit FALLBACK_MODEL in utils/model_config.py
 #
 # Same chain applies to ollama.base_url via resolve_base_url().
+#
+# CHANGELOG v1.2.2:
+# ---------------------------------
+# - Added top-level parallel section (was only under workflow.parallel)
+# - Added parallel.max_parallel_agents for ThreadPoolExecutor sizing
+# - Added parallel.max_parallel_gpu_jobs for GPU node scarcity
+# - Must not exceed OLLAMA_NUM_PARALLEL set in the RUN script
 #
 # CHANGELOG v1.2.0:
 # ---------------------------------
@@ -97,6 +104,60 @@ context:
 
   # Percentage of context to keep as recent history (rest gets summarized)
   recent_history_percent: 30
+
+# =============================================================================
+# Parallel Execution (v1.2.2 — NEW top-level section)
+# =============================================================================
+# Controls both sub-agent thread pool sizing and SLURM job concurrency.
+# This is the AUTHORITATIVE source — main.py reads from here:
+#   config.get('parallel', {}).get('max_parallel_agents', 4)
+#   config.get('parallel', {}).get('max_parallel_jobs', 10)
+#
+# Two separate concurrency dimensions:
+#   max_parallel_agents  →  ThreadPoolExecutor threads (run on Ollama host)
+#   max_parallel_jobs    →  SLURM jobs queued/running (run on cluster nodes)
+#
+# Resolution chains:
+#   max_parallel_agents:  CLI --max-parallel-agents → THIS → default 4
+#   max_parallel_jobs:    CLI --max-parallel → THIS → default 10
+#
+# IMPORTANT: max_parallel_agents must NOT exceed OLLAMA_NUM_PARALLEL
+# set in RUN_AGI_PIPELINE_GPU.sh. Both default to 4.
+# =============================================================================
+parallel:
+  enabled: true
+
+  # v1.2.2: Max concurrent sub-agent threads per batch.
+  # Each thread runs one task's full 4-phase lifecycle (outline → script →
+  # env build → SLURM submit → monitor). All threads share the same Ollama
+  # server, so this MUST NOT exceed OLLAMA_NUM_PARALLEL set in the RUN script.
+  #
+  # VRAM budget guide (qwen3-coder:latest, ~20 GiB weights shared):
+  #   Each parallel slot ≈ 3-4 GiB KV cache at 32K context
+  #   1× V100S-32GB: 2-3 safe
+  #   2× V100S-32GB: 4 safe (default)
+  #   CPU-only 1TiB RAM: 4-6 safe
+  max_parallel_agents: 4
+
+  # Max SLURM jobs queued/running simultaneously across all batches.
+  # This is DIFFERENT from max_parallel_agents — jobs are submitted to
+  # SLURM and run on cluster nodes, not on the Ollama host.
+  max_parallel_jobs: 10
+
+  # Max GPU SLURM jobs running simultaneously (GPU nodes are scarce)
+  max_parallel_gpu_jobs: 4
+
+  # Thread pool size for workflow-level operations
+  max_threads: 4
+
+  # Max tasks per parallel batch
+  max_batch_size: 5
+
+  # Strategy for identifying parallel batches
+  parallel_strategy: "dependency_based"
+
+  # Minimum tasks to bother with parallel execution
+  min_tasks_for_parallel: 2
 
 # =============================================================================
 # Agent Settings
@@ -581,6 +642,9 @@ workflow:
     generate_script: true
     submit_via_slurm: true
 
+  # v1.2.2 NOTE: The top-level 'parallel' section is now the authoritative
+  # source that main.py reads. These values are kept for backward compatibility
+  # with any code that reads workflow.parallel. Keep in sync with the top-level.
   parallel:
     enabled: true
     max_parallel_jobs: 10
