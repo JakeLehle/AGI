@@ -232,6 +232,7 @@ class DiagnosticAgent:
             "permission_error": self._investigate_permission_error,
             "runtime_logic_error": self._investigate_code_error,
             "network_error": self._investigate_network_error,
+            "runtime_argument_error": self._investigate_runtime_argument_error,
         }
 
         handler = dispatch.get(error_type, self._investigate_generic)
@@ -485,6 +486,22 @@ class DiagnosticAgent:
         error_message = kwargs["error_message"]
         stderr = kwargs["stderr"]
         subtask_description = kwargs.get("subtask_description", "")
+
+        # v1.2.3: Early-exit guard — argument/input errors are a launcher
+        # problem (sbatch exec_cmd missing args), NOT a script logic problem.
+        # Delegating to _investigate_code_error would ask the LLM to "fix"
+        # a script that is working correctly, producing wrong prescriptions.
+        argument_keywords = [
+            'no input file', 'provided via command', 'argument required',
+            'argument missing', 'no file provided', 'usage:', 'sys.exit(1)',
+        ]
+        combined_lower = (error_message + " " + stderr).lower()
+        if any(kw in combined_lower for kw in argument_keywords):
+            logger.info(
+                f"[{self.agent_id}] Detected argument error in code_error "
+                f"path — delegating to _investigate_runtime_argument_error"
+            )
+            return self._investigate_runtime_argument_error(**kwargs)
 
         # Parse traceback
         tb = self._parse_traceback(stderr)
@@ -773,11 +790,82 @@ class DiagnosticAgent:
                 self._store_solution(error_message, rx)
                 return rx
 
-        return FixPrescription(
+return FixPrescription(
             target_file="sbatch",
             fix_type="change_config",
             confidence=0.4,
             explanation=f"Unrecognized SLURM error: {combined[:300]}",
+        )
+
+    def _investigate_runtime_argument_error(self, **kwargs) -> FixPrescription:
+        """Investigate missing/incorrect CLI argument errors.
+
+        v1.2.3: This error class means the sbatch exec_cmd is not passing
+        required arguments to the script. The Python script itself is
+        correct — the fix must be applied to the sbatch launcher, not
+        the script. Returns fix_type='add_argument' which sub_agent.py's
+        _apply_fix() handles by deleting the stale sbatch and regenerating
+        it with input_files from the subtask definition appended to exec_cmd.
+
+        Protocol:
+          1. Read sbatch content from _step_files to confirm missing args
+          2. Read script content to extract what arguments it expects
+          3. Log diagnostic action taken
+          4. Return add_argument prescription for sub_agent to apply
+        """
+        error_message = kwargs.get("error_message", "")
+        stdout = kwargs.get("stdout", "")
+
+        # Read the sbatch script from discovered step files
+        sbatch_content = ""
+        for filename, info in self._step_files.items():
+            if filename.endswith(".sbatch"):
+                sbatch_content = info.get("content", "")
+                break
+
+        # Read the Python/R script to understand what args it expects
+        script_content = self._get_any_script_content()
+
+        # Extract the exec_cmd line from sbatch for the log
+        exec_line = ""
+        for line in sbatch_content.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("python ") or stripped.startswith("Rscript "):
+                exec_line = stripped
+                break
+
+        self._actions_taken.append(
+            f"Detected missing CLI argument. "
+            f"sbatch exec_cmd: '{exec_line or '[not found]'}'. "
+            f"Error: {error_message[:200]}"
+        )
+
+        logger.info(
+            f"[{self.agent_id}] runtime_argument_error: sbatch exec_cmd "
+            f"is missing input_file arguments. Prescribing add_argument fix."
+        )
+
+        return FixPrescription(
+            target_file="sbatch",
+            fix_type="add_argument",
+            changes=[{
+                "action": "add_input_argument",
+                "exec_line_found": exec_line,
+                "script_head": script_content[:1500] if script_content else "",
+                "suggestion": (
+                    "Regenerate sbatch with input_files from subtask definition "
+                    "appended as positional arguments to the exec_cmd line."
+                ),
+            }],
+            confidence=0.92,
+            explanation=(
+                f"The sbatch exec_cmd calls the script with no arguments, but "
+                f"the script requires at least one input file path via sys.argv. "
+                f"Current exec_cmd: '{exec_line or '[not found in sbatch]'}'. "
+                f"Fix: delete stale sbatch and regenerate with input_files "
+                f"appended. sub_agent._apply_fix will handle this via "
+                f"fix_type='add_argument'."
+            ),
         )
 
     def _investigate_syntax_error(self, **kwargs) -> FixPrescription:

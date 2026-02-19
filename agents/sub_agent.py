@@ -1,7 +1,7 @@
 """
-Script-First Sub-Agent v1.2.0 — 4-Phase Lifecycle with Diagnostic Agent
+Script-First Sub-Agent v1.2.3 — 4-Phase Lifecycle with Diagnostic Agent
 
-Features (inherited from v3.2.2):
+Features:
 - DUAL CLUSTER ROUTING: AGI_CLUSTER (CPU) + AGI_GPU_CLUSTER (GPU subtasks)
 - GPU-AWARE SBATCH: Auto-routes tasks to GPU/CPU based on package detection
 - GPU NODE RULES: No --mem on GPU partitions, --gres=gpu:N format
@@ -1039,11 +1039,13 @@ ADD_PIP: package_name==version"""
     ) -> Dict[str, Any]:
         """Execute the job and iterate with diagnostic agent on failures.
 
-        v1.2.0: Replaces the old _reflect_and_update loop with
+        v1.2.3: Replaces the old _reflect_and_update loop with
         DiagnosticAgent invocation that produces structured FixPrescriptions.
         """
         task_id = subtask.get('id', 'task')
         print(f"\n[{task_id}] Phase 4: Execution & Monitoring")
+
+        self._routed_slurm = routed_slurm
 
         while self._can_continue():
             self.checkpoint.iteration += 1
@@ -1329,6 +1331,36 @@ ADD_PIP: package_name==version"""
             # Package was already added by diagnostic agent
             return result
 
+        if fix_type == "add_argument":
+            # v1.2.3: The sbatch exec_cmd was missing input_file arguments.
+            # The stale sbatch must be deleted so Phase 3's cache check
+            # doesn't skip regeneration, then rebuilt from scratch.
+            # _generate_sbatch_script now appends subtask['input_files']
+            # to exec_cmd, so the regenerated sbatch will be correct.
+            print(f"    Removing stale sbatch (missing input args)...")
+            if self.checkpoint.sbatch_path:
+                stale = Path(self.checkpoint.sbatch_path)
+                if stale.exists():
+                    stale.unlink()
+                    print(f"    Deleted: {stale.name}")
+                # Clear from checkpoint so Phase 3 cache check doesn't block
+                self._update_checkpoint(sbatch_path=None)
+
+            routed_slurm = getattr(self, '_routed_slurm', {})
+            if routed_slurm:
+                regen = self._phase_3_generate_sbatch(subtask, routed_slurm)
+                if regen.get('success'):
+                    print(f"    Sbatch regenerated with input file arguments")
+                    result['script_updated'] = True  # Triggers re-submission
+                else:
+                    print(f"    WARNING: Sbatch regeneration failed")
+                    result['should_escalate'] = True
+            else:
+                # _routed_slurm not stored — escalate rather than guess
+                print(f"    WARNING: No routed_slurm available, escalating")
+                result['should_escalate'] = True
+            return result
+
         return result
 
     # =========================================================================
@@ -1403,16 +1435,25 @@ ADD_PIP: package_name==version"""
                 r'Traceback \(most recent call last\)',
                 r'Error in .*\.R:',
             ],
+            'runtime_argument_error': [
+                r'[Ee]rror:.*[Nn]o .*(?:input|file|argument).*provided',
+                r'[Ee]rror:.*(?:argument|input).*(?:required|missing)',
+                r'[Uu]sage:.*required',
+                r'error: the following arguments are required',
+                r'[Ee]rror:.*provided via command',
+                r'sys\.exit\(1\)',
+            ],
         }
 
         for error_type, pats in patterns.items():
             for p in pats:
                 m = re.search(p, combined, re.IGNORECASE)
                 if m:
-                    # Extract the actual error message (last meaningful line)
-                    error_message = self._extract_error_message(
-                        stderr or stdout
-                    )
+                    # v1.2.3: Prefer stderr for error extraction, but fall back
+                    # to stdout — many scripts (e.g. sys.exit calls, argparse)
+                    # print errors to stdout with an empty stderr.
+                    best_source = stderr if stderr.strip() else stdout
+                    error_message = self._extract_error_message(best_source)
                     return {
                         'success': False,
                         'error_type': error_type,
@@ -1421,11 +1462,15 @@ ADD_PIP: package_name==version"""
                     }
 
         if not job_result.get('success'):
+            # v1.2.3: Same stdout preference fix for the unknown fallback.
+            # Previously this always used stderr, losing the actual error when
+            # the script printed to stdout and stderr was empty.
+            best_source = stderr if stderr.strip() else stdout
             return {
                 'success': False,
                 'error_type': 'unknown',
-                'error_message': stderr[-500:] if stderr else 'Unknown error',
-                'error_summary': stderr[-500:] or 'Unknown error',
+                'error_message': best_source[-500:] if best_source else 'Unknown error',
+                'error_summary': best_source[-500:] or 'Unknown error',
             }
 
         return {'success': True}
@@ -1489,6 +1534,23 @@ ADD_PIP: package_name==version"""
             'java': f'java "{script_path}"',
         }
         exec_cmd = dispatch.get(language, f'python "{script_path}"')
+
+        # v1.2.3: Append input_files as positional CLI arguments.
+        # Scripts that use sys.argv or argparse require this — without it
+        # the sbatch calls the script with no arguments and the script
+        # immediately exits with "No input file provided".
+        # input_files come from the subtask definition, which is the
+        # authoritative source for what data this step needs.
+        input_files = subtask.get('input_files', [])
+        if input_files:
+            # Resolve each path relative to project root and quote it
+            resolved_args = []
+            for f in input_files:
+                p = Path(f)
+                if not p.is_absolute():
+                    p = self.project_root / p
+                resolved_args.append(f'"{p}"')
+            exec_cmd = exec_cmd + ' ' + ' '.join(resolved_args)
 
         # Build SBATCH directives
         lines = [
