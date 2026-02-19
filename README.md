@@ -481,6 +481,3 @@ Between runs, use `PARTIAL_CLEAN_PROJECT.sh` to remove SLURM logs (which accumul
 - **v1.2.3** — Fixed 5-layer failure chain that caused steps to ghost-stall at "running" status. Added `runtime_argument_error` classification, diagnostic agent handler and `add_argument` fix type, sbatch input file argument injection (Phase 3), and master document sync in parallel execution path.
 - **v1.2.2** — True parallel task execution via `ThreadPoolExecutor`. Progress-first routing prevents premature pipeline exit. `blocked` status for tasks with failed dependencies. `OLLAMA_NUM_PARALLEL` support for concurrent LLM requests.
 - **v1.2.0** — Diagnostic Agent with 13 error type handlers. `DiagnosticMemory` persistent solution storage. `DiskManager` for proactive quota monitoring. Sub-agent refactored into 4-phase lifecycle. All LLM calls use `invoke_resilient` with exponential backoff.
-- **v3.2** — ARC dual-cluster routing, token-based context management, GPU-aware task routing, model resolution chain, decomposition timeouts, open-source conda channels only.
-- **v3.1** — LangGraph workflow, reflexion memory, SLURM integration.
-- **v3.0** — Script-first architecture, master prompt living document.
