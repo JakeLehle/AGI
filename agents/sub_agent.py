@@ -577,14 +577,28 @@ class ScriptFirstSubAgentV3:
     ) -> Optional[str]:
         """Generate an outline and validate it against subtask goals."""
         desc = subtask.get('description', '')
+        packages = subtask.get('packages', [])
         inputs = subtask.get('input_files', [])
         outputs = subtask.get('output_files', [])
-        packages = subtask.get('packages', [])
+        hints = subtask.get('code_hints', [])
 
-        for attempt in range(self.MAX_OUTLINE_ATTEMPTS):
+        for attempt in range(self.MAX_IMPLEMENTATION_ATTEMPTS):
             self._update_checkpoint(
-                status=TaskStatus.GENERATING_OUTLINE.value
+                status=TaskStatus.GENERATING_SCRIPT.value
             )
+
+            if language == 'python':
+                prompt = self._build_python_script_prompt(
+                    desc, outline, packages, inputs, outputs, hints=hints
+                )
+            elif language == 'r':
+                prompt = self._build_r_script_prompt(
+                    desc, outline, packages, inputs, outputs, hints=hints
+                )
+            else:
+                prompt = self._build_generic_script_prompt(
+                    desc, outline, packages, inputs, outputs, language, hints=hints
+                )
 
             prompt = f"""Create a structured outline for a {language} script.
 
@@ -2010,15 +2024,20 @@ ADD_PIP: package_name==version"""
         return 'python'
 
     def _build_python_script_prompt(
-        self, desc, outline, packages, inputs, outputs
+        self, desc, outline, packages, inputs, outputs, hints=None
     ) -> str:
+        hints_block = ""
+        if hints:
+            hints_block = "\nIMPORTANT IMPLEMENTATION GUIDANCE (follow exactly):\n"
+            hints_block += "\n".join(f"  - {h}" for h in hints)
+            hints_block += "\n"
         return f"""Generate a complete Python script based on this validated outline.
 
 TASK: {desc}
 PACKAGES: {', '.join(packages)}
 INPUTS: {', '.join(inputs) if inputs else 'None'}
 OUTPUTS: {', '.join(outputs) if outputs else 'None'}
-
+{hints_block}
 OUTLINE:
 {outline}
 
@@ -2046,15 +2065,20 @@ if __name__ == "__main__":
 Generate ONLY the complete Python code."""
 
     def _build_r_script_prompt(
-        self, desc, outline, packages, inputs, outputs
+        self, desc, outline, packages, inputs, outputs, hints=None
     ) -> str:
+        hints_block = ""
+        if hints:
+            hints_block = "\nIMPORTANT IMPLEMENTATION GUIDANCE (follow exactly):\n"
+            hints_block += "\n".join(f"  - {h}" for h in hints)
+            hints_block += "\n"
         return f"""Generate a complete R script based on this validated outline.
 
 TASK: {desc}
 PACKAGES: {', '.join(packages)}
 INPUTS: {', '.join(inputs) if inputs else 'None'}
 OUTPUTS: {', '.join(outputs) if outputs else 'None'}
-
+{hints_block}
 OUTLINE:
 {outline}
 
@@ -2067,12 +2091,18 @@ REQUIRED STRUCTURE:
 Generate ONLY the R code."""
 
     def _build_generic_script_prompt(
-        self, desc, outline, packages, inputs, outputs, language
+        self, desc, outline, packages, inputs, outputs, language, hints=None
     ) -> str:
+        hints_block = ""
+        if hints:
+            hints_block = "\nIMPORTANT IMPLEMENTATION GUIDANCE (follow exactly):\n"
+            hints_block += "\n".join(f"  - {h}" for h in hints)
+            hints_block += "\n"
         return f"""Generate a complete {language} script based on this outline.
 
 TASK: {desc}
-OUTLINE: {outline}
+{hints_block}
+OUTLINE: {outline
 
 Requirements:
 - Implement every step from the outline
