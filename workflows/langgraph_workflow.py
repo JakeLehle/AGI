@@ -1,4 +1,4 @@
-i"""
+"""
 LangGraph Workflow v1.2.2 - Script-First Architecture with Diagnostic Agent
 
 Orchestrates multi-agent system with:
@@ -720,6 +720,21 @@ class MultiAgentWorkflow:
                             logger.warning(
                                 f"Task {task_id} failed: "
                                 f"{result.get('error', 'unknown')[:200]}")
+                            # v1.2.3: Sync master document on parallel failure.
+                            # Previously only the success branch updated the
+                            # master doc here, leaving failed tasks permanently
+                            # stuck at "running" in master_prompt_state.json.
+                            # This caused the router to deadlock — it saw the
+                            # task as neither complete nor failed, so it could
+                            # never dispatch dependents or enter the review loop.
+                            self.master.master_document.mark_failed(
+                                task_id,
+                                error_summary=result.get(
+                                    'error', 'Unknown error'
+                                ),
+                                attempts=1,
+                                script_path=result.get('script_path'),
+                            )
 
         # Log batch completion
         if immediate_results:
@@ -894,7 +909,7 @@ class MultiAgentWorkflow:
         failed = []
         task_attempt_counts = state.get('task_attempt_counts', {})
 
-        for item in results:
+for item in results:
             subtask = item['subtask']
             result = item['result']
             task_id = subtask['id']
@@ -945,11 +960,34 @@ class MultiAgentWorkflow:
                 subtask['last_result'] = result
                 failed.append(subtask)
 
-                # Update master document
-                self.master.master_document.mark_failed(
-                    task_id,
-                    result.get('error', 'Unknown error')
+                # v1.2.3: Safety-net master document sync on failure.
+                # Patch 4A handles the parallel thread path. This handles
+                # all other paths (sequential, wait_for_parallel_jobs TIMEOUT,
+                # any future result sources) through this single convergence
+                # point. Guard checks current master doc status first — if
+                # Patch 4A already wrote "failed", mark_failed is idempotent
+                # and the second call is harmless. If status is still "running"
+                # (the ghost state that caused the v1.2.2 deadlock), this
+                # corrects it unconditionally.
+                current_status = (
+                    self.master.master_document.steps
+                    .get(task_id, {})
+                    .get('status')
                 )
+                if current_status != 'completed':
+                    self.master.master_document.mark_failed(
+                        task_id,
+                        error_summary=result.get('error', 'Unknown error'),
+                        attempts=task_attempt_counts.get(task_id, 1),
+                        script_path=result.get('script_path'),
+                    )
+
+                agent_logger.log_workflow_event("task_failed", {
+                    "task_id": task_id,
+                    "error": result.get('error', 'unknown')[:200],
+                    "attempts": task_attempt_counts.get(task_id, 1),
+                    "was_ghost_running": current_status == 'running',
+                })
 
         return {
             "completed_subtasks": completed,
