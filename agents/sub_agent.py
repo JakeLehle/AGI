@@ -2102,7 +2102,7 @@ Generate ONLY the R code."""
 
 TASK: {desc}
 {hints_block}
-OUTLINE: {outline
+OUTLINE: {outline}
 
 Requirements:
 - Implement every step from the outline
