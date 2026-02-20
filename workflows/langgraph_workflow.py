@@ -694,6 +694,14 @@ class MultiAgentWorkflow:
         env_name = state['env_name']
         running_jobs = {}
         immediate_results = []
+        # Guard: empty batch should never reach here but handle it safely
+        # rather than crashing ThreadPoolExecutor with max_workers=0
+        if not batch:
+            logger.warning("submit_parallel_jobs called with empty batch — skipping")
+            return {
+                "running_jobs": {},
+                "parallel_results": [],
+            }
 
         max_workers = min(self.max_parallel_agents, len(batch))
 
