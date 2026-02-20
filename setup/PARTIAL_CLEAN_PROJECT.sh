@@ -123,8 +123,8 @@ count_dir() {
     local dir="$2"
     if [ -d "$dir" ]; then
         local count size hs
-        count=$(find "$dir" -type f 2>/dev/null | wc -l)
-        size=$(du -sb "$dir" 2>/dev/null | awk '{print $1}')
+        count=$(find "$dir" -type f 2>/dev/null | wc -l || echo 0)
+        size=$(du -sb "$dir" 2>/dev/null | awk '{print $1}' || echo 0)
         hs=$(numfmt --to=iec --suffix=B "${size:-0}" 2>/dev/null || echo "${size}B")
         if [ "$count" -gt 0 ]; then
             echo -e "  ${YELLOW}●${NC} ${label}: ${count} files (${hs})"
@@ -199,7 +199,7 @@ STATE_FILE="reports/master_prompt_state.json"
 echo "Current pipeline state:"
 if [ -f "$STATE_FILE" ]; then
     if command -v python3 &>/dev/null; then
-        python3 - "$STATE_FILE" <<'PYEOF'
+        python3 - "$STATE_FILE" <<'PYEOF' || true
 import json, sys
 try:
     with open(sys.argv[1]) as f:
@@ -271,12 +271,13 @@ echo ""
 echo -e "${GREEN}Preserved (will NOT be touched):${NC}"
 
 # Count checkpoints
-CP_COUNT=$(find temp/checkpoints -name "step_*_checkpoint.json" 2>/dev/null | wc -l)
+# AFTER
+CP_COUNT=$(find temp/checkpoints -name "step_*_checkpoint.json" 2>/dev/null 2>&1 | wc -l || echo 0)
 echo -e "  ● temp/checkpoints/          ${CP_COUNT} checkpoint(s) — phase progress per step"
 
 # Show checkpoint states
 if [ "$CP_COUNT" -gt 0 ] && command -v python3 &>/dev/null; then
-    python3 - <<'PYEOF'
+    python3 - <<'PYEOF' || true
 import json, glob, os
 from pathlib import Path
 

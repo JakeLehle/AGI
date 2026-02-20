@@ -584,21 +584,8 @@ class ScriptFirstSubAgentV3:
 
         for attempt in range(self.MAX_IMPLEMENTATION_ATTEMPTS):
             self._update_checkpoint(
-                status=TaskStatus.GENERATING_SCRIPT.value
+                status=TaskStatus.GENERATING_OUTLINE.value
             )
-
-            if language == 'python':
-                prompt = self._build_python_script_prompt(
-                    desc, outline, packages, inputs, outputs, hints=hints
-                )
-            elif language == 'r':
-                prompt = self._build_r_script_prompt(
-                    desc, outline, packages, inputs, outputs, hints=hints
-                )
-            else:
-                prompt = self._build_generic_script_prompt(
-                    desc, outline, packages, inputs, outputs, language, hints=hints
-                )
 
             prompt = f"""Create a structured outline for a {language} script.
 
@@ -691,25 +678,27 @@ INVALID: [specific issues]"""
         packages = subtask.get('packages', [])
         inputs = subtask.get('input_files', [])
         outputs = subtask.get('output_files', [])
-
+        hints = subtask.get('code_hints', [])
+    
+        content = None
         for attempt in range(self.MAX_IMPLEMENTATION_ATTEMPTS):
             self._update_checkpoint(
                 status=TaskStatus.GENERATING_SCRIPT.value
             )
-
+    
             if language == 'python':
                 prompt = self._build_python_script_prompt(
-                    desc, outline, packages, inputs, outputs
+                    desc, outline, packages, inputs, outputs, hints=hints
                 )
             elif language == 'r':
                 prompt = self._build_r_script_prompt(
-                    desc, outline, packages, inputs, outputs
+                    desc, outline, packages, inputs, outputs, hints=hints
                 )
             else:
                 prompt = self._build_generic_script_prompt(
-                    desc, outline, packages, inputs, outputs, language
+                    desc, outline, packages, inputs, outputs, language, hints=hints
                 )
-
+    
             try:
                 response = invoke_resilient(
                     self.llm, prompt,
@@ -720,22 +709,19 @@ INVALID: [specific issues]"""
             except LLMInvocationError as e:
                 logger.warning(f"Script generation failed: {e}")
                 continue
-
-            # Extract code from response
+    
             content = self._extract_code_from_response(response, language)
             if not content or len(content) < 50:
                 continue
-
-            # Ensure required structure for Python
+    
             if language == 'python' and 'AGI_DRY_RUN' not in content:
                 content = self._prepend_python_header(content, subtask)
-
-            # Validate
+    
             self._update_checkpoint(
                 status=TaskStatus.VALIDATING_SCRIPT.value
             )
             validation = self._validate_script(content, outline, subtask)
-
+    
             if validation.get('valid'):
                 print(f"  ✓ Script validated (attempt {attempt + 1})")
                 return content
@@ -744,12 +730,12 @@ INVALID: [specific issues]"""
                     f"  ⚠ Script validation failed (attempt {attempt + 1}): "
                     f"{validation.get('issues', '')[:100]}"
                 )
-
-        # Return last generated content even if validation failed
+    
         if content and len(content) > 50:
             logger.warning("Returning unvalidated script after max attempts")
             return content
         return None
+
 
     def _validate_script(
         self, script: str, outline: str, subtask: Dict
