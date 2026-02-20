@@ -53,7 +53,7 @@ def get_default_config() -> Dict[str, Any]:
         "llm": {
             "provider": "ollama",
             "config": {
-                "model": "llama3.1:70b",
+                "model": "qwen3-coder:latest",
                 "temperature": 0,
                 "max_tokens": 60000,
                 "ollama_base_url": ollama_url,
