@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# AGI Pipeline - Human Guidance Injection Tool (v1.2.3)
+# AGI Pipeline - Human Guidance Injection Tool (v1.2.4)
 # =============================================================================
 # Form-based tool for injecting guidance into failed pipeline steps before
 # a restart. Safely edits master_prompt_state.json via Python — no manual
@@ -21,6 +21,14 @@
 #   bash INJECT_HINTS.sh --dry-run    # preview changes without writing
 #
 # Run from your project root directory.
+#
+# v1.2.4 fixes:
+#   - read_single and read_multiline now open /dev/tty directly so they
+#     work inside a bash heredoc (stdin is consumed by the script itself)
+#   - All display output (menus, step info, prompts) uses display() which
+#     writes to stderr — visible on the terminal but not captured by the
+#     > "$INSTRUCTIONS_FILE" redirect on the heredoc
+#   - Only the final json.dumps() goes to stdout → instructions file
 # =============================================================================
 
 set -euo pipefail
@@ -65,45 +73,47 @@ if [ ! -f "$STATE_FILE" ]; then
     exit 1
 fi
 
-if ! command -v python3 &>/dev/null; then
-    echo -e "${RED}ERROR: python3 not found in PATH.${NC}"
-    echo "  Activate your conda environment: conda activate AGI"
-    exit 1
+if [ ! -d "$CHECKPOINT_DIR" ]; then
+    mkdir -p "$CHECKPOINT_DIR"
 fi
 
-# ---------------------------------------------------------------------------
-# Header
-# ---------------------------------------------------------------------------
 echo ""
-echo -e "${BLUE}${BOLD}============================================================${NC}"
-echo -e "${BLUE}${BOLD}  AGI Pipeline — Human Guidance Injection (v1.2.3)${NC}"
-echo -e "${BLUE}${BOLD}============================================================${NC}"
+echo -e "${BLUE}============================================================${NC}"
+echo -e "${BLUE}  AGI Pipeline — Human Guidance Injection (v1.2.4)${NC}"
+echo -e "${BLUE}============================================================${NC}"
 if [ "$DRY_RUN" = true ]; then
     echo -e "  Mode: ${YELLOW}DRY RUN — changes will be shown but not written${NC}"
 fi
 echo ""
 
 # ---------------------------------------------------------------------------
-# Show current pipeline state and collect failed step IDs
+# Show pipeline state and collect failed step IDs
 # ---------------------------------------------------------------------------
+echo "Current pipeline state:"
+echo ""
 
 FAILED_STEPS=$(python3 - "$STATE_FILE" <<'PYEOF'
 import json, sys
+
 try:
     with open(sys.argv[1]) as f:
         state = json.load(f)
-    steps = state.get('steps', {})
-    order = state.get('step_order', list(steps.keys()))
 
-    print("Current pipeline state:\n")
-    icons = {'completed': '✅', 'failed': '❌', 'pending': '⏳',
-             'running': '🔄', 'blocked': '🚫'}
+    steps = state.get('steps', {})
     failed = []
-    for sid in order:
-        s = steps.get(sid, {})
-        st = s.get('status', 'pending')
-        icon = icons.get(st, '?')
-        title = s.get('title', sid)[:60]
+
+    STATUS_ICON = {
+        'completed': '✅',
+        'failed':    '❌',
+        'running':   '🔄',
+        'pending':   '⏳',
+        'blocked':   '🚫',
+    }
+
+    for sid, s in steps.items():
+        st       = s.get('status', 'pending')
+        icon     = STATUS_ICON.get(st, '❓')
+        title    = s.get('title', sid)[:60]
         attempts = s.get('attempts', 0)
         err = ""
         if s.get('error_summary') and st in ('failed', 'running'):
@@ -113,9 +123,8 @@ try:
             failed.append(sid)
 
     print(f"\nSteps needing attention: {', '.join(failed) if failed else 'none'}")
-    # Output just the IDs to a separate line for bash to capture
-    import sys
-    print(f"\n__FAILED__:{ ','.join(failed)}")
+    print(f"\n__FAILED__:{','.join(failed)}")
+
 except Exception as e:
     print(f"Error reading state: {e}", file=sys.stderr)
     sys.exit(1)
@@ -139,7 +148,6 @@ IFS=',' read -ra FAILED_ARRAY <<< "$FAILED_ID_LIST"
 # ---------------------------------------------------------------------------
 # Let user select up to 4 steps to address
 # ---------------------------------------------------------------------------
-
 echo -e "${BOLD}Select steps to inject guidance into (up to 4):${NC}"
 echo "  Available: ${FAILED_ID_LIST//,/ }"
 echo "  Enter step IDs separated by spaces, or press Enter to use all failed steps"
@@ -155,7 +163,6 @@ fi
 # Validate and limit to 4
 SELECTED=()
 for sid in $SELECTED_RAW; do
-    # Verify it exists in state
     if python3 -c "
 import json, sys
 with open('$STATE_FILE') as f:
@@ -180,8 +187,13 @@ echo ""
 
 # ---------------------------------------------------------------------------
 # Collect guidance for each selected step
+#
+# KEY DESIGN: the heredoc stdout is redirected to INSTRUCTIONS_FILE, so
+# only the final json.dumps() ends up there. All interactive display uses
+# display() which writes to stderr — always visible on the terminal.
+# read_single / read_multiline open /dev/tty directly, bypassing the
+# stdin-consuming heredoc entirely.
 # ---------------------------------------------------------------------------
-# We'll build a JSON instructions file and pass it to the Python editor
 INSTRUCTIONS_FILE=$(mktemp /tmp/agi_inject_XXXXXX.json)
 trap 'rm -f "$INSTRUCTIONS_FILE"' EXIT
 
@@ -189,7 +201,7 @@ python3 - "$STATE_FILE" "${SELECTED[@]}" <<'PYEOF' > "$INSTRUCTIONS_FILE"
 import json, sys
 
 state_file = sys.argv[1]
-selected = sys.argv[2:]
+selected   = sys.argv[2:]
 
 with open(state_file) as f:
     state = json.load(f)
@@ -197,6 +209,56 @@ with open(state_file) as f:
 steps = state.get('steps', {})
 instructions = []
 
+# ---------------------------------------------------------------------------
+# display() — all terminal output goes to stderr so it is never captured
+# by the > "$INSTRUCTIONS_FILE" redirect on this heredoc.
+# ---------------------------------------------------------------------------
+def display(*args, **kwargs):
+    kwargs['file'] = sys.stderr
+    print(*args, **kwargs)
+
+# ---------------------------------------------------------------------------
+# read_single / read_multiline — open /dev/tty directly so they work
+# inside a heredoc where stdin is the script text, not the keyboard.
+# ---------------------------------------------------------------------------
+def read_single(prompt_text, default=""):
+    """Read a single line from the terminal."""
+    try:
+        tty = open('/dev/tty', 'r')
+    except OSError:
+        return default
+    with tty:
+        if default:
+            sys.stderr.write(f"  {prompt_text} [{default}]: ")
+        else:
+            sys.stderr.write(f"  {prompt_text}: ")
+        sys.stderr.flush()
+        line = tty.readline()
+        val  = line.rstrip('\n').strip()
+        return val if val else default
+
+def read_multiline(prompt_text):
+    """Read multi-line input from the terminal. Empty line = done."""
+    display(f"\n  {prompt_text}")
+    display("  (Enter each line, then an empty line to finish)")
+    lines = []
+    try:
+        tty = open('/dev/tty', 'r')
+    except OSError:
+        return lines
+    with tty:
+        while True:
+            sys.stderr.write("  > ")
+            sys.stderr.flush()
+            line = tty.readline()
+            if not line or line.rstrip('\n') == "":
+                break
+            lines.append(line.rstrip('\n'))
+    return lines
+
+# ---------------------------------------------------------------------------
+# Menus
+# ---------------------------------------------------------------------------
 MENU = """
   Injection type:
     1) Add implementation hints   — guide how the LLM writes the script
@@ -214,57 +276,39 @@ PHASE_MENU = """
     3) Delete only sbatch         — keep env + script, regenerate sbatch only
 """
 
-def read_multiline(prompt_text):
-    """Read multi-line input. Empty line = done."""
-    print(f"\n  {prompt_text}")
-    print("  (Enter each line, then an empty line to finish)")
-    lines = []
-    while True:
-        try:
-            line = input("  > ")
-            if line == "":
-                break
-            lines.append(line)
-        except EOFError:
-            break
-    return lines
-
-def read_single(prompt_text, default=""):
-    """Read a single line."""
-    if default:
-        val = input(f"  {prompt_text} [{default}]: ").strip()
-        return val if val else default
-    else:
-        return input(f"  {prompt_text}: ").strip()
-
+# ---------------------------------------------------------------------------
+# Per-step guidance collection loop
+# ---------------------------------------------------------------------------
 for step_id in selected:
     step = steps.get(step_id, {})
-    print(f"\n{'='*60}")
-    print(f"  STEP: {step_id}")
-    print(f"  Title: {step.get('title', 'unknown')}")
-    print(f"  Status: {step.get('status', 'unknown')}  |  Attempts: {step.get('attempts', 0)}")
+
+    display(f"\n{'='*60}")
+    display(f"  STEP: {step_id}")
+    display(f"  Title: {step.get('title', 'unknown')}")
+    display(f"  Status: {step.get('status', 'unknown')}  |  Attempts: {step.get('attempts', 0)}")
     if step.get('error_summary'):
-        print(f"  Last error: {step['error_summary'][:200]}")
+        display(f"  Last error: {step['error_summary'][:200]}")
     if step.get('input_files'):
-        print(f"  Input files: {step['input_files']}")
+        display(f"  Input files: {step['input_files']}")
     current_hints = step.get('code_hints', [])
     if current_hints:
-        print(f"  Existing hints ({len(current_hints)}): {current_hints[0][:80]}...")
-    print(f"{'='*60}")
+        display(f"  Existing hints ({len(current_hints)}): {current_hints[0][:80]}...")
+    display(f"{'='*60}")
 
-    print(MENU)
+    display(MENU)
     choice = read_single("Choice", "6").strip()
 
     instr = {"step_id": step_id, "action": None, "checkpoint_action": "keep"}
 
+    # ── Option 1: Add implementation hints ──────────────────────────────────
     if choice == "1":
         instr["action"] = "add_hints"
         existing = step.get('code_hints', [])
         if existing:
-            print(f"\n  Existing hints will be KEPT. New hints will be ADDED.")
-            print(f"  Current hints:")
+            display(f"\n  Existing hints will be KEPT. New hints will be ADDED.")
+            display(f"  Current hints:")
             for i, h in enumerate(existing):
-                print(f"    {i+1}. {h}")
+                display(f"    {i+1}. {h}")
             keep = read_single("Keep existing hints? [Y/n]", "Y").strip().lower()
             if keep in ("n", "no"):
                 instr["clear_existing_hints"] = True
@@ -278,73 +322,85 @@ for step_id in selected:
         )
         instr["hints"] = hints
 
-        print(PHASE_MENU)
+        display(PHASE_MENU)
         cp = read_single("Checkpoint action", "1").strip()
-        instr["checkpoint_action"] = {"1": "delete", "2": "keep", "3": "delete_sbatch"}.get(cp, "keep")
+        instr["checkpoint_action"] = {
+            "1": "delete", "2": "keep", "3": "delete_sbatch"
+        }.get(cp, "delete")
 
+    # ── Option 2: Fix input file paths ──────────────────────────────────────
     elif choice == "2":
         instr["action"] = "fix_inputs"
-        print("\n  Current input_files:", step.get('input_files', []))
-        print("  Enter the correct input file paths (absolute or relative to project root):")
+        display("\n  Current input_files:", step.get('input_files', []))
+        display("  Enter the correct input file paths (absolute or relative to project root):")
         paths = read_multiline("Paths (one per line)")
         instr["input_files"] = paths
 
         also_hint = read_single("Also add a load hint? [Y/n]", "Y").strip().lower()
         if also_hint not in ("n", "no") and paths:
-            first = paths[0]
             lang = step.get('language', 'python')
             if lang == 'r':
-                default_hint = f"Load input with: adata <- anndata::read_h5ad(commandArgs(TRUE)[1])"
+                default_hint = "Load input with: adata <- anndata::read_h5ad(commandArgs(TRUE)[1])"
             else:
-                default_hint = f"Load input with: import scanpy as sc; adata = sc.read_h5ad(import sys; sys.argv[1])"
+                default_hint = "Load input with: import sys, scanpy as sc; adata = sc.read_h5ad(sys.argv[1])"
             hint = read_single("Load hint (edit or accept default)", default_hint)
             instr["hints"] = [hint] if hint else []
 
-        print(PHASE_MENU)
+        display(PHASE_MENU)
         cp = read_single("Checkpoint action", "3").strip()
-        instr["checkpoint_action"] = {"1": "delete", "2": "keep", "3": "delete_sbatch"}.get(cp, "delete_sbatch")
+        instr["checkpoint_action"] = {
+            "1": "delete", "2": "keep", "3": "delete_sbatch"
+        }.get(cp, "delete_sbatch")
 
+    # ── Option 3: Override approach ──────────────────────────────────────────
     elif choice == "3":
         instr["action"] = "override_approach"
-        print("\n  Current expanded_plan (first 400 chars):")
-        print(f"  {step.get('expanded_plan', '')[:400]}")
-        print("\n  Enter your replacement approach. Be as specific as possible.")
-        print("  Include: exact methods, file paths, data structures, expected output format.")
-        lines = read_multiline("New approach (one paragraph, Enter=blank line to finish)")
+        display("\n  Current expanded_plan (first 400 chars):")
+        display(f"  {step.get('expanded_plan', '')[:400]}")
+        display("\n  Enter your replacement approach. Be as specific as possible.")
+        display("  Include: exact methods, file paths, data structures, expected output format.")
+        lines = read_multiline("New approach (one paragraph, empty line to finish)")
         instr["expanded_plan"] = " ".join(lines)
 
-        print(PHASE_MENU)
+        display(PHASE_MENU)
         cp = read_single("Checkpoint action", "1").strip()
-        instr["checkpoint_action"] = {"1": "delete", "2": "keep", "3": "delete_sbatch"}.get(cp, "delete")
+        instr["checkpoint_action"] = {
+            "1": "delete", "2": "keep", "3": "delete_sbatch"
+        }.get(cp, "delete")
 
+    # ── Option 4: Skip step ──────────────────────────────────────────────────
     elif choice == "4":
         instr["action"] = "skip"
-        print(f"\n  Step {step_id} will be marked as COMPLETED.")
-        print("  Downstream steps that depend on this will be unblocked.")
+        display(f"\n  Step {step_id} will be marked as COMPLETED.")
+        display("  Downstream steps that depend on this will be unblocked.")
         confirm = read_single("Confirm skip? [y/N]", "N").strip().lower()
         if confirm not in ("y", "yes"):
-            print("  Cancelled — no change for this step.")
+            display("  Cancelled — no change for this step.")
             instr["action"] = None
 
+    # ── Option 5: Reset and retry ────────────────────────────────────────────
     elif choice == "5":
         instr["action"] = "reset"
-        print(PHASE_MENU)
+        display(PHASE_MENU)
         cp = read_single("Checkpoint action", "2").strip()
-        instr["checkpoint_action"] = {"1": "delete", "2": "keep", "3": "delete_sbatch"}.get(cp, "keep")
+        instr["checkpoint_action"] = {
+            "1": "delete", "2": "keep", "3": "delete_sbatch"
+        }.get(cp, "keep")
 
+    # ── Option 6 / default: no change ───────────────────────────────────────
     else:
         instr["action"] = None
-        print(f"  Skipping {step_id} — no changes.")
+        display(f"  Skipping {step_id} — no changes.")
 
     instructions.append(instr)
 
+# Only stdout → captured by > "$INSTRUCTIONS_FILE"
 print(json.dumps(instructions, indent=2))
 PYEOF
 
 # ---------------------------------------------------------------------------
-# Preview and apply changes via Python
+# Apply changes via Python
 # ---------------------------------------------------------------------------
-
 echo ""
 echo -e "${BOLD}Applying changes...${NC}"
 echo ""
@@ -354,10 +410,10 @@ import json, sys, os, shutil
 from pathlib import Path
 from datetime import datetime
 
-state_file  = sys.argv[1]
-instr_file  = sys.argv[2]
-cp_dir      = Path(sys.argv[3])
-dry_run     = sys.argv[4].lower() == "true"
+state_file = sys.argv[1]
+instr_file = sys.argv[2]
+cp_dir     = Path(sys.argv[3])
+dry_run    = sys.argv[4].lower() == "true"
 
 with open(state_file) as f:
     state = json.load(f)
@@ -378,7 +434,7 @@ for instr in instructions:
     step = steps[step_id]
     step_changes = []
 
-    # -------------------------------------------------------------------------
+    # ── add_hints ─────────────────────────────────────────────────────────
     if action == "add_hints":
         new_hints = instr.get('hints', [])
         if not new_hints:
@@ -391,28 +447,29 @@ for instr in instructions:
         else:
             existing = step.get('code_hints', [])
             step['code_hints'] = existing + new_hints
-            step_changes.append(f"Added {len(new_hints)} hint(s) (total: {len(step['code_hints'])})")
+            step_changes.append(
+                f"Added {len(new_hints)} hint(s) "
+                f"(total: {len(step['code_hints'])})"
+            )
 
-        # Also append a guidance block to expanded_plan so it reaches
-        # the sub-agent even before the sub_agent.py patch is applied
+        # Dual-injection: also append to expanded_plan so hints reach the
+        # sub-agent even if the code_hints patch path has an issue
         guidance_block = (
             "\n\n[HUMAN GUIDANCE — FOLLOW EXACTLY]\n" +
             "\n".join(f"- {h}" for h in new_hints)
         )
         plan = step.get('expanded_plan', step.get('description', ''))
-        # Remove any previous guidance block before appending fresh
         if '[HUMAN GUIDANCE' in plan:
             plan = plan[:plan.index('[HUMAN GUIDANCE')]
         step['expanded_plan'] = plan.rstrip() + guidance_block
         step_changes.append("Appended guidance block to expanded_plan")
 
-        # Reset status so the router dispatches it
         if step.get('status') in ('failed', 'blocked', 'running'):
             step['status'] = 'pending'
             step['attempts'] = 0
             step_changes.append("Status → pending, attempts → 0")
 
-    # -------------------------------------------------------------------------
+    # ── fix_inputs ────────────────────────────────────────────────────────
     elif action == "fix_inputs":
         new_paths = instr.get('input_files', [])
         if new_paths:
@@ -424,7 +481,6 @@ for instr in instructions:
             existing = step.get('code_hints', [])
             step['code_hints'] = existing + extra_hints
             step_changes.append(f"Added {len(extra_hints)} load hint(s)")
-
             guidance_block = (
                 "\n\n[HUMAN GUIDANCE — FOLLOW EXACTLY]\n" +
                 "\n".join(f"- {h}" for h in extra_hints)
@@ -439,12 +495,11 @@ for instr in instructions:
             step['attempts'] = 0
             step_changes.append("Status → pending, attempts → 0")
 
-    # -------------------------------------------------------------------------
+    # ── override_approach ─────────────────────────────────────────────────
     elif action == "override_approach":
         new_plan = instr.get('expanded_plan', '').strip()
         if new_plan:
             step['expanded_plan'] = new_plan
-            step['description']   = new_plan
             step_changes.append(f"expanded_plan replaced ({len(new_plan)} chars)")
 
         if step.get('status') in ('failed', 'blocked', 'running'):
@@ -452,72 +507,92 @@ for instr in instructions:
             step['attempts'] = 0
             step_changes.append("Status → pending, attempts → 0")
 
-    # -------------------------------------------------------------------------
+    # ── skip ──────────────────────────────────────────────────────────────
     elif action == "skip":
         step['status'] = 'completed'
-        step['error_summary'] = None
-        step_changes.append("Status → completed (skipped by human)")
+        step['skip_reason'] = 'Manually skipped via INJECT_HINTS'
+        step_changes.append("Status → completed (manually skipped)")
 
-    # -------------------------------------------------------------------------
+    # ── reset ─────────────────────────────────────────────────────────────
     elif action == "reset":
         step['status'] = 'pending'
         step['attempts'] = 0
-        step['error_summary'] = None
-        step_changes.append("Status → pending, attempts → 0")
+        step.pop('error_summary', None)
+        step_changes.append("Status → pending, attempts → 0, error cleared")
 
-    # -------------------------------------------------------------------------
-    # Checkpoint management
-    # -------------------------------------------------------------------------
+    else:
+        continue
+
+    # ── checkpoint action ─────────────────────────────────────────────────
+    import re
     cp_action = instr.get('checkpoint_action', 'keep')
-    cp_file = cp_dir / f"{step_id}_checkpoint.json"
+    safe_id   = step_id.replace('/', '_').replace(' ', '_')
+    cp_file   = cp_dir / f"{safe_id}_checkpoint.json"
 
-    if cp_action == "delete" and cp_file.exists():
-        step_changes.append(f"Checkpoint DELETED (will restart from Phase 1)")
-        if not dry_run:
-            cp_file.unlink()
+    # Try alternate naming pattern if first not found
+    if not cp_file.exists():
+        safe_id2 = re.sub(r'[^\w\-]', '_', step_id)[:50]
+        cp_file2 = cp_dir / f"{safe_id2}_checkpoint.json"
+        if cp_file2.exists():
+            cp_file = cp_file2
 
-    elif cp_action == "delete_sbatch" and cp_file.exists():
-        # Read checkpoint, null out sbatch_path
-        try:
-            with open(cp_file) as f:
-                cp = json.load(f)
-            sbatch = cp.get('sbatch_path')
-            if sbatch and Path(sbatch).exists():
-                step_changes.append(f"Sbatch file deleted: {Path(sbatch).name}")
-                if not dry_run:
-                    Path(sbatch).unlink()
-            cp['sbatch_path'] = None
-            step_changes.append("Checkpoint sbatch_path cleared (Phase 3 will regenerate)")
+    if cp_action == "delete":
+        if cp_file.exists():
+            step_changes.append(f"Checkpoint deleted: {cp_file.name}")
             if not dry_run:
-                with open(cp_file, 'w') as f:
-                    json.dump(cp, f, indent=2)
-        except Exception as e:
-            step_changes.append(f"WARNING: Could not update checkpoint: {e}")
+                cp_file.unlink()
+        else:
+            step_changes.append("Checkpoint not found (already clean)")
+
+    elif cp_action == "delete_sbatch":
+        if cp_file.exists():
+            try:
+                with open(cp_file) as f:
+                    cp = json.load(f)
+                sbatch = cp.get('sbatch_path')
+                if sbatch and Path(sbatch).exists():
+                    step_changes.append(f"Sbatch deleted: {Path(sbatch).name}")
+                    if not dry_run:
+                        Path(sbatch).unlink()
+                cp['sbatch_path'] = None
+                step_changes.append(
+                    "Checkpoint sbatch_path cleared (Phase 3 will regenerate)"
+                )
+                if not dry_run:
+                    with open(cp_file, 'w') as f:
+                        json.dump(cp, f, indent=2)
+            except Exception as e:
+                step_changes.append(f"WARNING: Could not update checkpoint: {e}")
+        else:
+            step_changes.append("Checkpoint not found — nothing to clear")
 
     elif cp_action == "keep":
         step_changes.append("Checkpoint kept (will resume from last phase)")
 
-    # -------------------------------------------------------------------------
     # Timestamp
     step['last_updated'] = datetime.now().isoformat()
     steps[step_id] = step
     changes_summary.append((step_id, step_changes))
 
-# -------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Preview
-# -------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 print(f"\n{'─'*60}")
 print("  CHANGE PREVIEW")
 print(f"{'─'*60}")
 for step_id, ch_list in changes_summary:
     step = steps.get(step_id, {})
-    print(f"\n  [{step_id}]  →  status={step.get('status')}  attempts={step.get('attempts', 0)}")
+    print(
+        f"\n  [{step_id}]  →  "
+        f"status={step.get('status')}  "
+        f"attempts={step.get('attempts', 0)}"
+    )
     for ch in ch_list:
         print(f"    • {ch}")
     if step.get('code_hints'):
         print(f"    • code_hints ({len(step['code_hints'])}):")
         for h in step['code_hints'][:3]:
-            print(f"        "{h[:80]}"")
+            print(f'        "{h[:80]}"')
         if len(step['code_hints']) > 3:
             print(f"        ... and {len(step['code_hints'])-3} more")
 
@@ -527,13 +602,12 @@ if dry_run:
     print("\n  DRY RUN — no files were written.")
     sys.exit(0)
 
-# -------------------------------------------------------------------------
-# Write
-# -------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Atomic write
+# ---------------------------------------------------------------------------
 state['steps'] = steps
 state['last_updated'] = datetime.now().isoformat()
 
-# Atomic write: write to temp then rename
 tmp = state_file + ".tmp"
 with open(tmp, 'w') as f:
     json.dump(state, f, indent=2)
@@ -553,7 +627,8 @@ else
     echo -e "${GREEN}${BOLD}  Injection complete. Ready to resubmit.${NC}"
     echo -e "${GREEN}${BOLD}============================================================${NC}"
     echo ""
-    echo "  Run PARTIAL_CLEAN_PROJECT.sh first to clear old logs, then:"
-    echo -e "  ${CYAN}sbatch RUN_AGI_PIPELINE_GPU.sh${NC}"
+    echo "  Recommended next steps:"
+    echo -e "  1. ${CYAN}bash PARTIAL_CLEAN_PROJECT.sh --yes${NC}   (clear old logs)"
+    echo -e "  2. ${CYAN}sbatch RUN_AGI_PIPELINE_GPU.sh${NC}        (resubmit)"
 fi
 echo ""
