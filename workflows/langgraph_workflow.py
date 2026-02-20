@@ -909,7 +909,7 @@ class MultiAgentWorkflow:
         failed = []
         task_attempt_counts = state.get('task_attempt_counts', {})
 
-for item in results:
+        for item in results:
             subtask = item['subtask']
             result = item['result']
             task_id = subtask['id']
