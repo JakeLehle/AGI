@@ -211,6 +211,8 @@ class DiagnosticMemory:
         # Point at the diagnostic-specific collection
         vs_cfg = mem0_config.get("vector_store", {}).get("config", {})
         vs_cfg["collection_name"] = DIAGNOSTIC_COLLECTION
+        if "path" in vs_cfg:
+            vs_cfg["path"] = str(Path(vs_cfg["path"]).parent / "qdrant_diagnostic")
         mem0_config.setdefault("vector_store", {})["config"] = vs_cfg
 
         logger.info(
