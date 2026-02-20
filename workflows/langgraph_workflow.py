@@ -543,66 +543,136 @@ class MultiAgentWorkflow:
     def identify_parallel_tasks(self, state: WorkflowState) -> Dict:
         """
         Identify tasks that can run in parallel.
-
+    
         v3.2: GPU-aware batching — GPU and CPU tasks are batched separately
         to avoid saturating the GPU partition with too many concurrent jobs.
+    
+        v1.2.4 FIX: Deadlock recovery moved INTO this node (from route_execution_mode).
+        route_execution_mode is a conditional edge — LangGraph discards any state
+        mutations made there. Recovery must happen here where return values ARE
+        applied to state. Sets status to 'parallel_ready' or 'sequential_ready'
+        so the router can dispatch without touching state itself.
         """
         subtasks = state['subtasks']
-
+    
         # Find pending tasks
         pending = [st for st in subtasks if st.get('status', 'pending') == 'pending']
-
         if not pending:
             return {
                 "parallel_batch": [],
-                "status": "all_tasks_processed"
+                "current_subtask": None,
+                "status": "all_tasks_processed",
             }
-
+    
         # Find tasks with satisfied dependencies
-        completed_ids = {st['id'] for st in subtasks
-                        if st.get('status') == 'completed'}
-
+        completed_ids = {st['id'] for st in subtasks if st.get('status') == 'completed'}
         ready_tasks = []
         for st in pending:
             deps = set(st.get('dependencies', []))
             if deps.issubset(completed_ids):
                 ready_tasks.append(st)
-
+    
         if not ready_tasks:
-            # Check if we're blocked
-            if pending:
-                return {"parallel_batch": [], "status": "blocked"}
-            return {"parallel_batch": [], "status": "all_tasks_processed"}
-
-        # Batch for parallel execution
+            # No tasks are ready — attempt deadlock recovery before giving up.
+            # Pass a copy of state with updated subtasks list so _break_deadlock
+            # sees the current in-memory status (not stale state from LangGraph).
+            recovery_state = dict(state)
+            recovery_state['subtasks'] = subtasks
+    
+            recovery = self._break_deadlock(recovery_state)
+    
+            if recovery['unblocked']:
+                ready = recovery['ready_tasks']
+                print(
+                    f"\n⚠ DEADLOCK DETECTED — recovered: "
+                    f"{len(ready)} task(s) unblocked"
+                )
+                agent_logger.log_workflow_event("deadlock_recovered", {
+                    "unblocked_tasks": [t['id'] for t in ready],
+                    "actions_taken": recovery.get('actions', []),
+                })
+    
+                # Batch or sequential — same logic as the normal ready path below
+                if self.parallel_enabled and self.use_slurm and len(ready) > 1:
+                    max_batch = self.slurm_config.get("max_parallel_jobs", 10)
+                    gpu_ready = [t for t in ready if t.get('requires_gpu')]
+                    cpu_ready = [t for t in ready if not t.get('requires_gpu')]
+                    max_gpu_batch = min(
+                        self.slurm_config.get("max_parallel_gpu_jobs", 4), max_batch
+                    )
+                    batch = (
+                        gpu_ready[:max_gpu_batch]
+                        + cpu_ready[:max_batch - min(len(gpu_ready), max_gpu_batch)]
+                    )
+                    batch = batch[:max_batch]
+                    agent_logger.log_workflow_event("parallel_batch", {
+                        "batch_size": len(batch),
+                        "gpu_tasks": len([t for t in batch if t.get('requires_gpu')]),
+                        "cpu_tasks": len([t for t in batch if not t.get('requires_gpu')]),
+                        "tasks": [t['id'] for t in batch],
+                        "after_deadlock_recovery": True,
+                    })
+                    return {
+                        "subtasks": subtasks,  # updated by _break_deadlock (phantom deps stripped)
+                        "parallel_batch": batch,
+                        "current_subtask": None,
+                        "status": "parallel_ready",
+                    }
+                else:
+                    return {
+                        "subtasks": subtasks,
+                        "parallel_batch": [],
+                        "current_subtask": ready[0],
+                        "status": "sequential_ready",
+                    }
+    
+            # Truly unrecoverable — log and let router exit cleanly
+            print("\n⚠ DEADLOCK DETECTED — unrecoverable, exiting pipeline")
+            agent_logger.log_workflow_event("deadlock_unrecoverable", {
+                "actions_attempted": recovery.get('actions', []),
+                "remaining_blocked": recovery.get('remaining_blocked', []),
+            })
+            return {
+                "subtasks": subtasks,
+                "parallel_batch": [],
+                "current_subtask": None,
+                "status": "blocked",
+            }
+    
+        # Normal path — tasks are ready, batch them
         if self.parallel_enabled and self.use_slurm and len(ready_tasks) > 1:
             max_batch = self.slurm_config.get("max_parallel_jobs", 10)
-
             # v3.2: Separate GPU and CPU tasks to avoid GPU partition saturation
             gpu_ready = [t for t in ready_tasks if t.get('requires_gpu')]
             cpu_ready = [t for t in ready_tasks if not t.get('requires_gpu')]
-
-            # Prioritize: run GPU tasks first (usually fewer, longer-running)
-            max_gpu_batch = min(self.slurm_config.get("max_parallel_gpu_jobs", 4), max_batch)
-            batch = gpu_ready[:max_gpu_batch] + cpu_ready[:max_batch - min(len(gpu_ready), max_gpu_batch)]
+            max_gpu_batch = min(
+                self.slurm_config.get("max_parallel_gpu_jobs", 4), max_batch
+            )
+            batch = (
+                gpu_ready[:max_gpu_batch]
+                + cpu_ready[:max_batch - min(len(gpu_ready), max_gpu_batch)]
+            )
             batch = batch[:max_batch]
-
             agent_logger.log_workflow_event("parallel_batch", {
                 "batch_size": len(batch),
                 "gpu_tasks": len([t for t in batch if t.get('requires_gpu')]),
                 "cpu_tasks": len([t for t in batch if not t.get('requires_gpu')]),
-                "tasks": [t['id'] for t in batch]
+                "tasks": [t['id'] for t in batch],
             })
-
+            if len(batch) == 1:
+                return {
+                    "parallel_batch": [],
+                    "current_subtask": batch[0],
+                }
             return {
                 "parallel_batch": batch,
-                "current_subtask": None
+                "current_subtask": None,
             }
         else:
             # Sequential mode
             return {
                 "parallel_batch": [],
-                "current_subtask": ready_tasks[0]
+                "current_subtask": ready_tasks[0],
             }
 
     def submit_parallel_jobs(self, state: WorkflowState) -> Dict:
@@ -1255,76 +1325,63 @@ dependencies that cannot be resolved. This typically means:
     # ==================== Routing Functions ====================
 
     def route_execution_mode(self, state: WorkflowState) -> str:
-        """Route based on execution mode with deadlock detection.
-
-        v3.2.2 Fix D: When status='blocked' (all pending tasks have unsatisfied
-        deps), the old code fell through to 'complete' — silently exiting with
-        0 completed, 0 failed. Now we:
-        1. Attempt deadlock recovery via _break_deadlock()
-        2. If recovery unblocks tasks, route to sequential/parallel
-        3. If truly deadlocked, report 'deadlocked' status (not 'completed')
+        """Route based on execution mode.
+    
+        Reads status set by identify_parallel_tasks and routes accordingly.
+        Does NOT mutate state — conditional edges in LangGraph discard any
+        state changes made here. All recovery logic lives in identify_parallel_tasks.
+    
+        v1.2.4: Removed deadlock recovery from this function. It was silently
+        discarding state mutations (current_subtask assignments), causing the
+        NoneType crash in execute_sequential. Recovery now happens in
+        identify_parallel_tasks which is a proper node whose return dict IS
+        applied to state.
         """
         batch = state.get('parallel_batch', [])
         current = state.get('current_subtask')
         status = state.get('status', '')
-
+    
         if status == 'all_tasks_processed':
             decision = "complete"
-
+    
+        elif status == 'parallel_ready':
+            # Deadlock was recovered inside identify_parallel_tasks, batch is set
+            decision = "parallel"
+    
+        elif status == 'sequential_ready':
+            # Deadlock was recovered inside identify_parallel_tasks, current is set
+            decision = "sequential"
+    
         elif status == 'blocked':
-            # ── FIX D: Deadlock detection and recovery ────────────────
-            print("\n⚠ DEADLOCK DETECTED: All pending tasks have unsatisfied dependencies")
-            agent_logger.log_workflow_event("deadlock_detected", {
-                "pending_count": len([s for s in state.get('subtasks', [])
-                                      if s.get('status', 'pending') == 'pending']),
-                "completed_count": len([s for s in state.get('subtasks', [])
-                                        if s.get('status') == 'completed']),
-                "failed_count": len([s for s in state.get('subtasks', [])
-                                     if s.get('status') == 'failed']),
+            # identify_parallel_tasks already attempted recovery and failed.
+            # Exit cleanly with deadlocked status for the report.
+            agent_logger.log_workflow_event("deadlock_unrecoverable_exit", {
+                "completed": len([s for s in state.get('subtasks', [])
+                                  if s.get('status') == 'completed']),
+                "failed": len([s for s in state.get('subtasks', [])
+                               if s.get('status') == 'failed']),
+                "blocked": len([s for s in state.get('subtasks', [])
+                                if s.get('status') == 'blocked']),
             })
-
-            recovery = self._break_deadlock(state)
-
-            if recovery['unblocked']:
-                # Recovery succeeded — route the unblocked tasks
-                unblocked = recovery['ready_tasks']
-                print(f"  ✓ Deadlock broken: {len(unblocked)} task(s) unblocked")
-                agent_logger.log_workflow_event("deadlock_recovered", {
-                    "unblocked_tasks": [t['id'] for t in unblocked],
-                    "actions_taken": recovery.get('actions', []),
-                })
-
-                if self.parallel_enabled and self.use_slurm and len(unblocked) > 1:
-                    state['parallel_batch'] = unblocked
-                    state['current_subtask'] = None
-                    decision = "parallel"
-                else:
-                    state['current_subtask'] = unblocked[0]
-                    state['parallel_batch'] = []
-                    decision = "sequential"
-            else:
-                # True deadlock — cannot recover
-                print("  ✗ UNRECOVERABLE DEADLOCK: Cannot break dependency cycle")
-                print(f"    Actions attempted: {recovery.get('actions', [])}")
-                agent_logger.log_workflow_event("deadlock_unrecoverable", {
-                    "actions_attempted": recovery.get('actions', []),
-                    "remaining_tasks": recovery.get('remaining_blocked', []),
-                })
-                # Set status so generate_report knows this was a deadlock
-                state['status'] = 'deadlocked'
-                decision = "complete"
-
+            # Note: cannot mutate state here — report node checks status field
+            # which will still be 'blocked'; generate_report handles that case.
+            decision = "complete"
+    
         elif batch and len(batch) > 1:
             decision = "parallel"
+    
         elif current or (batch and len(batch) == 1):
             if batch and len(batch) == 1:
-                state['current_subtask'] = batch[0]
-                state['parallel_batch'] = []
-            decision = "sequential"
+                # Single-item batch collapses to sequential — but we cannot set
+                # current_subtask here. identify_parallel_tasks should have set
+                # current_subtask directly for single-task batches.
+                decision = "sequential"
+            else:
+                decision = "sequential"
+    
         else:
             decision = "complete"
-
-        # v3.2: Transition logging
+    
         agent_logger.log_workflow_event("transition", {
             "from": "identify_parallel",
             "to": decision,
@@ -1332,7 +1389,7 @@ dependencies that cannot be resolved. This typically means:
             "has_current": current is not None,
             "status": status,
         })
-
+    
         return decision
 
     def _break_deadlock(self, state: WorkflowState) -> Dict[str, Any]:
