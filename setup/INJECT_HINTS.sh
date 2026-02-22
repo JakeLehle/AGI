@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# AGI Pipeline - Human Guidance Injection Tool (v1.2.4)
+# AGI Pipeline - Human Guidance Injection Tool (v1.2.5)
 # =============================================================================
 # Form-based tool for injecting guidance into failed pipeline steps before
 # a restart. Safely edits master_prompt_state.json via Python — no manual
@@ -286,18 +286,65 @@ for step_id in selected:
     display(f"  STEP: {step_id}")
     display(f"  Title: {step.get('title', 'unknown')}")
     display(f"  Status: {step.get('status', 'unknown')}  |  Attempts: {step.get('attempts', 0)}")
+
+    # Show full error summary — truncated only if very long
     if step.get('error_summary'):
-        display(f"  Last error: {step['error_summary'][:200]}")
+        err = step['error_summary']
+        if len(err) <= 400:
+            display(f"  Last error: {err}")
+        else:
+            display(f"  Last error: {err[:400]}")
+            display(f"              ... ({len(err)} chars total — see phase log for full detail)")
+
     if step.get('input_files'):
         display(f"  Input files: {step['input_files']}")
     current_hints = step.get('code_hints', [])
     if current_hints:
         display(f"  Existing hints ({len(current_hints)}): {current_hints[0][:80]}...")
+
+    # v1.2.5: Show phase log path and last 5 lines for Phase 1/2/3 failures.
+    # Phase 4 failures have SLURM logs in slurm/logs/ instead.
+    import os
+    from pathlib import Path as _Path
+
+    project_root = _Path(state_file).parent.parent
+    phase_log = project_root / 'logs' / 'steps' / f"{step_id}_phases.log"
+
+    if phase_log.exists():
+        log_size = phase_log.stat().st_size
+        display(f"")
+        display(f"  Phase log: logs/steps/{step_id}_phases.log  "
+                f"({log_size:,} bytes)")
+        display(f"  Last 5 lines:")
+        try:
+            lines = phase_log.read_text(errors='replace').splitlines()
+            tail = lines[-5:] if len(lines) >= 5 else lines
+            for ln in tail:
+                display(f"    {ln}")
+        except Exception as e:
+            display(f"    (could not read log: {e})")
+        display(f"  To read full log: cat logs/steps/{step_id}_phases.log")
+    else:
+        # Only mention if the step actually failed at Phase 1/2/3
+        status = step.get('status', '')
+        err_text = step.get('error_summary', '')
+        is_phase123_failure = (
+            status == 'failed' and (
+                'Phase 1' in err_text or
+                'Phase 2' in err_text or
+                'Phase 3' in err_text
+            )
+        )
+        if is_phase123_failure:
+            display(f"")
+            display(f"  Phase log: not found at logs/steps/{step_id}_phases.log")
+            display(f"  (log is created on next run — this step has not run "
+                    f"under v1.2.5 yet)")
+
     display(f"{'='*60}")
 
     display(MENU)
     choice = read_single("Choice", "6").strip()
-
     instr = {"step_id": step_id, "action": None, "checkpoint_action": "keep"}
 
     # ── Option 1: Add implementation hints ──────────────────────────────────

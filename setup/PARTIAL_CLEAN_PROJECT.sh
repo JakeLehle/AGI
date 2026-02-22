@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# AGI Pipeline - PARTIAL Clean Script (v1.2.3)
+# AGI Pipeline - PARTIAL Clean Script (v1.2.5)
 # =============================================================================
 # Selective cleanup for mid-pipeline restarts. Removes log files and
 # safe intermediates while preserving everything needed to resume from
@@ -101,7 +101,7 @@ PROJECT_DIR="$(pwd)"
 
 echo ""
 echo -e "${BLUE}============================================================${NC}"
-echo -e "${BLUE}  AGI Pipeline — PARTIAL Clean (v1.2.3)${NC}"
+echo -e "${BLUE}  AGI Pipeline — PARTIAL Clean (v1.2.5)${NC}"
 echo -e "${BLUE}============================================================${NC}"
 echo -e "  Project: ${CYAN}${PROJECT_DIR}${NC}"
 if [ "$DRY_RUN" = true ]; then
@@ -191,6 +191,61 @@ remove_glob() {
     [ "$count" -gt 0 ] && echo -e "  ${GREEN}✓${NC} Removed ${count} file(s): ${label}"
 }
 
+count_logs_main() {
+    # Count files in logs/ excluding the logs/steps/ subdirectory.
+    # logs/steps/ contains per-step phase logs (v1.2.5) that survive
+    # PARTIAL clean so Phase 1/2/3 failures remain diagnosable.
+    local label="$1"
+    if [ -d "logs" ]; then
+        local count size hs
+        count=$(find logs -type f \
+                    -not -path "logs/steps/*" \
+                    2>/dev/null | wc -l || echo 0)
+        size=$(find logs -type f \
+                   -not -path "logs/steps/*" \
+                   2>/dev/null \
+               | xargs du -sc 2>/dev/null | tail -1 | awk '{print $1}' \
+               || echo 0)
+        hs=$(numfmt --to=iec --suffix=B "${size:-0}" 2>/dev/null \
+             || echo "${size:-0}B")
+        if [ "${count:-0}" -gt 0 ]; then
+            echo -e "  ${YELLOW}●${NC} ${label}: ${count} files (${hs})"
+            TOTAL_FILES=$((TOTAL_FILES + count))
+            TOTAL_SIZE=$((TOTAL_SIZE + ${size:-0}))
+        else
+            echo -e "  ${GREEN}○${NC} ${label}: clean"
+        fi
+    else
+        echo -e "  ${GREEN}○${NC} ${label}: not present"
+    fi
+}
+
+remove_logs_main() {
+    # Remove files in logs/ but preserve the logs/steps/ subdirectory
+    # and all its contents (per-step phase logs, v1.2.5).
+    local label="$1"
+    if [ -d "logs" ]; then
+        local count
+        count=$(find logs -type f \
+                    -not -path "logs/steps/*" \
+                    2>/dev/null | wc -l || echo 0)
+        if [ "${count:-0}" -gt 0 ]; then
+            if [ "$DRY_RUN" = false ]; then
+                find logs -mindepth 1 -type f \
+                    -not -path "logs/steps/*" \
+                    -delete 2>/dev/null || true
+                # Remove empty subdirs but never remove logs/steps itself
+                find logs -mindepth 1 -type d \
+                    -not -path "logs/steps" \
+                    -not -path "logs/steps/*" \
+                    -empty -delete 2>/dev/null || true
+            fi
+            echo -e "  ${GREEN}✓${NC} Cleared ${count} file(s): ${label}"
+        fi
+    fi
+}
+
+
 # ---------------------------------------------------------------------------
 # Show current pipeline state (always, even in dry run)
 # ---------------------------------------------------------------------------
@@ -242,12 +297,25 @@ fi
 echo "Scanning artifacts to remove..."
 echo ""
 
-count_dir  "Agent logs              (logs/)"                  "logs"
+count_logs_main  "Agent/Ollama logs       (logs/ excl. steps/)"
 count_dir  "SLURM subtask logs      (slurm/logs/)"            "slurm/logs"
 count_dir  "SLURM master logs       (slurm_logs/)"            "slurm_logs"
 count_dir  "Generated sbatch        (slurm/scripts/)"         "slurm/scripts"
 count_glob "Generated prompt JSONs  (prompts/prompt_*.json)"  "./prompts/prompt_*.json"
 count_glob "Pipeline status MD      (reports/)"               "./reports/pipeline_status.md"
+
+echo ""
+
+# Show phase log summary separately — these are PRESERVED
+if [ -d "logs/steps" ]; then
+    STEP_LOG_COUNT=$(find logs/steps -type f -name "*.log" 2>/dev/null | wc -l || echo 0)
+    STEP_LOG_STEPS=$(find logs/steps -type f -name "*.log" 2>/dev/null \
+                     | sed 's|logs/steps/||;s|_phases\.log||' | sort | tr '\n' ' ')
+    if [ "${STEP_LOG_COUNT:-0}" -gt 0 ]; then
+        echo -e "  ${GREEN}◆${NC} Phase logs (PRESERVED) (logs/steps/): ${STEP_LOG_COUNT} file(s)"
+        echo -e "    Steps with logs: ${CYAN}${STEP_LOG_STEPS}${NC}"
+    fi
+fi
 
 echo ""
 
@@ -257,6 +325,9 @@ if [ "$TOTAL_FILES" -eq 0 ]; then
     echo "To make step changes before restarting, edit:"
     echo -e "  ${CYAN}reports/master_prompt_state.json${NC}  (step status, hints, input_files)"
     echo -e "  ${CYAN}temp/checkpoints/step_N_checkpoint.json${NC}  (phase progress)"
+    echo ""
+    echo "To inspect a Phase 1/2/3 failure:"
+    echo -e "  ${CYAN}cat logs/steps/step_N_phases.log${NC}"
     exit 0
 fi
 
@@ -334,7 +405,7 @@ echo ""
 # Execute removal
 # ---------------------------------------------------------------------------
 
-remove_dir_contents  "agent + ollama logs"      "logs"
+remove_logs_main     "agent + ollama logs (logs/ excl. steps/)"
 remove_dir_contents  "SLURM subtask logs"        "slurm/logs"
 remove_dir_contents  "SLURM master logs"         "slurm_logs"
 remove_dir_contents  "generated sbatch scripts"  "slurm/scripts"
@@ -361,6 +432,11 @@ echo ""
 echo "  To reset a specific step's phase progress (force script regeneration):"
 echo -e "    ${CYAN}rm temp/checkpoints/step_N_checkpoint.json${NC}"
 echo ""
+echo "  To inspect Phase 1/2/3 failures before deciding what to inject:"
+echo -e "    ${CYAN}cat logs/steps/step_N_phases.log${NC}         (full phase output)"
+echo -e "    ${CYAN}tail -50 logs/steps/step_N_phases.log${NC}    (last 50 lines)"
+echo -e "    ${CYAN}ls -lh logs/steps/${NC}                       (all available step logs)"
+echo ""
 echo "  Then resubmit:"
-echo -e "    ${CYAN}sbatch RUN_AGI_PIPELINE_GPU.sh${NC}  (add --resume if your run script supports it)"
+echo -e "    ${CYAN}sbatch RUN_AGI_PIPELINE_GPU.sh${NC}"
 echo ""

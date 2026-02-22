@@ -1,5 +1,5 @@
 """
-Script-First Sub-Agent v1.2.3 — 4-Phase Lifecycle with Diagnostic Agent
+Script-First Sub-Agent v1.2.5 — 4-Phase Lifecycle with Diagnostic Agent
 
 Features:
 - DUAL CLUSTER ROUTING: AGI_CLUSTER (CPU) + AGI_GPU_CLUSTER (GPU subtasks)
@@ -315,6 +315,123 @@ class TaskCheckpoint:
             phase=0, diagnostic_invocations=0
         )
 
+# =============================================================================
+# STEP LOGGER v1.2.5
+# =============================================================================
+
+class StepLogger:
+    """
+    Per-step phase logger for Phases 1-3 (master-node execution).
+
+    Phases 1, 2, and 3 run in-process on the GPU master node and produce
+    no SLURM log files. This logger writes all phase activity to a
+    dedicated per-step file so failures can be diagnosed independently
+    of the single combined master job log.
+
+    Design:
+      - One file per step: logs/steps/{step_id}_phases.log
+      - Append mode: survives job cancellation and resubmission
+      - Run boundary header on each open: job ID, node, timestamp
+      - Immediate flush on every write: safe against sudden termination
+      - Thread-safe: each sub-agent thread owns its own StepLogger instance
+    """
+
+    def __init__(self, step_id: str, project_root: Path):
+        self.step_id = step_id
+        self.log_dir = project_root / 'logs' / 'steps'
+        self.log_path = self.log_dir / f"{step_id}_phases.log"
+        self._fh = None
+        self._open()
+
+    def _open(self):
+        """Open log file in append mode and write run boundary header."""
+        try:
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            self._fh = open(self.log_path, 'a', buffering=1)  # line-buffered
+
+            job_id = os.environ.get('SLURM_JOB_ID', 'local')
+            node = os.environ.get('SLURMD_NODENAME', '') or \
+                   subprocess.run(
+                       ['hostname', '-s'], capture_output=True, text=True
+                   ).stdout.strip()
+
+            header = (
+                f"\n{'═' * 62}\n"
+                f"  RUN   job={job_id}   node={node}\n"
+                f"        time={datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"{'═' * 62}\n"
+            )
+            self._fh.write(header)
+            self._fh.flush()
+        except Exception as e:
+            # Logger must never crash the pipeline
+            logger.warning(f"[{self.step_id}] StepLogger open failed: {e}")
+            self._fh = None
+
+    def log(self, message: str):
+        """Write a timestamped line to the step log."""
+        if self._fh is None:
+            return
+        try:
+            ts = datetime.now().strftime('%H:%M:%S')
+            self._fh.write(f"[{ts}] {message}\n")
+            self._fh.flush()
+        except Exception:
+            pass
+
+    def log_result(self, label: str, result: dict):
+        """
+        Write the full stdout and stderr from a subprocess result dict.
+
+        This is the key method for capturing complete conda error output —
+        the result dict is expected to have 'stdout', 'stderr', and
+        optionally 'command' and 'return_code' keys.
+        """
+        if self._fh is None:
+            return
+        try:
+            rc = result.get('return_code', '?')
+            cmd = result.get('command', '')
+            self.log(f"{label}  rc={rc}  cmd={cmd}")
+
+            stdout = (result.get('stdout') or '').strip()
+            stderr = (result.get('stderr') or '').strip()
+
+            if stdout:
+                self._fh.write(f"  --- STDOUT ---\n")
+                self._fh.write(stdout + "\n")
+            if stderr:
+                self._fh.write(f"  --- STDERR ---\n")
+                self._fh.write(stderr + "\n")
+            if stdout or stderr:
+                self._fh.write(f"  --- END ---\n")
+            self._fh.flush()
+        except Exception:
+            pass
+
+    def log_exception(self, e: Exception):
+        """Write a full exception with traceback to the step log."""
+        if self._fh is None:
+            return
+        try:
+            import traceback
+            self._fh.write(f"  --- EXCEPTION ---\n")
+            traceback.print_exc(file=self._fh)
+            self._fh.write(f"  {type(e).__name__}: {e}\n")
+            self._fh.write(f"  --- END EXCEPTION ---\n")
+            self._fh.flush()
+        except Exception:
+            pass
+
+    def close(self):
+        """Flush and close the log file handle."""
+        if self._fh is not None:
+            try:
+                self._fh.flush()
+                self._fh.close()
+            except Exception:
+                pass
+            self._fh = None
 
 # =============================================================================
 # SUB-AGENT v1.2.0
@@ -393,6 +510,9 @@ class ScriptFirstSubAgentV3:
         # Disk manager (lazy init)
         self._disk_manager = None
 
+        # Per-step phase logger (v1.2.5) — initialized in execute()
+        self.step_logger: Optional[StepLogger] = None
+
     # =========================================================================
     # MAIN ENTRY POINT
     # =========================================================================
@@ -415,83 +535,134 @@ class ScriptFirstSubAgentV3:
         Returns:
             Dict with success, task_id, and phase-specific results.
         """
-        task_id = subtask.get('id', 'unknown')
+task_id = subtask.get('id', 'unknown')
 
-        # Initialize or resume checkpoint
-        self.checkpoint = self._load_or_create_checkpoint(task_id)
-
-        # Check if already completed
-        if self._check_existing_outputs(subtask).get('already_complete'):
-            self._delete_checkpoint(task_id)
-            return self._success_result(
-                task_id, message="Outputs exist", skipped=True
-            )
-
-        # Route to cluster
-        routed_slurm = self.cluster_config.get_slurm_for_task(
-            task_description=subtask.get('description', ''),
-            requires_gpu=subtask.get('requires_gpu', False),
-            packages=subtask.get('packages', []),
-        )
-        routed_cluster = routed_slurm.get(
-            'cluster_name', self.cluster_config.cluster_name
-        )
-        self._update_checkpoint(routed_cluster=routed_cluster)
+        # v1.2.5: Initialize per-step phase logger before anything else
+        self.step_logger = StepLogger(task_id, self.project_root)
 
         try:
-            # =============================================================
-            # PHASE 1: Script Generation
-            # =============================================================
-            if self.checkpoint.phase < 1:
-                result = self._phase_1_generate_script(subtask)
-                if not result['success']:
-                    self._update_checkpoint(status=TaskStatus.FAILED.value)
-                    return self._failure_result(
-                        task_id, f"Phase 1 failed: {result.get('error')}"
-                    )
-                self._update_checkpoint(phase=1)
+            # Initialize or resume checkpoint
+            self.checkpoint = self._load_or_create_checkpoint(task_id)
 
-            # =============================================================
-            # PHASE 2: Environment Creation
-            # =============================================================
-            if self.checkpoint.phase < 2:
-                result = self._phase_2_create_environment(subtask)
-                if not result['success']:
-                    self._update_checkpoint(status=TaskStatus.FAILED.value)
-                    return self._failure_result(
-                        task_id, f"Phase 2 failed: {result.get('error')}"
-                    )
-                self._update_checkpoint(phase=2)
-
-            # =============================================================
-            # PHASE 3: Sbatch Generation
-            # =============================================================
-            if self.checkpoint.phase < 3:
-                result = self._phase_3_generate_sbatch(
-                    subtask, routed_slurm
+            # Check if already completed
+            if self._check_existing_outputs(subtask).get('already_complete'):
+                self._delete_checkpoint(task_id)
+                self.step_logger.log(f"Skipped — outputs already exist")
+                return self._success_result(
+                    task_id, message="Outputs exist", skipped=True
                 )
-                if not result['success']:
-                    self._update_checkpoint(status=TaskStatus.FAILED.value)
-                    return self._failure_result(
-                        task_id, f"Phase 3 failed: {result.get('error')}"
+
+            desc_preview = subtask.get('description', '')[:120].replace('\n', ' ')
+            self.step_logger.log(f"Starting execute(): {desc_preview}")
+            self.step_logger.log(
+                f"Checkpoint phase={self.checkpoint.phase}  "
+                f"status={self.checkpoint.status}"
+            )
+
+            # Route to cluster
+            routed_slurm = self.cluster_config.get_slurm_for_task(
+                task_description=subtask.get('description', ''),
+                requires_gpu=subtask.get('requires_gpu', False),
+                packages=subtask.get('packages', []),
+            )
+            routed_cluster = routed_slurm.get(
+                'cluster_name', self.cluster_config.cluster_name
+            )
+            self._update_checkpoint(routed_cluster=routed_cluster)
+            self.step_logger.log(
+                f"Routed to cluster={routed_cluster}  "
+                f"partition={routed_slurm.get('partition', '?')}"
+            )
+
+            try:
+                # =============================================================
+                # PHASE 1: Script Generation
+                # =============================================================
+                if self.checkpoint.phase < 1:
+                    self.step_logger.log("► Entering Phase 1: Script Generation")
+                    result = self._phase_1_generate_script(subtask)
+                    if not result['success']:
+                        self.step_logger.log(
+                            f"✗ Phase 1 FAILED: {result.get('error', '')}"
+                        )
+                        self._update_checkpoint(status=TaskStatus.FAILED.value)
+                        return self._failure_result(
+                            task_id, f"Phase 1 failed: {result.get('error')}"
+                        )
+                    self._update_checkpoint(phase=1)
+                    self.step_logger.log(
+                        f"✓ Phase 1 complete: {self.checkpoint.script_path}"
                     )
-                self._update_checkpoint(phase=3)
 
-            # =============================================================
-            # PHASE 4: Execution + Diagnostic Loop
-            # =============================================================
-            result = self._phase_4_execute_and_monitor(
-                subtask, routed_cluster, routed_slurm
-            )
-            return result
+                # =============================================================
+                # PHASE 2: Environment Creation
+                # =============================================================
+                if self.checkpoint.phase < 2:
+                    self.step_logger.log("► Entering Phase 2: Environment Creation")
+                    result = self._phase_2_create_environment(subtask)
+                    if not result['success']:
+                        self.step_logger.log(
+                            f"✗ Phase 2 FAILED: {result.get('error', '')}"
+                        )
+                        self._update_checkpoint(status=TaskStatus.FAILED.value)
+                        return self._failure_result(
+                            task_id, f"Phase 2 failed: {result.get('error')}"
+                        )
+                    self._update_checkpoint(phase=2)
+                    self.step_logger.log(
+                        f"✓ Phase 2 complete: env={self.checkpoint.env_name}"
+                    )
 
-        except Exception as e:
-            logger.error(f"[{task_id}] Unhandled exception: {e}")
-            self._update_checkpoint(
-                status=TaskStatus.FAILED.value,
-                last_error=str(e)
-            )
-            return self._failure_result(task_id, f"Unhandled: {e}")
+                # =============================================================
+                # PHASE 3: Sbatch Generation
+                # =============================================================
+                if self.checkpoint.phase < 3:
+                    self.step_logger.log("► Entering Phase 3: Sbatch Generation")
+                    result = self._phase_3_generate_sbatch(
+                        subtask, routed_slurm
+                    )
+                    if not result['success']:
+                        self.step_logger.log(
+                            f"✗ Phase 3 FAILED: {result.get('error', '')}"
+                        )
+                        self._update_checkpoint(status=TaskStatus.FAILED.value)
+                        return self._failure_result(
+                            task_id, f"Phase 3 failed: {result.get('error')}"
+                        )
+                    self._update_checkpoint(phase=3)
+                    self.step_logger.log(
+                        f"✓ Phase 3 complete: {self.checkpoint.sbatch_path}"
+                    )
+
+                # =============================================================
+                # PHASE 4: Execution + Diagnostic Loop
+                # =============================================================
+                self.step_logger.log("► Entering Phase 4: Execution")
+                result = self._phase_4_execute_and_monitor(
+                    subtask, routed_cluster, routed_slurm
+                )
+                if result.get('success'):
+                    self.step_logger.log("✓ Phase 4 complete: SUCCESS")
+                else:
+                    self.step_logger.log(
+                        f"✗ Phase 4 complete: FAILED  "
+                        f"{result.get('error', '')[:200]}"
+                    )
+                return result
+
+            except Exception as e:
+                logger.error(f"[{task_id}] Unhandled exception: {e}")
+                self.step_logger.log(f"✗ Unhandled exception: {type(e).__name__}: {e}")
+                self.step_logger.log_exception(e)
+                self._update_checkpoint(
+                    status=TaskStatus.FAILED.value,
+                    last_error=str(e)
+                )
+                return self._failure_result(task_id, f"Unhandled: {e}")
+
+        finally:
+            # Always close the log, even on crash or cancellation
+            self.step_logger.close()
 
     # =========================================================================
     # PHASE 1: SCRIPT GENERATION (Validated Two-Pass)
@@ -518,41 +689,56 @@ class ScriptFirstSubAgentV3:
         script_path = self.project_root / 'scripts' / f"{safe_id}.{ext}"
         script_path.parent.mkdir(parents=True, exist_ok=True)
 
-        print(f"\n[{task_id}] Phase 1: Script Generation ({language})")
+print(f"\n[{task_id}] Phase 1: Script Generation ({language})")
+        sl = self.step_logger  # convenience alias
 
         # Skip if script already exists and is validated
         if (self.checkpoint.script_path
                 and Path(self.checkpoint.script_path).exists()
                 and self.checkpoint.script_validated):
             print(f"  ✓ Script already validated: {self.checkpoint.script_path}")
+            sl.log(f"Script already validated, skipping Phase 1: "
+                   f"{self.checkpoint.script_path}")
             return {'success': True}
+
+        sl.log(f"Language detected: {language}")
+        sl.log(f"Script target: {script_path}")
 
         # Step 1a+1b: Outline generation with validation
         if not self.checkpoint.outline_validated:
             self._update_checkpoint(
                 status=TaskStatus.GENERATING_OUTLINE.value
             )
+            sl.log("Step 1a: Generating outline via LLM...")
             outline = self._generate_and_validate_outline(subtask, language)
             if not outline:
+                sl.log("✗ Outline generation failed after all attempts")
                 return {
                     'success': False,
                     'error': 'Could not generate validated outline'
                 }
+            sl.log(f"✓ Outline validated ({len(outline)} chars)")
             self._update_checkpoint(outline_validated=True)
         else:
             # Reconstruct outline from existing script context
             outline = subtask.get('expanded_plan', desc)
+            sl.log("Outline already validated, using expanded_plan")
 
         # Step 1c+1d: Implementation with validation
         self._update_checkpoint(status=TaskStatus.GENERATING_SCRIPT.value)
+        sl.log("Step 1c: Generating full script from outline...")
         script_content = self._generate_and_validate_script(
             subtask, outline, language
         )
         if not script_content:
+            sl.log("✗ Script generation failed after all attempts")
             return {
                 'success': False,
                 'error': 'Could not generate validated script'
             }
+
+        sl.log(f"✓ Script validated ({len(script_content)} chars, "
+               f"{script_content.count(chr(10))} lines)")
 
         # Save script
         script_path.write_text(script_content)
@@ -570,6 +756,7 @@ class ScriptFirstSubAgentV3:
         )
         print(f"  ✓ Script saved: {script_path}")
         print(f"  ✓ Language: {language}")
+        sl.log(f"✓ Phase 1 done: script={script_path}  env_name={env_name}")
         return {'success': True}
 
     def _generate_and_validate_outline(
@@ -792,12 +979,19 @@ INVALID: [specific issues]"""
           2b. YAML generation with conda/pip routing
           2c. Environment build
           2d. Repair loop (max 15 iterations)
+
+        v1.2.5: All conda subprocess output (stdout + stderr) is written
+        to the per-step phase log via self.step_logger so Phase 2 failures
+        are fully diagnosable without a SLURM log file.
         """
         task_id = subtask.get('id', 'task')
+        sl = self.step_logger  # convenience alias
         print(f"\n[{task_id}] Phase 2: Environment Creation")
 
         if self.checkpoint.env_created:
             print(f"  ✓ Environment already created: {self.checkpoint.env_name}")
+            sl.log(f"Environment already created, skipping Phase 2: "
+                   f"{self.checkpoint.env_name}")
             return {'success': True}
 
         # Proactive disk check
@@ -809,12 +1003,16 @@ INVALID: [specific issues]"""
         env_yaml_path = Path(self.checkpoint.env_yaml_path)
         env_yaml_path.parent.mkdir(parents=True, exist_ok=True)
 
+        sl.log(f"env_name={env_name}  yaml={env_yaml_path}  language={language}")
+
         # Read script content
         script_content = script_path.read_text() if script_path.exists() else ""
+        sl.log(f"Script content read: {len(script_content)} chars from {script_path}")
 
         # Step 2a: LLM dependency review
         self._update_checkpoint(status=TaskStatus.REVIEWING_DEPS.value)
         print(f"  → Reviewing dependencies via LLM...")
+        sl.log("Step 2a: LLM dependency review...")
 
         try:
             from utils.dependency_parser import (
@@ -832,56 +1030,78 @@ INVALID: [specific issues]"""
                 initial_backoff=20.0,
             )
             dep_list = parse_dependency_response(dep_response)
+            sl.log(f"LLM identified {len(dep_list)} dependencies")
 
             # Step 2b: Generate YAML
             env_yaml = generate_env_yaml(dep_list, env_name)
+            sl.log("Step 2b: YAML generated via LLM dependency list")
 
         except (ImportError, LLMInvocationError) as e:
             logger.warning(
                 f"LLM dependency review failed ({e}), "
                 f"falling back to regex-based extraction"
             )
+            sl.log(f"⚠ LLM dep review failed ({e}), using regex fallback")
             env_yaml = self._generate_env_yaml_fallback(
                 subtask, script_content, env_name, language
             )
 
         env_yaml_path.write_text(env_yaml)
         print(f"  ✓ Environment YAML: {env_yaml_path}")
+        sl.log(f"YAML written to {env_yaml_path}:\n{env_yaml}")
 
         # Step 2c: Build environment
         self._update_checkpoint(status=TaskStatus.BUILDING_ENV.value)
+        sl.log("Step 2c: Running conda env create (initial build)...")
         build_result = self._create_conda_environment()
+        sl.log_result("Initial conda build", build_result)
 
         if build_result.get('success'):
             self._update_checkpoint(env_created=True)
             print(f"  ✓ Environment ready: {env_name}")
+            sl.log(f"✓ Environment built successfully on first attempt: {env_name}")
             return {'success': True}
 
         # Step 2d: Repair loop
         print(f"  ⚠ Build failed, entering repair loop...")
         self._update_checkpoint(status=TaskStatus.REPAIRING_ENV.value)
+        sl.log(f"✗ Initial build failed. Entering repair loop "
+               f"(max {self.MAX_ENV_REPAIR_ITERATIONS} attempts)...")
 
         for repair_attempt in range(self.MAX_ENV_REPAIR_ITERATIONS):
             if not self._can_continue():
+                sl.log("Repair loop: _can_continue() returned False, stopping")
                 break
 
             error = build_result.get('error', '')
             print(f"  → Repair attempt {repair_attempt + 1}: {error[:100]}")
+            sl.log(f"Repair attempt {repair_attempt + 1}/{self.MAX_ENV_REPAIR_ITERATIONS}: "
+                   f"error={error[:300]}")
 
             repaired = self._repair_environment(error, env_yaml_path, env_name)
             if not repaired:
+                sl.log("✗ _repair_environment() returned False — no repair action possible")
                 return {
                     'success': False,
                     'error': f"Env repair exhausted: {error[:200]}"
                 }
 
-            # Retry build
+            sl.log(f"Repair action taken, retrying conda build...")
             build_result = self._create_conda_environment()
+            sl.log_result(
+                f"conda build after repair {repair_attempt + 1}", build_result
+            )
+
             if build_result.get('success'):
                 self._update_checkpoint(env_created=True)
                 print(f"  ✓ Environment ready after repair: {env_name}")
+                sl.log(f"✓ Environment built after repair attempt "
+                       f"{repair_attempt + 1}: {env_name}")
                 return {'success': True}
 
+        final_error = build_result.get('error', 'unknown')
+        sl.log(f"✗ Phase 2 exhausted all repair attempts. "
+               f"Final error: {final_error}")
         return {
             'success': False,
             'error': f"Env build failed after {self.MAX_ENV_REPAIR_ITERATIONS} repairs"
@@ -996,17 +1216,23 @@ ADD_PIP: package_name==version"""
         task_id = subtask.get('id', 'task')
         safe_id = re.sub(r'[^\w\-]', '_', task_id)[:30]
 
+    sl = self.step_logger
         print(f"\n[{task_id}] Phase 3: Sbatch Generation")
 
         if (self.checkpoint.sbatch_path
                 and Path(self.checkpoint.sbatch_path).exists()):
             print(f"  ✓ Sbatch already exists: {self.checkpoint.sbatch_path}")
+            sl.log(f"Sbatch already exists, skipping Phase 3: "
+                   f"{self.checkpoint.sbatch_path}")
             return {'success': True}
 
         sbatch_path = (
             self.project_root / 'slurm' / 'scripts' / f"{safe_id}.sbatch"
         )
         sbatch_path.parent.mkdir(parents=True, exist_ok=True)
+        sl.log(f"Generating sbatch: {sbatch_path}")
+        sl.log(f"Cluster={routed_slurm.get('cluster_name')}  "
+               f"partition={routed_slurm.get('partition')}")
 
         sbatch_content = self._generate_sbatch_script(
             safe_id,
@@ -1025,6 +1251,10 @@ ADD_PIP: package_name==version"""
         print(f"  ✓ Sbatch: {sbatch_path}")
         print(f"  ✓ Cluster: {routed_slurm.get('cluster_name')}")
         print(f"  ✓ Partition: {routed_slurm.get('partition')}")
+
+        # Log the generated sbatch content so Phase 3 failures are diagnosable
+        sl.log(f"✓ Sbatch written ({len(sbatch_content)} chars)")
+        sl.log(f"Sbatch content:\n{sbatch_content}")
         return {'success': True}
 
     # =========================================================================
@@ -1730,9 +1960,20 @@ ADD_PIP: package_name==version"""
     # =========================================================================
 
     def _create_conda_environment(self) -> Dict[str, Any]:
-        """Create conda env from YAML. Pip fallback on failure."""
+        """Create conda env from YAML. Pip fallback on failure.
+
+        v1.2.5: Always returns the full subprocess result dict including
+        'stdout', 'stderr', 'return_code', and 'command' so the caller
+        (_phase_2_create_environment) can pass it to log_result() for
+        complete Phase 2 failure diagnosis.
+        """
         if not self.checkpoint or not self.checkpoint.env_yaml_path:
-            return {'success': False, 'error': 'No env YAML path'}
+            return {
+                'success': False,
+                'error': 'No env YAML path',
+                'stdout': '',
+                'stderr': '',
+            }
 
         env_yaml_path = self.checkpoint.env_yaml_path
         env_name = self.checkpoint.env_name
@@ -1742,33 +1983,54 @@ ADD_PIP: package_name==version"""
                 yaml_path=env_yaml_path,
                 env_name=env_name,
             )
+            # conda_tools already returns stdout/stderr in its result dict
             return result
 
         # Fallback: direct subprocess
+        cmd = ['conda', 'env', 'create', '-f', env_yaml_path,
+               '-n', env_name, '--yes']
         try:
-            result = subprocess.run(
-                ['conda', 'env', 'create', '-f', env_yaml_path,
-                 '-n', env_name, '--yes'],
+            proc = subprocess.run(
+                cmd,
                 capture_output=True, text=True, timeout=1200,
             )
 
-            if result.returncode == 0:
-                return {'success': True}
+            if proc.returncode == 0:
+                return {
+                    'success': True,
+                    'stdout': proc.stdout,
+                    'stderr': proc.stderr,
+                    'return_code': proc.returncode,
+                    'command': ' '.join(cmd),
+                }
 
             # Try pip fallback for failed packages
-            stderr = result.stderr
+            stderr = proc.stderr
             failed = re.findall(
                 r'PackagesNotFoundError.*?- (\S+)', stderr, re.DOTALL
             )
             if failed:
-                # Remove failed packages from YAML, rebuild, pip install them
                 return self._pip_fallback_build(
                     env_yaml_path, env_name, failed, stderr
                 )
 
-            return {'success': False, 'error': stderr[-500:]}
+            return {
+                'success': False,
+                'error': stderr[-500:],
+                'stdout': proc.stdout,
+                'stderr': proc.stderr,
+                'return_code': proc.returncode,
+                'command': ' '.join(cmd),
+            }
         except Exception as e:
-            return {'success': False, 'error': str(e)}
+            return {
+                'success': False,
+                'error': str(e),
+                'stdout': '',
+                'stderr': str(e),
+                'return_code': -1,
+                'command': ' '.join(cmd),
+            }
 
     def _pip_fallback_build(
         self, yaml_path: str, env_name: str,

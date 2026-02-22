@@ -1,12 +1,15 @@
 #!/bin/bash
 # =============================================================================
-# AGI Pipeline - FULL Clean Script (v1.2.3)
+# AGI Pipeline - FULL Clean Script (v1.2.5)
 # =============================================================================
 # Complete wipe of all pipeline artifacts for a fresh-start run.
 # This is destructive — all generated state will be lost.
 #
 # REMOVES:
 #   - logs/              Agent logs, Ollama logs, error logs
+#   - logs/steps/        Per-step Phase 1/2/3 logs (v1.2.5) — fully wiped
+#                        on FULL clean. Use PARTIAL clean to preserve these
+#                        for diagnosing failures before resubmit.
 #   - temp/checkpoints/  Step checkpoint JSONs
 #   - slurm/logs/        SLURM subtask job stdout/stderr
 #   - slurm_logs/        Master pipeline job stdout/stderr
@@ -76,7 +79,7 @@ PROJECT_DIR="$(pwd)"
 
 echo ""
 echo -e "${RED}============================================================${NC}"
-echo -e "${RED}  AGI Pipeline — FULL Clean (v1.2.3)${NC}"
+echo -e "${RED}  AGI Pipeline — FULL Clean (v1.2.5)${NC}"
 echo -e "${RED}============================================================${NC}"
 echo -e "  Project: ${CYAN}${PROJECT_DIR}${NC}"
 if [ "$DRY_RUN" = true ]; then
@@ -194,7 +197,8 @@ remove_dir_contents() {
 echo "Scanning artifacts..."
 echo ""
 
-count_dir  "Agent logs              (logs/)"                       "logs"
+count_dir  "Agent/Ollama logs       (logs/ excl. steps/)"          "logs"
+count_dir  "Phase logs — WIPED      (logs/steps/)"                 "logs/steps"
 count_dir  "SLURM subtask logs      (slurm/logs/)"                 "slurm/logs"
 count_dir  "SLURM master logs       (slurm_logs/)"                 "slurm_logs"
 count_glob "Checkpoints             (temp/checkpoints/)"           "./temp/checkpoints/step_*_checkpoint.json"
