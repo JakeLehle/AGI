@@ -535,7 +535,7 @@ class ScriptFirstSubAgentV3:
         Returns:
             Dict with success, task_id, and phase-specific results.
         """
-task_id = subtask.get('id', 'unknown')
+        task_id = subtask.get('id', 'unknown')
 
         # v1.2.5: Initialize per-step phase logger before anything else
         self.step_logger = StepLogger(task_id, self.project_root)
@@ -689,7 +689,7 @@ task_id = subtask.get('id', 'unknown')
         script_path = self.project_root / 'scripts' / f"{safe_id}.{ext}"
         script_path.parent.mkdir(parents=True, exist_ok=True)
 
-print(f"\n[{task_id}] Phase 1: Script Generation ({language})")
+        print(f"\n[{task_id}] Phase 1: Script Generation ({language})")
         sl = self.step_logger  # convenience alias
 
         # Skip if script already exists and is validated
@@ -1216,7 +1216,7 @@ ADD_PIP: package_name==version"""
         task_id = subtask.get('id', 'task')
         safe_id = re.sub(r'[^\w\-]', '_', task_id)[:30]
 
-    sl = self.step_logger
+        sl = self.step_logger
         print(f"\n[{task_id}] Phase 3: Sbatch Generation")
 
         if (self.checkpoint.sbatch_path
