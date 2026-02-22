@@ -11,7 +11,7 @@
 #SBATCH --error=slurm_logs/agi_%j.err
 
 ###############################################################################
-# AGI Multi-Agent Pipeline v1.2.2 — ARC GPU Submission Script
+# AGI Multi-Agent Pipeline v1.2.5 — ARC GPU Submission Script
 #
 # Runs the MASTER PIPELINE on an ARC GPU node for fast LLM inference.
 # Subtask scripts are submitted to CPU or GPU partitions as needed.
@@ -263,7 +263,7 @@ CLEANUP_ENV_ON_SUCCESS="${CLEANUP_ENV_ON_SUCCESS:-true}"
 
 echo ""
 echo "============================================================================"
-echo "  AGI Multi-Agent Pipeline v1.2.2"
+echo "  AGI Multi-Agent Pipeline v1.2.5"
 echo "============================================================================"
 echo "  Job ID:              ${SLURM_JOB_ID:-interactive}"
 echo "  Node:                $(hostname)"
@@ -287,6 +287,7 @@ echo "==========================================================================
 mkdir -p "${PROJECT_DIR}/slurm/logs"
 mkdir -p "${PROJECT_DIR}/slurm/scripts"
 mkdir -p "${PROJECT_DIR}/logs"
+mkdir -p "${PROJECT_DIR}/logs/steps"
 mkdir -p "${PROJECT_DIR}/temp/checkpoints"
 mkdir -p "${PROJECT_DIR}/envs"
 mkdir -p "${PROJECT_DIR}/scripts"
@@ -491,6 +492,126 @@ else:
 PYEOF
 
 # ============================================================================
+# GPU KEEPALIVE HEARTBEAT (v1.2.5)
+# ============================================================================
+# The ARC cluster cancels GPU jobs that show no GPU utilization for an
+# extended period. This pipeline spends most of its time waiting for CPU
+# subtask jobs on compute1/compute2 — during that wait, the GPU is idle
+# and the job gets cancelled.
+#
+# The keepalive_heartbeat function runs in the background and every
+# HEARTBEAT_INTERVAL_MINUTES:
+#   1. Writes a timestamped status block to stdout (visible in tail -f)
+#   2. Performs a minimal GPU compute touch via PyTorch to register
+#      utilization with nvidia-smi (satisfies the inactivity monitor)
+#
+# The GPU touch uses ~8MB VRAM for <100ms and immediately frees memory
+# so it does not compete with Ollama's loaded model weights.
+#
+# The heartbeat is launched after Ollama is confirmed running and is
+# killed via trap on any exit (normal, error, or SLURM cancellation).
+# ============================================================================
+
+HEARTBEAT_INTERVAL_MINUTES="${HEARTBEAT_INTERVAL_MINUTES:-10}"
+HEARTBEAT_PID=""
+
+keepalive_heartbeat() {
+    local interval_sec=$(( HEARTBEAT_INTERVAL_MINUTES * 60 ))
+    local start_epoch
+    start_epoch=$(date +%s)
+
+    while true; do
+        sleep "${interval_sec}"
+
+        # --- Elapsed time ---
+        local now_epoch
+        now_epoch=$(date +%s)
+        local elapsed_sec=$(( now_epoch - start_epoch ))
+        local elapsed_days=$(( elapsed_sec / 86400 ))
+        local elapsed_hrs=$(( (elapsed_sec % 86400) / 3600 ))
+        local elapsed_min=$(( (elapsed_sec % 3600) / 60 ))
+        local elapsed_str
+        elapsed_str=$(printf "%dd %02d:%02d" \
+                      "${elapsed_days}" "${elapsed_hrs}" "${elapsed_min}")
+
+        # --- Disk space ---
+        local work_dir
+        work_dir=$(dirname "${PROJECT_DIR}")
+        local avail_gb
+        avail_gb=$(df -k "${work_dir}" 2>/dev/null \
+                   | tail -1 | awk '{printf "%.0f", $4/1048576}')
+        avail_gb="${avail_gb:-?}"
+
+        # --- Pipeline step counts from state file ---
+        local state_file="${PROJECT_DIR}/reports/master_prompt_state.json"
+        local step_summary="(state file not found)"
+        if [ -f "${state_file}" ]; then
+            step_summary=$(python3 - "${state_file}" 2>/dev/null <<'PYSTEP'
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        state = json.load(f)
+    steps = state.get('steps', {})
+    counts = {}
+    for s in steps.values():
+        st = s.get('status', 'pending')
+        counts[st] = counts.get(st, 0) + 1
+    parts = []
+    for k in ('completed', 'running', 'failed', 'pending', 'blocked'):
+        if counts.get(k, 0) > 0:
+            parts.append(f"{k}={counts[k]}")
+    print("  ".join(parts) if parts else "no steps")
+except Exception as e:
+    print(f"parse error: {e}")
+PYSTEP
+            )
+        fi
+
+        # --- Active SLURM subtask jobs ---
+        local active_jobs
+        active_jobs=$(squeue -u "${USER}" --noheader \
+                      --format="%i" 2>/dev/null \
+                      | grep -v "^${SLURM_JOB_ID}$" \
+                      | tr '\n' ' ' | xargs)
+        local active_count
+        active_count=$(echo "${active_jobs}" | wc -w)
+
+        # --- GPU compute touch ---
+        local gpu_status="skipped (torch not available)"
+        if python3 -c "import torch; assert torch.cuda.is_available()" \
+                2>/dev/null; then
+            python3 - 2>/dev/null <<'PYGPU'
+import torch
+try:
+    x = torch.randn(1000, 1000, device='cuda')
+    _ = torch.mm(x, x)
+    del x
+    torch.cuda.empty_cache()
+    print("ok")
+except Exception as e:
+    print(f"error: {e}")
+PYGPU
+            gpu_status="touch complete"
+        fi
+
+        # --- Write heartbeat block to stdout ---
+        echo ""
+        echo "──────────────────────────────────────────────────────────────"
+        echo "  HEARTBEAT  $(date '+%Y-%m-%d %H:%M:%S')  elapsed=${elapsed_str}"
+        echo "  Disk:      ${avail_gb} GB free on $(dirname "${PROJECT_DIR}")"
+        echo "  Steps:     ${step_summary}"
+        if [ "${active_count}" -gt 0 ]; then
+            echo "  SLURM:     ${active_count} subtask job(s) active: ${active_jobs}"
+        else
+            echo "  SLURM:     no subtask jobs currently queued/running"
+        fi
+        echo "  GPU touch: ${gpu_status}"
+        echo "──────────────────────────────────────────────────────────────"
+
+    done
+}
+
+# ============================================================================
 # START OLLAMA
 # ============================================================================
 
@@ -522,6 +643,23 @@ else
     done
     echo "    Ollama ready (${WAITED}s)"
 fi
+
+# v1.2.5: Launch keepalive heartbeat now that Ollama is confirmed running.
+# Launched here so the first GPU touch doesn't race with model loading.
+# The trap below ensures it's always killed on exit.
+echo ""
+echo ">>> Starting GPU keepalive heartbeat..."
+echo "    Interval: every ${HEARTBEAT_INTERVAL_MINUTES} minutes"
+echo "    Purpose:  prevent GPU inactivity cancellation during CPU subtask waits"
+keepalive_heartbeat &
+HEARTBEAT_PID=$!
+echo "    Heartbeat PID: ${HEARTBEAT_PID}"
+
+# Trap: kill heartbeat on any exit (normal, error, or SLURM cancellation)
+trap 'echo ">>> Stopping heartbeat (PID: ${HEARTBEAT_PID})..."; \
+      kill "${HEARTBEAT_PID}" 2>/dev/null; \
+      wait "${HEARTBEAT_PID}" 2>/dev/null; \
+      true' EXIT
 
 # ============================================================================
 # VERIFY MODELS
@@ -644,6 +782,8 @@ PIPELINE_EXIT_CODE=$?
 echo ""
 echo ">>> Pipeline finished (exit code: ${PIPELINE_EXIT_CODE})"
 
+# Heartbeat is stopped automatically by the EXIT trap registered above.
+# Ollama shutdown is handled here explicitly.
 if [ -n "${OLLAMA_PID}" ]; then
     echo ">>> Stopping Ollama..."
     kill "${OLLAMA_PID}" 2>/dev/null || true

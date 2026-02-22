@@ -790,7 +790,7 @@ class DiagnosticAgent:
                 self._store_solution(error_message, rx)
                 return rx
 
-return FixPrescription(
+        return FixPrescription(
             target_file="sbatch",
             fix_type="change_config",
             confidence=0.4,
