@@ -79,7 +79,7 @@ fi
 
 echo ""
 echo -e "${BLUE}============================================================${NC}"
-echo -e "${BLUE}  AGI Pipeline — Human Guidance Injection (v1.2.4)${NC}"
+echo -e "${BLUE}  AGI Pipeline — Human Guidance Injection (v1.2.5)${NC}"
 echo -e "${BLUE}============================================================${NC}"
 if [ "$DRY_RUN" = true ]; then
     echo -e "  Mode: ${YELLOW}DRY RUN — changes will be shown but not written${NC}"
