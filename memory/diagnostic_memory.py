@@ -792,6 +792,35 @@ BOOTSTRAP_SOLUTIONS: List[Dict[str, Any]] = [
         "fix_target": "env",
         "fix_actions": [{"action": "version_pin", "package": "numpy", "pin": "<2.0"}],
     },
+    {
+        "error_pattern": "SafetyError: The package for",
+        "solution": "Corrupted package in ~/.conda/pkgs/. Remove the specific corrupted package directory, run 'conda clean --packages --yes', then retry the environment build.",
+        "error_type": "conda_error",
+        "fix_target": "system",
+        "fix_actions": [
+            {"action": "remove_corrupted_cache"},
+            {"action": "conda_clean_packages"},
+        ],
+    },
+    {
+        "error_pattern": "ClobberError: This transaction has incompatible packages",
+        "solution": "Conda transaction conflict, often caused by corrupted cache. Run 'conda clean --packages --tarballs --yes', remove the environment prefix, and rebuild.",
+        "error_type": "conda_error",
+        "fix_target": "system",
+        "fix_actions": [
+            {"action": "conda_clean_packages"},
+            {"action": "remove_env_prefix"},
+        ],
+    },
+    {
+        "error_pattern": "CondaValueError: prefix already exists",
+        "solution": "A previous failed build left a partial environment prefix on disk. Remove it with 'conda env remove -n ENV_NAME -y' or shutil.rmtree the prefix directory, then retry.",
+        "error_type": "conda_error",
+        "fix_target": "system",
+        "fix_actions": [
+            {"action": "remove_env_prefix"},
+        ],
+    },
 ]
 
 

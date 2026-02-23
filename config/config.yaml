@@ -1,5 +1,5 @@
 # =============================================================================
-# Multi-Agent System Configuration v1.2.2
+# Multi-Agent System Configuration v1.2.6
 # =============================================================================
 # Supports four-phase sub-agent lifecycle with integrated diagnostic agent
 #
@@ -626,6 +626,16 @@ failure_diagnosis:
       regex: "(Error in .+ : |Execution halted|there is no package called)"
       action: "diagnose_r"
       description: "R script execution error"
+
+    corrupted_cache:
+      regex: "(SafetyError|appears to be corrupted|incorrect size)"
+      action: "clean_conda_cache"
+      description: "Corrupted package in conda cache"
+
+    clobber_error:
+      regex: "(ClobberError|incompatible packages)"
+      action: "clean_conda_cache"
+      description: "Conda transaction conflict from incompatible packages"
 
 # =============================================================================
 # Workflow Settings

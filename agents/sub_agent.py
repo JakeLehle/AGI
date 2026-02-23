@@ -1,5 +1,5 @@
 """
-Script-First Sub-Agent v1.2.5 — 4-Phase Lifecycle with Diagnostic Agent
+Script-First Sub-Agent v1.2.6 — 4-Phase Lifecycle with Diagnostic Agent
 
 Features:
 - DUAL CLUSTER ROUTING: AGI_CLUSTER (CPU) + AGI_GPU_CLUSTER (GPU subtasks)
@@ -1072,6 +1072,9 @@ INVALID: [specific issues]"""
         sl.log(f"✗ Initial build failed. Entering repair loop "
                f"(max {self.MAX_ENV_REPAIR_ITERATIONS} attempts)...")
 
+        # v1.2.6: Track error signatures to detect oscillation patterns
+        error_signatures = []
+
         for repair_attempt in range(self.MAX_ENV_REPAIR_ITERATIONS):
             if not self._can_continue():
                 sl.log("Repair loop: _can_continue() returned False, stopping")
@@ -1081,6 +1084,16 @@ INVALID: [specific issues]"""
             print(f"  → Repair attempt {repair_attempt + 1}: {error[:100]}")
             sl.log(f"Repair attempt {repair_attempt + 1}/{self.MAX_ENV_REPAIR_ITERATIONS}: "
                    f"error={error[:300]}")
+
+            # v1.2.6: Classify and track error signature for oscillation detection
+            sig = self._classify_repair_error(error)
+            error_signatures.append(sig)
+
+            if self._detect_repair_oscillation(error_signatures, sl):
+                return {
+                    'success': False,
+                    'error': f"Env repair oscillation detected: {' ↔ '.join(set(error_signatures[-4:]))}"
+                }
 
             repaired = self._repair_environment(error, env_yaml_path, env_name)
             if not repaired:
@@ -1116,17 +1129,90 @@ INVALID: [specific issues]"""
     ) -> bool:
         """Attempt to repair a failed environment build.
 
-        Handles: disk quota, package not found, conflicts.
+        Handles: disk quota, package not found, corrupted cache (SafetyError),
+        transaction conflicts (ClobberError), stale prefix, solver conflicts.
         Returns True if a repair action was taken (caller should retry).
+
+        v1.2.6: Added SafetyError (corrupted conda cache) and ClobberError
+        handlers. SafetyError is checked early because it causes cascading
+        ClobberError and prefix-exists failures.
         """
         error_lower = error.lower()
 
-        # Disk quota
+        # ── Disk quota ───────────────────────────────────────────────────
         if 'no space' in error_lower or 'quota' in error_lower:
             self._ensure_disk_space(force=True)
             return True
 
-        # Package not found on conda → move to pip
+        # ── Corrupted package cache (SafetyError) ───────────────────────
+        # v1.2.6: A corrupted tarball in ~/.conda/pkgs/ causes every build
+        # that needs that package to fail. Must be handled BEFORE the
+        # prefix-exists check because a corrupted cache leaves a partial
+        # prefix on disk, creating an oscillation loop.
+        if 'safetyerror' in error_lower or 'appears to be corrupted' in error_lower or 'incorrect size' in error_lower:
+            print(f"    Corrupted conda cache detected, cleaning...")
+            try:
+                # Parse the specific corrupted package path
+                # Pattern: "The package for X located at /path/to/pkgs/X-version"
+                corrupted_path = None
+                path_match = re.search(
+                    r'located at\s+(\S+)', error
+                )
+                if path_match:
+                    corrupted_path = Path(path_match.group(1))
+
+                # Remove the specific corrupted package directory
+                if corrupted_path and corrupted_path.exists():
+                    import shutil
+                    shutil.rmtree(str(corrupted_path), ignore_errors=True)
+                    print(f"    ✓ Removed corrupted cache: {corrupted_path}")
+                    # Also remove the corresponding .tar.bz2 / .conda if present
+                    for suffix in ['.tar.bz2', '.conda']:
+                        archive = corrupted_path.with_suffix(suffix)
+                        if archive.exists():
+                            archive.unlink(missing_ok=True)
+                            print(f"    ✓ Removed cached archive: {archive}")
+
+                # Run conda clean --packages to verify cache integrity
+                subprocess.run(
+                    ['conda', 'clean', '--packages', '--yes'],
+                    capture_output=True, text=True, timeout=120,
+                )
+                print(f"    ✓ conda clean --packages completed")
+
+                # Also remove stale env prefix if it exists (the corrupted
+                # build likely left one behind)
+                self._remove_stale_prefix(env_name)
+
+                return True
+            except Exception as e:
+                logger.warning(f"Corrupted cache cleanup failed: {e}")
+                # Still return True to retry — the clean may have partially worked
+                return True
+
+        # ── ClobberError (incompatible package transactions) ─────────────
+        # v1.2.6: ClobberError means two packages want to write the same file.
+        # Often co-occurs with SafetyError (handled above). Standalone cases
+        # need cache cleanup + fresh prefix.
+        if 'clobbererror' in error_lower or 'incompatible packages' in error_lower:
+            print(f"    ClobberError detected, cleaning cache and prefix...")
+            try:
+                # Clean the entire package cache to remove any conflicting state
+                subprocess.run(
+                    ['conda', 'clean', '--packages', '--tarballs', '--yes'],
+                    capture_output=True, text=True, timeout=120,
+                )
+                print(f"    ✓ conda clean --packages --tarballs completed")
+
+                # Remove stale prefix so we get a clean create
+                self._remove_stale_prefix(env_name)
+
+                return True
+            except Exception as e:
+                logger.warning(f"ClobberError cleanup failed: {e}")
+                return True
+
+        # ── Package not found on conda → move to pip ─────────────────────
         not_found = re.findall(
             r'PackagesNotFoundError.*?- (\S+)',
             error, re.DOTALL
@@ -1157,41 +1243,11 @@ INVALID: [specific issues]"""
                     print(f"    Moved {pkg_clean} to pip section")
             return True
 
-        # Stale prefix on disk — a previous partial build left the env
-        # directory. Remove it so the next create attempt starts clean.
+        # ── Stale prefix on disk ─────────────────────────────────────────
         if 'prefix already exists' in error_lower or 'condavalueerror' in error_lower:
-            print(f"    Removing stale env prefix: {env_name}")
-            try:
-                remove_result = subprocess.run(
-                    ['conda', 'env', 'remove', '-n', env_name, '-y', '--quiet'],
-                    capture_output=True, text=True, timeout=120,
-                )
-                if remove_result.returncode == 0:
-                    print(f"    ✓ Stale prefix removed, will retry create")
-                    return True
-                else:
-                    # conda env remove failed — try direct rm as fallback
-                    conda_envs_root = subprocess.run(
-                        ['conda', 'info', '--json'],
-                        capture_output=True, text=True, timeout=30,
-                    )
-                    if conda_envs_root.returncode == 0:
-                        import json as _json
-                        info = _json.loads(conda_envs_root.stdout)
-                        for env_dir in info.get('envs_dirs', []):
-                            prefix = Path(env_dir) / env_name
-                            if prefix.exists():
-                                import shutil
-                                shutil.rmtree(str(prefix), ignore_errors=True)
-                                print(f"    ✓ Removed prefix via shutil: {prefix}")
-                                return True
-                    print(f"    ✗ Could not remove stale prefix")
-                    return False
-            except Exception as e:
-                logger.warning(f"Stale prefix removal failed: {e}")
-                return False
+            return self._remove_stale_prefix(env_name)
 
-        # Conflict → ask LLM for version resolution
+        # ── Conflict → ask LLM for version resolution ────────────────────
         if 'conflict' in error_lower:
             try:
                 fix_prompt = f"""A conda environment build failed with this error:
@@ -1233,9 +1289,118 @@ ADD_PIP: package_name==version"""
             except (LLMInvocationError, Exception) as e:
                 logger.warning(f"LLM conflict resolution failed: {e}")
 
-        # Pip install failure → try alternative
+        # ── Pip install failure → transient, retry ────────────────────────
         if 'pip' in error_lower and 'failed' in error_lower:
             return True  # Retry may succeed after network transient
+
+        return False
+
+    def _remove_stale_prefix(self, env_name: str) -> bool:
+        """Remove a stale conda environment prefix left by a failed build.
+
+        v1.2.6: Extracted from _repair_environment so it can be called as a
+        combo action from the SafetyError and ClobberError handlers too.
+
+        Returns True if the prefix was removed (caller should retry).
+        """
+        print(f"    Removing stale env prefix: {env_name}")
+        try:
+            remove_result = subprocess.run(
+                ['conda', 'env', 'remove', '-n', env_name, '-y', '--quiet'],
+                capture_output=True, text=True, timeout=120,
+            )
+            if remove_result.returncode == 0:
+                print(f"    ✓ Stale prefix removed, will retry create")
+                return True
+            else:
+                # conda env remove failed — try direct rm as fallback
+                conda_envs_root = subprocess.run(
+                    ['conda', 'info', '--json'],
+                    capture_output=True, text=True, timeout=30,
+                )
+                if conda_envs_root.returncode == 0:
+                    import json as _json
+                    info = _json.loads(conda_envs_root.stdout)
+                    for env_dir in info.get('envs_dirs', []):
+                        prefix = Path(env_dir) / env_name
+                        if prefix.exists():
+                            import shutil
+                            shutil.rmtree(str(prefix), ignore_errors=True)
+                            print(f"    ✓ Removed prefix via shutil: {prefix}")
+                            return True
+                print(f"    ✗ Could not remove stale prefix")
+                return False
+        except Exception as e:
+            logger.warning(f"Stale prefix removal failed: {e}")
+            return False
+
+    @staticmethod
+    def _classify_repair_error(error: str) -> str:
+        """Classify a conda build error into a short signature string.
+
+        v1.2.6: Used by the repair loop to detect oscillation patterns
+        (e.g. alternating between SafetyError and prefix-exists).
+
+        Returns a short, stable string like 'safety_error', 'prefix_exists',
+        'packages_not_found', etc.
+        """
+        el = error.lower()
+        if 'safetyerror' in el or 'appears to be corrupted' in el or 'incorrect size' in el:
+            return 'safety_error'
+        if 'clobbererror' in el or 'incompatible packages' in el:
+            return 'clobber_error'
+        if 'prefix already exists' in el or 'condavalueerror' in el:
+            return 'prefix_exists'
+        if 'packagesnotfounderror' in el or 'resolvepackagenotfound' in el:
+            return 'packages_not_found'
+        if 'no space' in el or 'quota' in el:
+            return 'disk_quota'
+        if 'conflict' in el:
+            return 'conflict'
+        if 'pip' in el and 'failed' in el:
+            return 'pip_failed'
+        return 'unknown'
+
+    @staticmethod
+    def _detect_repair_oscillation(
+        signatures: list, sl=None
+    ) -> bool:
+        """Detect if the repair loop is stuck in a repeating error pattern.
+
+        v1.2.6: Prevents burning all 15 iterations on unresolvable cycles.
+
+        Detects:
+          - Same error 3+ times → not making progress
+          - Same pair alternating 2+ full cycles (4 entries) → oscillation
+
+        Returns True if the loop should bail out.
+        """
+        if len(signatures) < 3:
+            return False
+
+        # Check 1: Same error appearing 3+ times total
+        from collections import Counter
+        counts = Counter(signatures)
+        for sig, count in counts.items():
+            if count >= 3:
+                msg = (f"✗ Repair oscillation: '{sig}' appeared {count} times "
+                       f"across {len(signatures)} attempts — not making progress")
+                print(f"    {msg}")
+                if sl:
+                    sl.log(msg)
+                return True
+
+        # Check 2: A-B-A-B alternating pattern (2 full cycles = 4 entries)
+        if len(signatures) >= 4:
+            last4 = signatures[-4:]
+            if (last4[0] == last4[2] and last4[1] == last4[3]
+                    and last4[0] != last4[1]):
+                msg = (f"✗ Repair oscillation: alternating between "
+                       f"'{last4[0]}' and '{last4[1]}' — breaking cycle")
+                print(f"    {msg}")
+                if sl:
+                    sl.log(msg)
+                return True
 
         return False
 
