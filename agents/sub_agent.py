@@ -1030,8 +1030,12 @@ INVALID: [specific issues]"""
                 initial_backoff=20.0,
             )
             dep_list = parse_dependency_response(dep_response)
-            sl.log(f"LLM identified {len(dep_list)} dependencies")
-
+            sl.log(
+                f"LLM identified: {len(dep_list.conda_packages)} conda, "
+                f"{len(dep_list.pip_packages)} pip, "
+                f"{len(dep_list.system_binaries)} binaries, "
+                f"{len(dep_list.r_packages)} R packages"
+            )
             # Step 2b: Generate YAML
             env_yaml = generate_env_yaml(dep_list, env_name)
             sl.log("Step 2b: YAML generated via LLM dependency list")
@@ -1152,6 +1156,40 @@ INVALID: [specific issues]"""
                     )
                     print(f"    Moved {pkg_clean} to pip section")
             return True
+
+        # Stale prefix on disk — a previous partial build left the env
+        # directory. Remove it so the next create attempt starts clean.
+        if 'prefix already exists' in error_lower or 'condavalueerror' in error_lower:
+            print(f"    Removing stale env prefix: {env_name}")
+            try:
+                remove_result = subprocess.run(
+                    ['conda', 'env', 'remove', '-n', env_name, '-y', '--quiet'],
+                    capture_output=True, text=True, timeout=120,
+                )
+                if remove_result.returncode == 0:
+                    print(f"    ✓ Stale prefix removed, will retry create")
+                    return True
+                else:
+                    # conda env remove failed — try direct rm as fallback
+                    conda_envs_root = subprocess.run(
+                        ['conda', 'info', '--json'],
+                        capture_output=True, text=True, timeout=30,
+                    )
+                    if conda_envs_root.returncode == 0:
+                        import json as _json
+                        info = _json.loads(conda_envs_root.stdout)
+                        for env_dir in info.get('envs_dirs', []):
+                            prefix = Path(env_dir) / env_name
+                            if prefix.exists():
+                                import shutil
+                                shutil.rmtree(str(prefix), ignore_errors=True)
+                                print(f"    ✓ Removed prefix via shutil: {prefix}")
+                                return True
+                    print(f"    ✗ Could not remove stale prefix")
+                    return False
+            except Exception as e:
+                logger.warning(f"Stale prefix removal failed: {e}")
+                return False
 
         # Conflict → ask LLM for version resolution
         if 'conflict' in error_lower:
@@ -1990,9 +2028,21 @@ ADD_PIP: package_name==version"""
         cmd = ['conda', 'env', 'create', '-f', env_yaml_path,
                '-n', env_name, '--yes']
         try:
+
+            existing_check = subprocess.run(
+                ['conda', 'env', 'list'],
+                capture_output=True, text=True,
+            )
+            if existing_check.returncode == 0 and env_name in existing_check.stdout:
+                logger.info(f"Removing existing env before create: {env_name}")
+                subprocess.run(
+                    ['conda', 'env', 'remove', '-n', env_name, '-y', '--quiet'],
+                    capture_output=True, text=True,
+                )
+
             proc = subprocess.run(
                 cmd,
-                capture_output=True, text=True, timeout=1200,
+                capture_output=True, text=True,
             )
 
             if proc.returncode == 0:
