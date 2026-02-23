@@ -1289,11 +1289,41 @@ ADD_PIP: package_name==version"""
             except (LLMInvocationError, Exception) as e:
                 logger.warning(f"LLM conflict resolution failed: {e}")
 
-        # ── Pip install failure → transient, retry ────────────────────────
-        if 'pip' in error_lower and 'failed' in error_lower:
-            return True  # Retry may succeed after network transient
+        # ── Pip install failure ───────────────────────────────────────────
+        # v1.2.6b: Distinguish permanent pip failures (package doesn't exist)
+        # from transient ones (network timeout). Permanent failures need the
+        # offending package removed from YAML + partial prefix cleaned up.
+        if 'pip' in error_lower and ('failed' in error_lower or 'pip subprocess error' in error_lower):
+            # Parse which pip packages failed
+            pip_not_found = re.findall(
+                r'No matching distribution found for (\S+)', error
+            )
+            if not pip_not_found:
+                pip_not_found = re.findall(
+                    r'Could not find a version that satisfies the requirement (\S+)',
+                    error
+                )
 
-        return False
+            if pip_not_found and yaml and yaml_path.exists():
+                # Permanent failure: remove unfindable packages from YAML
+                for pkg in pip_not_found:
+                    pkg_clean = re.split(r'[><=!\[]', pkg)[0].strip()
+                    if not pkg_clean:
+                        continue
+                    if self.conda_tools:
+                        self.conda_tools.remove_package_from_yaml(
+                            str(yaml_path), pkg_clean
+                        )
+                        print(f"    Removed unfindable pip package: {pkg_clean}")
+                # Also clean up the partial prefix left by the failed build
+                self._remove_stale_prefix(env_name)
+                return True
+
+            # No specific package parsed — treat as transient, but still
+            # clean the partial prefix to avoid prefix-exists on retry
+            self._remove_stale_prefix(env_name)
+            return True
+
 
     def _remove_stale_prefix(self, env_name: str) -> bool:
         """Remove a stale conda environment prefix left by a failed build.
@@ -2165,10 +2195,14 @@ ADD_PIP: package_name==version"""
     def _create_conda_environment(self) -> Dict[str, Any]:
         """Create conda env from YAML. Pip fallback on failure.
 
-        v1.2.5: Always returns the full subprocess result dict including
+        v1.2.6: Always returns the full subprocess result dict including
         'stdout', 'stderr', 'return_code', and 'command' so the caller
         (_phase_2_create_environment) can pass it to log_result() for
         complete Phase 2 failure diagnosis.
+
+        v1.2.6b: Pre-remove existing environment on BOTH code paths
+        (conda_tools and subprocess fallback) to prevent prefix-exists
+        failures when retrying a step from a previous pipeline run.
         """
         if not self.checkpoint or not self.checkpoint.env_yaml_path:
             return {
@@ -2180,6 +2214,11 @@ ADD_PIP: package_name==version"""
 
         env_yaml_path = self.checkpoint.env_yaml_path
         env_name = self.checkpoint.env_name
+
+        # v1.2.6b: Always remove existing env before create, regardless
+        # of code path. This prevents prefix-exists failures when a step
+        # is retried from a previous pipeline run or after a partial build.
+        self._pre_remove_existing_env(env_name)
 
         if self.conda_tools:
             result = self.conda_tools.create_from_yaml(
@@ -2193,18 +2232,6 @@ ADD_PIP: package_name==version"""
         cmd = ['conda', 'env', 'create', '-f', env_yaml_path,
                '-n', env_name, '--yes']
         try:
-
-            existing_check = subprocess.run(
-                ['conda', 'env', 'list'],
-                capture_output=True, text=True,
-            )
-            if existing_check.returncode == 0 and env_name in existing_check.stdout:
-                logger.info(f"Removing existing env before create: {env_name}")
-                subprocess.run(
-                    ['conda', 'env', 'remove', '-n', env_name, '-y', '--quiet'],
-                    capture_output=True, text=True,
-                )
-
             proc = subprocess.run(
                 cmd,
                 capture_output=True, text=True,
@@ -2246,6 +2273,27 @@ ADD_PIP: package_name==version"""
                 'return_code': -1,
                 'command': ' '.join(cmd),
             }
+
+    def _pre_remove_existing_env(self, env_name: str):
+        """Remove an existing conda environment before creating a new one.
+
+        v1.2.6b: Extracted to ensure both the conda_tools and subprocess
+        fallback paths in _create_conda_environment() handle pre-existing
+        environments consistently. Silently succeeds if the env doesn't exist.
+        """
+        try:
+            existing_check = subprocess.run(
+                ['conda', 'env', 'list'],
+                capture_output=True, text=True, timeout=30,
+            )
+            if existing_check.returncode == 0 and env_name in existing_check.stdout:
+                logger.info(f"Removing existing env before create: {env_name}")
+                subprocess.run(
+                    ['conda', 'env', 'remove', '-n', env_name, '-y', '--quiet'],
+                    capture_output=True, text=True, timeout=180,
+                )
+        except Exception as e:
+            logger.warning(f"Pre-remove existing env failed: {e}")
 
     def _pip_fallback_build(
         self, yaml_path: str, env_name: str,
