@@ -675,13 +675,23 @@ class MultiAgentWorkflow:
                 "current_subtask": ready_tasks[0],
             }
 
-    def submit_parallel_jobs(self, state: WorkflowState) -> Dict:
+def submit_parallel_jobs(self, state: WorkflowState) -> Dict:
         """Submit parallel tasks with true concurrent execution.
 
         v1.2.2 FIX F: Uses ThreadPoolExecutor to run all batch tasks
         simultaneously. Each task gets its own thread running the full
         4-phase sub-agent lifecycle. The method blocks until ALL tasks
         in the batch have resolved (success, failure, or crash).
+
+        v1.2.7 FIX: All results treated as immediate. The sub-agent runs
+        the full lifecycle (script → env → sbatch → submit → monitor →
+        diagnostic loop) within its thread. By the time the future resolves,
+        the task is terminal. The old job_id-based split routed successful
+        tasks to running_jobs → wait_for_parallel_jobs for redundant
+        re-polling of already-completed SLURM jobs, causing tasks to
+        ghost-stall at "running" when the poll failed to resolve.
+        running_jobs is now always empty; wait_for_parallel_jobs is a
+        passthrough.
 
         Thread safety:
         - Each thread creates its own ScriptFirstSubAgent instance
@@ -692,7 +702,6 @@ class MultiAgentWorkflow:
         """
         batch = state['parallel_batch']
         env_name = state['env_name']
-        running_jobs = {}
         immediate_results = []
         # Guard: empty batch should never reach here but handle it safely
         # rather than crashing ThreadPoolExecutor with max_workers=0
@@ -776,57 +785,56 @@ class MultiAgentWorkflow:
                     subtask = next(s for s in batch if s['id'] == task_id)
                     result = {'success': False, 'error': f"Future exception: {e}"}
 
-                if result.get('job_id'):
-                    running_jobs[task_id] = result['job_id']
-                else:
-                    immediate_results.append({
-                        "subtask": subtask,
-                        "result": result,
-                    })
-                    # Update master doc (thread-safe via lock)
-                    with self._lock:
-                        if result.get('success'):
-                            logger.info(
-                                f"Task {task_id} completed immediately "
-                                f"(skipped={result.get('skipped', False)})"
-                            )
-                            self.master.mark_subtask_complete(
-                                task_id,
-                                result.get('outputs', {}),
-                                result.get('report', ''))
-                        else:
-                            logger.warning(
-                                f"Task {task_id} failed: "
-                                f"{result.get('error', 'unknown')[:200]}")
-                            # v1.2.3: Sync master document on parallel failure.
-                            # Previously only the success branch updated the
-                            # master doc here, leaving failed tasks permanently
-                            # stuck at "running" in master_prompt_state.json.
-                            # This caused the router to deadlock — it saw the
-                            # task as neither complete nor failed, so it could
-                            # never dispatch dependents or enter the review loop.
-                            self.master.master_document.mark_failed(
-                                task_id,
-                                error_summary=result.get(
-                                    'error', 'Unknown error'
-                                ),
-                                attempts=1,
-                                script_path=result.get('script_path'),
-                            )
+                # v1.2.7: ALL results are immediate. The sub-agent runs the
+                # full 4-phase lifecycle in its thread — by the time the
+                # future resolves, the task is terminal (success or failure).
+                # The old code split on result.get('job_id'), routing
+                # successful tasks to running_jobs → wait_for_parallel_jobs
+                # for redundant re-polling. This caused tasks to ghost-stall
+                # at "running" status because wait_for_parallel_jobs polled
+                # already-completed SLURM jobs and failed to resolve them.
+                immediate_results.append({
+                    "subtask": subtask,
+                    "result": result,
+                })
+                # Update master doc (thread-safe via lock)
+                with self._lock:
+                    if result.get('success'):
+                        logger.info(
+                            f"Task {task_id} completed "
+                            f"(skipped={result.get('skipped', False)})"
+                        )
+                        self.master.mark_subtask_complete(
+                            task_id,
+                            result.get('outputs', {}),
+                            result.get('report', ''))
+                    else:
+                        logger.warning(
+                            f"Task {task_id} failed: "
+                            f"{result.get('error', 'unknown')[:200]}")
+                        self.master.master_document.mark_failed(
+                            task_id,
+                            error_summary=result.get(
+                                'error', 'Unknown error'
+                            ),
+                            attempts=1,
+                            script_path=result.get('script_path'),
+                        )
 
         # Log batch completion
-        if immediate_results:
-            n_success = sum(1 for r in immediate_results if r['result'].get('success'))
-            n_fail = len(immediate_results) - n_success
-            agent_logger.log_workflow_event("parallel_complete", {
-                "total": len(immediate_results),
-                "success": n_success,
-                "failed": n_fail,
-                "tasks": [r['subtask']['id'] for r in immediate_results],
-            })
+        n_success = sum(1 for r in immediate_results if r['result'].get('success'))
+        n_fail = len(immediate_results) - n_success
+        agent_logger.log_workflow_event("parallel_complete", {
+            "total": len(immediate_results),
+            "success": n_success,
+            "failed": n_fail,
+            "tasks": [r['subtask']['id'] for r in immediate_results],
+        })
 
+        # v1.2.7: running_jobs always empty — no second poll needed.
+        # wait_for_parallel_jobs becomes a passthrough.
         return {
-            "running_jobs": running_jobs,
+            "running_jobs": {},
             "parallel_results": immediate_results,
         }
 
