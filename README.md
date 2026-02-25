@@ -17,11 +17,11 @@ The AGI pipeline decomposes complex research prompts into executable scripts, su
 │                      └──────────────┘           │          │
 │                              ▲                  │ sbatch   │
 │                    ┌─────────┴────────┐         │          │
-│                    │ Diagnostic Agent │◄────────┘          │
+│                    │ Diagnostic Agent │◄────────|          │
 │                    │ Error classify   │  (on failure)      │
-│                    │ Fix prescribe    │                    │
-│                    │ Solution memory  │                    │
-│                    └──────────────────┘                    │
+│                    │ Fix prescribe    │         |          │
+│                    │ Solution memory  │         |          │
+│                    └──────────────────┘         |          │
 └─────────────────────────────────────────────────┬──────────┘
                                                   │
                           ┌───────────────────────┼──────────────────┐
