@@ -747,8 +747,7 @@ Examples:
         "nodelist": args.nodelist,
         "exclude_nodes": args.exclude,
         "max_parallel_jobs": args.max_parallel or config.get("parallel", {}).get("max_parallel_jobs", 10),
-        "poll_interval": config.get("slurm", {}).get("poll_interval", 10),
-        "max_poll_attempts": config.get("slurm", {}).get("max_poll_attempts", 720),
+        "poll_interval": config.get("slurm", {}).get("poll_interval", 30),
         # v3.2: Dual cluster routing + sub-agent options
         "cluster_for_subtasks": cluster_for_subtasks,
         "gpu_cluster_for_subtasks": gpu_cluster_for_subtasks,

@@ -1,5 +1,5 @@
 """
-LangGraph Workflow v1.2.2 - Script-First Architecture with Diagnostic Agent
+LangGraph Workflow v1.2.7 - Script-First Architecture with Diagnostic Agent
 
 Orchestrates multi-agent system with:
 - Token-based context limits (configurable, default 25K) instead of iteration counts
@@ -895,7 +895,14 @@ class MultiAgentWorkflow:
         }
 
     def wait_for_parallel_jobs(self, state: WorkflowState) -> Dict:
-        """Wait for all parallel SLURM jobs to complete"""
+        """Wait for all parallel SLURM jobs to complete.
+
+        v1.2.7: This node is now a passthrough. submit_parallel_jobs runs
+        the full sub-agent lifecycle in ThreadPoolExecutor threads and
+        returns running_jobs={} (all results are immediate). The polling
+        logic below is retained without a timeout for safety, but should
+        never execute in the current architecture.
+        """
         running_jobs = state.get('running_jobs', {})
 
         existing_results = state.get('parallel_results', [])
@@ -905,7 +912,6 @@ class MultiAgentWorkflow:
 
         results = list(existing_results)
         poll_interval = self.slurm_config.get("poll_interval", 10)
-        max_attempts = self.slurm_config.get("max_poll_attempts", 720)
 
         # Create mapping of job_id -> subtask
         job_to_subtask = {}
@@ -914,11 +920,10 @@ class MultiAgentWorkflow:
             if task_id in running_jobs:
                 job_to_subtask[running_jobs[task_id]] = subtask
 
-        # Poll until all jobs complete
+        # Poll until all jobs complete — no artificial timeout
         completed_jobs = set()
-        attempts = 0
 
-        while len(completed_jobs) < len(running_jobs) and attempts < max_attempts:
+        while len(completed_jobs) < len(running_jobs):
             for task_id, job_id in running_jobs.items():
                 if job_id in completed_jobs:
                     continue
@@ -944,22 +949,6 @@ class MultiAgentWorkflow:
 
             if len(completed_jobs) < len(running_jobs):
                 time.sleep(poll_interval)
-                attempts += 1
-
-        # Handle timeout
-        for task_id, job_id in running_jobs.items():
-            if job_id not in completed_jobs:
-                subtask = job_to_subtask.get(job_id)
-                if subtask:
-                    results.append({
-                        "subtask": subtask,
-                        "result": {
-                            "success": False,
-                            "job_id": job_id,
-                            "state": "TIMEOUT",
-                            "error": "Job monitoring timed out"
-                        }
-                    })
 
         return {
             "parallel_results": results,

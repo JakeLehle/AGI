@@ -1,5 +1,5 @@
 # =============================================================================
-# Multi-Agent System Configuration v1.2.6
+# Multi-Agent System Configuration v1.2.7
 # =============================================================================
 # Supports four-phase sub-agent lifecycle with integrated diagnostic agent
 #
@@ -416,8 +416,11 @@ slurm:
   default_gpu_cluster: "arc_gpu1v100"
 
   # Polling settings
+  # v1.2.7: max_poll_attempts removed. All polling loops run indefinitely
+  # until SLURM reports a terminal state. The job's own --time wall limit
+  # is the only exit condition. This prevents premature POLL_TIMEOUT
+  # failures when jobs sit in queue on a busy cluster.
   poll_interval: 30       # Seconds between job status checks
-  max_poll_attempts: 8640  # 8640 × 30s = 3 days coverage
 
   # Job naming prefix
   job_prefix: "agi"
