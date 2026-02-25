@@ -675,7 +675,7 @@ class MultiAgentWorkflow:
                 "current_subtask": ready_tasks[0],
             }
 
-def submit_parallel_jobs(self, state: WorkflowState) -> Dict:
+    def submit_parallel_jobs(self, state: WorkflowState) -> Dict:
         """Submit parallel tasks with true concurrent execution.
 
         v1.2.2 FIX F: Uses ThreadPoolExecutor to run all batch tasks
