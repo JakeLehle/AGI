@@ -1,4 +1,4 @@
-i# AGI Multi-Agent Pipeline
+# AGI Multi-Agent Pipeline
 
 > Automated computational workflow orchestration for HPC clusters using local LLMs.
 
