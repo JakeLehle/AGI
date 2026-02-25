@@ -1,5 +1,5 @@
 """
-SLURM job submission and management tools.
+SLURM job submission and management tools v1.2.7.
 Supports multiple clusters with different configurations (CPU and GPU).
 
 Features:
@@ -914,25 +914,27 @@ class SlurmTools:
         self,
         job_id: str,
         poll_interval: int = None,
-        max_attempts: int = None,
         callback: callable = None
     ) -> Dict[str, Any]:
         """
         Wait for a job to complete.
         
+        v1.2.7: No artificial timeout. Polls indefinitely until SLURM
+        reports a terminal state. The job's own wall time is the only
+        exit condition.
+        
         Args:
             job_id: Job ID to wait for
             poll_interval: Seconds between status checks
-            max_attempts: Maximum polling attempts
             callback: Optional callback function called each poll
             
         Returns:
             Final job status
         """
         poll_interval = poll_interval or self.config.poll_interval
-        max_attempts = max_attempts or self.config.max_poll_attempts
+        attempt = 0
         
-        for attempt in range(max_attempts):
+        while True:
             status = self.get_job_status(job_id)
             
             if not status["success"]:
@@ -954,37 +956,33 @@ class SlurmTools:
                 return status
             
             time.sleep(poll_interval)
-        
-        return {
-            "success": False,
-            "job_id": job_id,
-            "error": f"Timeout waiting for job after {max_attempts * poll_interval} seconds"
-        }
+            attempt += 1
     
     def wait_for_jobs(
         self,
         job_ids: List[str],
-        poll_interval: int = None,
-        max_attempts: int = None
+        poll_interval: int = None
     ) -> Dict[str, Any]:
         """
         Wait for multiple jobs to complete.
         
+        v1.2.7: No artificial timeout. Polls indefinitely until all
+        jobs reach a terminal state. Each job's own wall time is the
+        only exit condition.
+        
         Args:
             job_ids: List of job IDs to wait for
             poll_interval: Seconds between status checks
-            max_attempts: Maximum polling attempts
             
         Returns:
             Dict with status of all jobs
         """
         poll_interval = poll_interval or self.config.poll_interval
-        max_attempts = max_attempts or self.config.max_poll_attempts
         
         remaining = set(str(j) for j in job_ids)
         results = {}
         
-        for attempt in range(max_attempts):
+        while remaining:
             newly_completed = []
             
             for job_id in remaining:
@@ -1005,21 +1003,6 @@ class SlurmTools:
                 }
             
             time.sleep(poll_interval)
-        
-        # Timeout - return what we have
-        for job_id in remaining:
-            results[job_id] = {
-                "success": False,
-                "job_id": job_id,
-                "error": "Timeout"
-            }
-        
-        return {
-            "success": False,
-            "all_completed": False,
-            "jobs": results,
-            "timed_out": list(remaining)
-        }
     
     def cancel_job(self, job_id: str) -> Dict[str, Any]:
         """Cancel a running or pending job"""

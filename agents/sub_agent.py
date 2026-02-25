@@ -1,5 +1,5 @@
 """
-Script-First Sub-Agent v1.2.6 — 4-Phase Lifecycle with Diagnostic Agent
+Script-First Sub-Agent v1.2.7 — 4-Phase Lifecycle with Diagnostic Agent
 
 Features:
 - DUAL CLUSTER ROUTING: AGI_CLUSTER (CPU) + AGI_GPU_CLUSTER (GPU subtasks)
@@ -2416,15 +2416,21 @@ ADD_PIP: package_name==version"""
             return {'success': False, 'error': str(e)}
 
     def _wait_for_job(self) -> Dict[str, Any]:
-        """Poll squeue until job completes."""
+        """Poll squeue until job completes.
+
+        v1.2.7: No artificial timeout. Polls indefinitely until SLURM
+        reports a terminal state. The SLURM job's own wall time limit
+        (--time in sbatch) is the only exit condition. This prevents
+        premature POLL_TIMEOUT failures when jobs sit in queue on a
+        busy cluster.
+        """
         if not self.checkpoint or not self.checkpoint.current_job_id:
             return {'success': False, 'error': 'No job ID'}
 
         job_id = self.checkpoint.current_job_id
         poll_interval = self.slurm_config.get('poll_interval', 30)
-        max_polls = self.slurm_config.get('max_poll_attempts', 8640)
 
-        for _ in range(max_polls):
+        while True:
             try:
                 result = subprocess.run(
                     ['squeue', '-j', job_id, '-h', '-o', '%T'],
@@ -2459,8 +2465,6 @@ ADD_PIP: package_name==version"""
                 pass
 
             time.sleep(poll_interval)
-
-        return {'success': False, 'state': 'POLL_TIMEOUT', 'job_id': job_id}
 
     def _collect_job_logs(self) -> Dict[str, str]:
         """Collect stdout/stderr from SLURM log files."""
