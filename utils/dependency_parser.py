@@ -305,7 +305,7 @@ RESPOND WITH ONLY a JSON object in this exact format (no other text, no markdown
 }}
 
 RULES:
-- Use ONLY conda-forge and bioconda channels (no defaults/main — commercial license).
+- Use ONLY public anaconda channels (no defaults/main — commercial license).
 - Put packages in pip_packages ONLY if they are genuinely not available on conda-forge or bioconda.
 - For R packages: use the R package name (e.g. "Seurat" not "r-seurat") — the YAML generator handles the prefix.
 - For system binaries: use the conda package name (e.g. "samtools" not "/usr/bin/samtools").
@@ -520,7 +520,7 @@ def generate_env_yaml(
     Returns:
         YAML string ready to write to a .yml file.
     """
-    ch = channels or ["conda-forge", "bioconda"]
+    ch = channels or ["conda-forge", "bioconda", "r", "plotly"]
 
     # Start building the conda deps list
     conda_deps: List[str] = []
