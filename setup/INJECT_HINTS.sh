@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# AGI Pipeline - Human Guidance Injection Tool (v1.2.5)
+# AGI Pipeline - Human Guidance Injection Tool (v1.2.8)
 # =============================================================================
 # Form-based tool for injecting guidance into failed pipeline steps before
 # a restart. Safely edits master_prompt_state.json via Python — no manual
@@ -13,22 +13,48 @@
 #   4. Skip the step             — mark completed to unblock downstream steps
 #   5. Reset and retry           — clear failed status, reset attempt count
 #
-# Changes are previewed before writing. Optionally deletes step checkpoints
-# to control which phases re-run on the next submission.
+# Changes are previewed before writing. Optionally clears the step checkpoint
+# (forces full restart from Phase 1) or just clears sbatch_path in the
+# checkpoint (Phase 3 regenerates and OVERWRITES the existing sbatch file).
+#
+# NOTE on sbatch handling (v1.2.8):
+#   slurm/scripts/ is now a PROTECTED directory — sbatch files are never
+#   deleted, only overwritten. The "delete_sbatch" checkpoint action clears
+#   the sbatch_path field in the checkpoint JSON only, which causes Phase 3
+#   to regenerate and overwrite the sbatch on the next run. The file itself
+#   is not removed.
 #
 # Usage:
-#   bash INJECT_HINTS.sh              # interactive
-#   bash INJECT_HINTS.sh --dry-run    # preview changes without writing
+#   bash INJECT_HINTS.sh                       # interactive
+#   bash INJECT_HINTS.sh --dry-run             # preview changes without writing
+#   bash INJECT_HINTS.sh --reset-step=step_03  # non-interactive single step reset
+#   bash INJECT_HINTS.sh --reset-all-envs      # non-interactive: force env rebuild
+#
+# Non-interactive flags:
+#   --reset-step=STEP_ID   Reset a specific step to pending and delete its
+#                          checkpoint. Skips the interactive form entirely.
+#                          Useful in scripts or after a targeted fix.
+#   --reset-all-envs       Walk all step checkpoints and set env_created=False.
+#                          Forces Phase 2 to rebuild every conda environment on
+#                          the next run. Scripts, sbatch files, and the manifest
+#                          are untouched. Use when envs are corrupted cluster-wide.
 #
 # Run from your project root directory.
 #
-# v1.2.4 fixes:
+# v1.2.4 fixes (carried forward):
 #   - read_single and read_multiline now open /dev/tty directly so they
 #     work inside a bash heredoc (stdin is consumed by the script itself)
 #   - All display output (menus, step info, prompts) uses display() which
 #     writes to stderr — visible on the terminal but not captured by the
 #     > "$INSTRUCTIONS_FILE" redirect on the heredoc
 #   - Only the final json.dumps() goes to stdout → instructions file
+#
+# v1.2.8 changes:
+#   - Added --reset-step=STEP_ID non-interactive flag
+#   - Added --reset-all-envs non-interactive flag
+#   - delete_sbatch checkpoint action now clears sbatch_path in checkpoint
+#     only (does NOT delete the actual file — slurm/scripts/ is protected)
+#   - Version bump throughout
 # =============================================================================
 
 set -euo pipefail
@@ -45,13 +71,22 @@ BOLD='\033[1m'
 NC='\033[0m'
 
 DRY_RUN=false
+RESET_STEP=""
+RESET_ALL_ENVS=false
+
 for arg in "$@"; do
     case "$arg" in
-        --dry-run) DRY_RUN=true ;;
+        --dry-run)          DRY_RUN=true ;;
+        --reset-all-envs)   RESET_ALL_ENVS=true ;;
+        --reset-step=*)     RESET_STEP="${arg#--reset-step=}" ;;
         --help|-h)
-            echo "Usage: bash INJECT_HINTS.sh [--dry-run]"
+            echo "Usage: bash INJECT_HINTS.sh [OPTIONS]"
             echo ""
-            echo "  --dry-run   Preview all changes without writing to disk"
+            echo "  --dry-run              Preview all changes without writing to disk"
+            echo "  --reset-step=STEP_ID   Non-interactively reset a step to pending"
+            echo "                         and delete its phase checkpoint."
+            echo "  --reset-all-envs       Non-interactively mark every step's conda"
+            echo "                         environment for rebuild on next run."
             echo ""
             echo "Run from your project root. Edits reports/master_prompt_state.json"
             echo "safely via Python to inject human guidance before a pipeline restart."
@@ -79,12 +114,169 @@ fi
 
 echo ""
 echo -e "${BLUE}============================================================${NC}"
-echo -e "${BLUE}  AGI Pipeline — Human Guidance Injection (v1.2.5)${NC}"
+echo -e "${BLUE}  AGI Pipeline — Human Guidance Injection (v1.2.8)${NC}"
 echo -e "${BLUE}============================================================${NC}"
 if [ "$DRY_RUN" = true ]; then
     echo -e "  Mode: ${YELLOW}DRY RUN — changes will be shown but not written${NC}"
 fi
 echo ""
+
+# =============================================================================
+# NON-INTERACTIVE: --reset-all-envs
+# =============================================================================
+# Walk every checkpoint in temp/checkpoints/ and set env_created=False.
+# This forces Phase 2 to rebuild all conda environments on the next run.
+# Scripts, sbatch files, and the output manifest are untouched.
+# =============================================================================
+
+if [ "$RESET_ALL_ENVS" = true ]; then
+    echo -e "  ${CYAN}→${NC} Mode: --reset-all-envs (non-interactive)"
+    echo ""
+
+    python3 - "$CHECKPOINT_DIR" "$DRY_RUN" <<'PYEOF'
+import json, sys, glob
+from pathlib import Path
+
+cp_dir  = Path(sys.argv[1])
+dry_run = sys.argv[2].lower() == "true"
+
+checkpoints = sorted(cp_dir.glob("*.json"))
+if not checkpoints:
+    print("  No checkpoints found — nothing to reset.")
+    sys.exit(0)
+
+count = 0
+for cp_path in checkpoints:
+    try:
+        with open(cp_path) as f:
+            cp = json.load(f)
+    except Exception as e:
+        print(f"  ⚠  Could not read {cp_path.name}: {e}")
+        continue
+
+    task_id     = cp.get("task_id", cp_path.stem)
+    was_created = cp.get("env_created", False)
+    env_name    = cp.get("env_name", "")
+
+    if was_created or env_name:
+        cp["env_created"] = False
+        marker = "✓" if not dry_run else "(dry-run)"
+        print(f"  {marker}  {task_id:<30}  env_created → False  (env: {env_name})")
+        if not dry_run:
+            tmp = str(cp_path) + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(cp, f, indent=2)
+            Path(tmp).replace(cp_path)
+        count += 1
+    else:
+        print(f"  ○  {task_id:<30}  already False — skipped")
+
+print(f"\n  {'Would reset' if dry_run else 'Reset'} env_created on {count} checkpoint(s).")
+print("  Conda environments themselves are NOT removed.")
+print("  Phase 2 will rebuild them on the next pipeline run.")
+PYEOF
+
+    echo ""
+    if [ "$DRY_RUN" = true ]; then
+        echo -e "${YELLOW}Dry run complete — no files were written.${NC}"
+    else
+        echo -e "${GREEN}Done. Resubmit to trigger Phase 2 env rebuild for all steps.${NC}"
+        echo -e "  ${CYAN}sbatch RUN_AGI_PIPELINE_GPU.sh${NC}"
+    fi
+    echo ""
+    exit 0
+fi
+
+# =============================================================================
+# NON-INTERACTIVE: --reset-step=STEP_ID
+# =============================================================================
+# Reset a single named step to pending and delete its checkpoint.
+# The step's scripts, sbatch, env YAML, and conda environment are untouched.
+# =============================================================================
+
+if [ -n "$RESET_STEP" ]; then
+    echo -e "  ${CYAN}→${NC} Mode: --reset-step=${RESET_STEP} (non-interactive)"
+    echo ""
+
+    python3 - "$STATE_FILE" "$CHECKPOINT_DIR" "$RESET_STEP" "$DRY_RUN" <<'PYEOF'
+import json, sys, re
+from pathlib import Path
+from datetime import datetime
+
+state_file = sys.argv[1]
+cp_dir     = Path(sys.argv[2])
+step_id    = sys.argv[3]
+dry_run    = sys.argv[4].lower() == "true"
+
+with open(state_file) as f:
+    state = json.load(f)
+
+steps = state.get("steps", {})
+if step_id not in steps:
+    print(f"  ERROR: Step '{step_id}' not found in state file.")
+    print(f"  Available: {', '.join(steps.keys())}")
+    sys.exit(1)
+
+step = steps[step_id]
+old_status = step.get("status", "unknown")
+
+# Reset step status
+step["status"]       = "pending"
+step["attempts"]     = 0
+step["last_updated"] = datetime.now().isoformat()
+step.pop("error_summary", None)
+steps[step_id] = step
+
+print(f"  Step:    {step_id}")
+print(f"  Status:  {old_status} → pending")
+print(f"  Attempts reset to 0")
+
+# Delete checkpoint
+safe_id  = re.sub(r"[^\w\-]", "_", step_id)[:50]
+cp_file  = cp_dir / f"{safe_id}_checkpoint.json"
+if not cp_file.exists():
+    # Try bare step_id
+    cp_file2 = cp_dir / f"{step_id}_checkpoint.json"
+    if cp_file2.exists():
+        cp_file = cp_file2
+
+if cp_file.exists():
+    print(f"  Checkpoint: {cp_file.name} → deleted")
+    if not dry_run:
+        cp_file.unlink()
+else:
+    print(f"  Checkpoint: not found (already clean)")
+
+# Write state
+if not dry_run:
+    state["steps"] = steps
+    state["last_updated"] = datetime.now().isoformat()
+    tmp = state_file + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=2)
+    Path(tmp).replace(state_file)
+    print(f"\n  ✅ Written: {state_file}")
+else:
+    print(f"\n  DRY RUN — no files written.")
+PYEOF
+
+    echo ""
+    if [ "$DRY_RUN" = true ]; then
+        echo -e "${YELLOW}Dry run complete — no files were written.${NC}"
+    else
+        echo -e "${GREEN}Done. Step '${RESET_STEP}' will restart from Phase 1 on next run.${NC}"
+        echo ""
+        echo "  Recommended next steps:"
+        echo -e "  1. ${CYAN}bash PARTIAL_CLEAN_PROJECT.sh --yes${NC}   (clear old logs)"
+        echo -e "  2. ${CYAN}sbatch RUN_AGI_PIPELINE_GPU.sh${NC}        (resubmit)"
+    fi
+    echo ""
+    exit 0
+fi
+
+# =============================================================================
+# INTERACTIVE MODE (default)
+# =============================================================================
 
 # ---------------------------------------------------------------------------
 # Show pipeline state and collect failed step IDs
@@ -139,6 +331,10 @@ FAILED_ID_LIST=$(echo "$FAILED_STEPS" | grep "^__FAILED__:" | sed 's/__FAILED__:
 
 if [ -z "$FAILED_ID_LIST" ] || [ "$FAILED_ID_LIST" = "" ]; then
     echo -e "${GREEN}No failed or blocked steps found. Nothing to inject.${NC}"
+    echo ""
+    echo "  For non-interactive resets, try:"
+    echo -e "    ${CYAN}bash INJECT_HINTS.sh --reset-step=step_N${NC}"
+    echo -e "    ${CYAN}bash INJECT_HINTS.sh --reset-all-envs${NC}"
     exit 0
 fi
 
@@ -273,7 +469,8 @@ PHASE_MENU = """
   Checkpoint action:
     1) Delete checkpoint          — force full restart from Phase 1 (script generation)
     2) Keep checkpoint            — resume from where it left off
-    3) Delete only sbatch         — keep env + script, regenerate sbatch only
+    3) Clear sbatch reference     — keep env + script, Phase 3 regenerates sbatch
+                                    (v1.2.8: overwrites existing file, does not delete)
 """
 
 # ---------------------------------------------------------------------------
@@ -302,7 +499,7 @@ for step_id in selected:
     if current_hints:
         display(f"  Existing hints ({len(current_hints)}): {current_hints[0][:80]}...")
 
-    # v1.2.5: Show phase log path and last 5 lines for Phase 1/2/3 failures.
+    # Show phase log path and last 5 lines for Phase 1/2/3 failures.
     # Phase 4 failures have SLURM logs in slurm/logs/ instead.
     import os
     from pathlib import Path as _Path
@@ -325,7 +522,6 @@ for step_id in selected:
             display(f"    (could not read log: {e})")
         display(f"  To read full log: cat logs/steps/{step_id}_phases.log")
     else:
-        # Only mention if the step actually failed at Phase 1/2/3
         status = step.get('status', '')
         err_text = step.get('error_summary', '')
         is_phase123_failure = (
@@ -339,7 +535,7 @@ for step_id in selected:
             display(f"")
             display(f"  Phase log: not found at logs/steps/{step_id}_phases.log")
             display(f"  (log is created on next run — this step has not run "
-                    f"under v1.2.5 yet)")
+                    f"under v1.2.5+ yet)")
 
     display(f"{'='*60}")
 
@@ -365,14 +561,14 @@ for step_id in selected:
             "  Examples:\n"
             "    Use scanpy.read_h5ad(sys.argv[1]) to load the input\n"
             "    The AnnData object uses obs['cell_type'] not obs['celltype']\n"
-            "    Save output to data/outputs/analysis/processed/ not scripts/"
+            "    Save output to outputs/step_03/ not scripts/"
         )
         instr["hints"] = hints
 
         display(PHASE_MENU)
         cp = read_single("Checkpoint action", "1").strip()
         instr["checkpoint_action"] = {
-            "1": "delete", "2": "keep", "3": "delete_sbatch"
+            "1": "delete", "2": "keep", "3": "clear_sbatch_ref"
         }.get(cp, "delete")
 
     # ── Option 2: Fix input file paths ──────────────────────────────────────
@@ -396,8 +592,8 @@ for step_id in selected:
         display(PHASE_MENU)
         cp = read_single("Checkpoint action", "3").strip()
         instr["checkpoint_action"] = {
-            "1": "delete", "2": "keep", "3": "delete_sbatch"
-        }.get(cp, "delete_sbatch")
+            "1": "delete", "2": "keep", "3": "clear_sbatch_ref"
+        }.get(cp, "clear_sbatch_ref")
 
     # ── Option 3: Override approach ──────────────────────────────────────────
     elif choice == "3":
@@ -412,7 +608,7 @@ for step_id in selected:
         display(PHASE_MENU)
         cp = read_single("Checkpoint action", "1").strip()
         instr["checkpoint_action"] = {
-            "1": "delete", "2": "keep", "3": "delete_sbatch"
+            "1": "delete", "2": "keep", "3": "clear_sbatch_ref"
         }.get(cp, "delete")
 
     # ── Option 4: Skip step ──────────────────────────────────────────────────
@@ -431,7 +627,7 @@ for step_id in selected:
         display(PHASE_MENU)
         cp = read_single("Checkpoint action", "2").strip()
         instr["checkpoint_action"] = {
-            "1": "delete", "2": "keep", "3": "delete_sbatch"
+            "1": "delete", "2": "keep", "3": "clear_sbatch_ref"
         }.get(cp, "keep")
 
     # ── Option 6 / default: no change ───────────────────────────────────────
@@ -573,13 +769,12 @@ for instr in instructions:
     # ── checkpoint action ─────────────────────────────────────────────────
     import re
     cp_action = instr.get('checkpoint_action', 'keep')
-    safe_id   = step_id.replace('/', '_').replace(' ', '_')
+    safe_id   = re.sub(r'[^\w\-]', '_', step_id)[:50]
     cp_file   = cp_dir / f"{safe_id}_checkpoint.json"
 
     # Try alternate naming pattern if first not found
     if not cp_file.exists():
-        safe_id2 = re.sub(r'[^\w\-]', '_', step_id)[:50]
-        cp_file2 = cp_dir / f"{safe_id2}_checkpoint.json"
+        cp_file2 = cp_dir / f"{step_id}_checkpoint.json"
         if cp_file2.exists():
             cp_file = cp_file2
 
@@ -591,23 +786,27 @@ for instr in instructions:
         else:
             step_changes.append("Checkpoint not found (already clean)")
 
-    elif cp_action == "delete_sbatch":
+    elif cp_action == "clear_sbatch_ref":
+        # v1.2.8: slurm/scripts/ is a PROTECTED directory — sbatch files are
+        # never deleted, only overwritten. This action clears only the
+        # sbatch_path field in the checkpoint JSON. Phase 3 will then
+        # regenerate and OVERWRITE the existing sbatch file on the next run.
         if cp_file.exists():
             try:
                 with open(cp_file) as f:
                     cp = json.load(f)
                 sbatch = cp.get('sbatch_path')
-                if sbatch and Path(sbatch).exists():
-                    step_changes.append(f"Sbatch deleted: {Path(sbatch).name}")
+                if sbatch:
+                    cp['sbatch_path'] = None
+                    step_changes.append(
+                        f"Checkpoint sbatch_path cleared "
+                        f"(Phase 3 will overwrite: {Path(sbatch).name})"
+                    )
                     if not dry_run:
-                        Path(sbatch).unlink()
-                cp['sbatch_path'] = None
-                step_changes.append(
-                    "Checkpoint sbatch_path cleared (Phase 3 will regenerate)"
-                )
-                if not dry_run:
-                    with open(cp_file, 'w') as f:
-                        json.dump(cp, f, indent=2)
+                        with open(cp_file, 'w') as f:
+                            json.dump(cp, f, indent=2)
+                else:
+                    step_changes.append("Checkpoint sbatch_path already empty")
             except Exception as e:
                 step_changes.append(f"WARNING: Could not update checkpoint: {e}")
         else:

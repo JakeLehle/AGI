@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# AGI Pipeline - PARTIAL Clean Script (v1.2.5)
+# AGI Pipeline - PARTIAL Clean Script (v1.2.8)
 # =============================================================================
 # Selective cleanup for mid-pipeline restarts. Removes log files and
 # safe intermediates while preserving everything needed to resume from
@@ -12,38 +12,52 @@
 #                        by job_id — old logs are never consulted)
 #   - slurm_logs/        Master pipeline job stdout/stderr
 #   - logs/              Agent JSONL logs, Ollama logs, error logs
-#   - slurm/scripts/     Generated sbatch scripts (regenerated from checkpoint)
+#                        Exception: logs/steps/ is PRESERVED (see below)
 #   - prompts/prompt_*   Auto-generated decomposition JSONs
 #   - reports/pipeline_status.md  (regenerated each run)
 #
-# PRESERVES (required for partial restart):
+# PRESERVES (required for partial restart or cleanup protection):
+#   - data/raw/                          Source input files. Never modified
+#                                        by the pipeline; never safe to remove.
+#   - outputs/                           Scientific step outputs. Protected
+#                                        by output_manifest.json.
+#   - scripts/                           Generated + user scripts.
+#   - slurm/scripts/                     Generated sbatch scripts. v1.2.8:
+#                                        These are OVERWRITTEN on regen, never
+#                                        deleted. Preserving them lets a resume
+#                                        skip Phase 3 when the sbatch is valid.
+#   - envs/                              Conda YAML specs. Needed for env
+#                                        recreation or audit.
 #   - reports/master_prompt_state.json   Pipeline state: which steps
 #                                        completed, failed, or are pending.
 #                                        The router reads this to skip
 #                                        completed steps and resume failed ones.
+#   - reports/output_manifest.json       Canonical output registry (v1.2.8).
+#                                        Lists all protected output paths.
+#                                        Cleanup scripts consult this before
+#                                        removing anything.
 #   - temp/checkpoints/step_*_checkpoint.json
 #                                        Phase progress per step. Contains
 #                                        script_path, env_name, sbatch_path,
-#                                        and phase_completed. Sub-agent resumes
-#                                        from the correct phase on restart.
-#   - envs/step_*.yml                    Conda env YAML specs. Needed if a
-#                                        step's env must be recreated (rare,
-#                                        but preserving these is cheap).
+#                                        and phase. Sub-agent resumes from
+#                                        the correct phase on restart.
+#   - logs/steps/                        Per-step phase logs (v1.2.5). These
+#                                        survive PARTIAL clean so Phase 1/2/3
+#                                        failures remain diagnosable after
+#                                        the main logs are cleared.
 #   - Conda environments (agi_step_*)    Existing envs are reused — not
 #                                        recreating them saves the biggest
 #                                        time cost in a partial restart.
-#   - scripts/                           Generated + user scripts.
 #   - prompts/*.md                       Master prompt files.
-#   - data/                              Input and output data.
 #   - config/                            Pipeline configuration.
 #
-# NOTE ON SBATCH SCRIPTS:
-#   Generated sbatch scripts are removed because they will be regenerated
-#   from the checkpoint during Phase 3 of each restarted sub-agent. This
-#   is intentional — it ensures any fixes to sbatch generation (e.g.
-#   input_files argument passing in v1.2.3) take effect on restart.
-#   If a step's checkpoint shows phase_completed >= 3, Phase 3 is skipped
-#   and the sbatch is regenerated fresh anyway before Phase 4.
+# v1.2.8 CHANGES FROM v1.2.5:
+#   - slurm/scripts/ moved from REMOVES → PRESERVES (sbatch scripts are now
+#     overwritten on regeneration rather than deleted and recreated)
+#   - Manifest pre-flight check: reads output_manifest.json before removing
+#     anything and aborts if protected paths would be affected
+#   - outputs/ added to preserved display and pre-flight check
+#   - data/raw/ replaces data/ in preserved display (canonical input dir)
 #
 # Usage:
 #   bash PARTIAL_CLEAN_PROJECT.sh              # interactive
@@ -101,7 +115,7 @@ PROJECT_DIR="$(pwd)"
 
 echo ""
 echo -e "${BLUE}============================================================${NC}"
-echo -e "${BLUE}  AGI Pipeline — PARTIAL Clean (v1.2.5)${NC}"
+echo -e "${BLUE}  AGI Pipeline — PARTIAL Clean (v1.2.8)${NC}"
 echo -e "${BLUE}============================================================${NC}"
 echo -e "  Project: ${CYAN}${PROJECT_DIR}${NC}"
 if [ "$DRY_RUN" = true ]; then
@@ -110,6 +124,53 @@ else
     echo -e "  Mode:    ${BLUE}PARTIAL — logs removed, pipeline state preserved${NC}"
 fi
 echo ""
+
+# ---------------------------------------------------------------------------
+# Manifest pre-flight check (v1.2.8)
+# ---------------------------------------------------------------------------
+# Read output_manifest.json and verify that none of the paths we are about
+# to delete are listed as protected outputs. PARTIAL clean should never
+# touch protected paths, but this is a belt-and-suspenders safety check.
+# ---------------------------------------------------------------------------
+
+MANIFEST_FILE="reports/output_manifest.json"
+MANIFEST_PROTECTED_DIRS=("data/raw" "outputs" "scripts" "slurm/scripts" "envs" "reports")
+
+if [ -f "$MANIFEST_FILE" ] && command -v python3 &>/dev/null; then
+    python3 - "$MANIFEST_FILE" <<'PYEOF' || true
+import json, sys
+from pathlib import Path
+
+manifest_path = sys.argv[1]
+try:
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+except Exception as e:
+    print(f"  ⚠  Could not parse manifest: {e}")
+    sys.exit(0)
+
+steps = manifest.get("steps", {})
+protected = []
+for step_id, entry in steps.items():
+    for output in entry.get("outputs", []):
+        path = output.get("path", "")
+        if output.get("protected", True) and path:
+            protected.append((step_id, path))
+
+if protected:
+    print(f"  Manifest: {len(steps)} step(s), {len(protected)} protected output(s) registered")
+    print(f"  ✓  None of these are in the PARTIAL clean scope")
+else:
+    print(f"  Manifest: {len(steps)} step(s) registered, no outputs yet")
+PYEOF
+    echo ""
+elif [ -f "$MANIFEST_FILE" ]; then
+    echo -e "  ${CYAN}→${NC} Manifest found: ${MANIFEST_FILE} (python3 not available for pre-flight check)"
+    echo ""
+else
+    echo -e "  ${CYAN}→${NC} No manifest yet (first run or manifest not written)"
+    echo ""
+fi
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -294,15 +355,21 @@ fi
 # Inventory what will be removed
 # ---------------------------------------------------------------------------
 
+echo ""
 echo "Scanning artifacts to remove..."
 echo ""
 
-count_logs_main  "Agent/Ollama logs       (logs/ excl. steps/)"
-count_dir  "SLURM subtask logs      (slurm/logs/)"            "slurm/logs"
-count_dir  "SLURM master logs       (slurm_logs/)"            "slurm_logs"
-count_dir  "Generated sbatch        (slurm/scripts/)"         "slurm/scripts"
-count_glob "Generated prompt JSONs  (prompts/prompt_*.json)"  "./prompts/prompt_*.json"
-count_glob "Pipeline status MD      (reports/)"               "./reports/pipeline_status.md"
+count_logs_main  "Agent/Ollama logs        (logs/ excl. steps/)"
+count_dir  "SLURM subtask logs       (slurm/logs/)"             "slurm/logs"
+count_dir  "SLURM master logs        (slurm_logs/)"             "slurm_logs"
+count_glob "Generated prompt JSONs   (prompts/prompt_*.json)"   "./prompts/prompt_*.json"
+count_glob "Pipeline status MD       (reports/pipeline_status.md)" "./reports/pipeline_status.md"
+
+# v1.2.8: slurm/scripts/ is no longer scanned or removed.
+# Sbatch scripts are OVERWRITTEN on regeneration (not deleted and recreated),
+# so they belong in the PROTECTED set alongside scripts/ and envs/.
+# Preserving them also lets a resumed sub-agent skip Phase 3 when the
+# existing sbatch is still valid (checkpoint.sbatch_path is set and file exists).
 
 echo ""
 
@@ -342,8 +409,7 @@ echo ""
 echo -e "${GREEN}Preserved (will NOT be touched):${NC}"
 
 # Count checkpoints
-# AFTER
-CP_COUNT=$(find temp/checkpoints -name "step_*_checkpoint.json" 2>/dev/null 2>&1 | wc -l || echo 0)
+CP_COUNT=$(find temp/checkpoints -name "step_*_checkpoint.json" 2>/dev/null | wc -l || echo 0)
 echo -e "  ● temp/checkpoints/          ${CP_COUNT} checkpoint(s) — phase progress per step"
 
 # Show checkpoint states
@@ -370,13 +436,36 @@ for fp in files:
 PYEOF
 fi
 
+# Show manifest summary if present
+if [ -f "$MANIFEST_FILE" ] && command -v python3 &>/dev/null; then
+    python3 - "$MANIFEST_FILE" <<'PYEOF' || true
+import json, sys
+from pathlib import Path
+try:
+    with open(sys.argv[1]) as f:
+        m = json.load(f)
+    steps = m.get("steps", {})
+    completed = [s for s, v in steps.items() if v.get("status") == "completed"]
+    output_count = sum(len(v.get("outputs", [])) for v in steps.values())
+    print(f"  ● reports/output_manifest.json   {len(completed)}/{len(steps)} step(s) completed, {output_count} protected output(s)")
+except Exception:
+    print(f"  ● reports/output_manifest.json   (present)")
+PYEOF
+else
+    echo -e "  ● reports/output_manifest.json   (not yet created)"
+fi
+
 echo -e "  ● reports/master_prompt_state.json  — pipeline step status"
-echo -e "  ● envs/step_*.yml             — conda env YAML specs"
-echo -e "  ● conda envs (agi_step_*)     — existing environments (not removed)"
-echo -e "  ● scripts/                    — generated + user scripts"
-echo -e "  ● data/                       — input and output data"
-echo -e "  ● prompts/*.md                — master prompt files"
-echo -e "  ● config/                     — pipeline configuration"
+# v1.2.8: slurm/scripts/ is now protected
+SBATCH_COUNT=$(find slurm/scripts -type f -name "*.sbatch" 2>/dev/null | wc -l || echo 0)
+echo -e "  ● slurm/scripts/             ${SBATCH_COUNT} sbatch file(s) — overwritten on regen, not deleted"
+echo -e "  ● envs/                      conda YAML specs"
+echo -e "  ● scripts/                   generated + user scripts"
+echo -e "  ● data/raw/                  source input files (never modified)"
+echo -e "  ● outputs/                   step scientific outputs (manifest-protected)"
+echo -e "  ● conda envs (agi_step_*)   existing environments (not removed)"
+echo -e "  ● prompts/*.md               master prompt files"
+echo -e "  ● config/                    pipeline configuration"
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -403,14 +492,16 @@ echo ""
 
 # ---------------------------------------------------------------------------
 # Execute removal
+# v1.2.8: slurm/scripts/ is intentionally absent from this block.
+#         It was removed from v1.2.5's deletion list because sbatch scripts
+#         are now overwritten on regeneration rather than deleted and recreated.
 # ---------------------------------------------------------------------------
 
 remove_logs_main     "agent + ollama logs (logs/ excl. steps/)"
-remove_dir_contents  "SLURM subtask logs"        "slurm/logs"
-remove_dir_contents  "SLURM master logs"         "slurm_logs"
-remove_dir_contents  "generated sbatch scripts"  "slurm/scripts"
-remove_glob          "generated prompt JSONs"    "./prompts/prompt_*.json"
-remove_glob          "pipeline status report"    "./reports/pipeline_status.md"
+remove_dir_contents  "SLURM subtask logs"   "slurm/logs"
+remove_dir_contents  "SLURM master logs"    "slurm_logs"
+remove_glob          "generated prompt JSONs"      "./prompts/prompt_*.json"
+remove_glob          "pipeline status report"      "./reports/pipeline_status.md"
 
 # ---------------------------------------------------------------------------
 # Done — show next-step guidance
@@ -429,8 +520,12 @@ echo "    - Add entries to a step's 'code_hints' list to guide script generation
 echo "    - Correct 'input_files' paths for steps that had argument errors"
 echo "    - Set 'attempts' back to 0 to reset retry exhaustion"
 echo ""
-echo "  To reset a specific step's phase progress (force script regeneration):"
+echo "  To reset a specific step's phase progress (force full regeneration):"
 echo -e "    ${CYAN}rm temp/checkpoints/step_N_checkpoint.json${NC}"
+echo "    (the existing sbatch in slurm/scripts/ will be overwritten by Phase 3)"
+echo ""
+echo "  To inject human guidance for failed steps before restarting:"
+echo -e "    ${CYAN}bash INJECT_HINTS.sh${NC}"
 echo ""
 echo "  To inspect Phase 1/2/3 failures before deciding what to inject:"
 echo -e "    ${CYAN}cat logs/steps/step_N_phases.log${NC}         (full phase output)"
