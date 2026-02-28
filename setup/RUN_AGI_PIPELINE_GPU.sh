@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=agi-pipeline
-#SBATCH --partition=gpu1v100
+#SBATCH --partition=gpu2v100
 #SBATCH --account=sdz852
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -512,7 +512,7 @@ PYEOF
 # killed via trap on any exit (normal, error, or SLURM cancellation).
 # ============================================================================
 
-HEARTBEAT_INTERVAL_MINUTES="${HEARTBEAT_INTERVAL_MINUTES:-10}"
+HEARTBEAT_INTERVAL_MINUTES="${HEARTBEAT_INTERVAL_MINUTES:-5}"
 HEARTBEAT_PID=""
 
 keepalive_heartbeat() {
@@ -577,22 +577,31 @@ PYSTEP
         active_count=$(echo "${active_jobs}" | wc -w)
 
         # --- GPU compute touch ---
-        local gpu_status="skipped (torch not available)"
-        if python3 -c "import torch; assert torch.cuda.is_available()" \
-                2>/dev/null; then
-            python3 - 2>/dev/null <<'PYGPU'
-import torch
+        # v1.2.7: Hold VRAM for 3s so nvidia-smi poller has a guaranteed
+        # sampling window. Previous 1ms burst was too short to register.
+        # Stderr is no longer suppressed so CUDA failures appear in SLURM log.
+        local gpu_status
+        gpu_status=$(python3 2>&1 <<'PYGPU'
+import sys, time, torch
+
+if not torch.cuda.is_available():
+    print("WARN: CUDA not available - GPU touch skipped", file=sys.stderr)
+    print("cuda_unavailable")
+    sys.exit(0)
+
 try:
-    x = torch.randn(1000, 1000, device='cuda')
-    _ = torch.mm(x, x)
+    x = torch.randn(2048, 2048, device='cuda')
+    for _ in range(5):
+        _ = torch.mm(x, x)
+    time.sleep(3)   # Hold VRAM allocated across monitoring poll window
     del x
     torch.cuda.empty_cache()
     print("ok")
 except Exception as e:
+    print(f"error: {e}", file=sys.stderr)
     print(f"error: {e}")
 PYGPU
-            gpu_status="touch complete"
-        fi
+        )
 
         # --- Write heartbeat block to stdout ---
         echo ""

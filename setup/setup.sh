@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# AGI Multi-Agent Pipeline v3.2 - Project Directory Setup
+# AGI Multi-Agent Pipeline v1.2.8 - Project Directory Setup
 # =============================================================================
 # Initializes a NEW project directory for the AGI multi-agent system.
 # Run this from inside the empty (or existing) project directory.
@@ -8,10 +8,17 @@
 # What it does:
 #   1. Creates the expected folder structure
 #   2. Copies RUN and CLEAN scripts from the AGI repo (with paths filled in)
-#   3. Creates project.yaml with v3.2 defaults
+#   3. Creates project.yaml with v1.2.8 defaults
 #   4. Creates .gitignore
 #   5. Generates a project README.md
 #   6. Optionally initializes a Git repository
+#
+# v1.2.8 directory structure changes:
+#   - data/raw/       replaces data/inputs/ (protected input source)
+#   - outputs/        new top-level protected dir for step scientific outputs
+#   - logs/steps/     now created explicitly (was created on-the-fly by StepLogger)
+#   - reports/        protected (contains output_manifest.json)
+#   - data/outputs/   removed — step outputs now live in outputs/step_N/
 #
 # Usage:
 #   # Auto-detect AGI repo (works when script is in AGI/setup/):
@@ -140,13 +147,26 @@ fi
 if [ "$VERIFY_ONLY" = true ]; then
     print_header "Verifying Project Structure: ${PROJECT_NAME}"
 
+    # v1.2.8: Updated to reflect canonical directory structure
     expected_dirs=(
-        "agents" "config" "conda_env"
-        "data/inputs" "data/outputs"
-        "envs" "logs" "prompts" "reports" "scripts"
-        "slurm/logs" "slurm/scripts" "slurm_logs"
+        "agents"
+        "config"
+        "conda_env"
+        "data/raw"
+        "envs"
+        "logs"
+        "logs/steps"
+        "outputs"
+        "prompts"
+        "reports"
+        "scripts"
+        "slurm/logs"
+        "slurm/scripts"
+        "slurm_logs"
         "temp/checkpoints"
-        "tools/dynamic_tools" "utils" "workflows"
+        "tools/dynamic_tools"
+        "utils"
+        "workflows"
     )
 
     all_present=true
@@ -167,13 +187,22 @@ if [ "$VERIFY_ONLY" = true ]; then
     fi
 
     echo ""
-    for f in project.yaml RUN_AGI_PIPELINE_GPU.sh RUN_AGI_PIPELINE_CPU.sh CLEAN_PROJECT.sh; do
+    for f in project.yaml RUN_AGI_PIPELINE_GPU.sh RUN_AGI_PIPELINE_CPU.sh \
+              FULL_CLEAN_PROJECT.sh PARTIAL_CLEAN_PROJECT.sh INJECT_HINTS.sh; do
         if [ -f "$f" ]; then
             print_success "$f"
         else
             print_warning "$f (missing)"
         fi
     done
+
+    # v1.2.8: Check that the manifest exists if the pipeline has run
+    echo ""
+    if [ -f "reports/output_manifest.json" ]; then
+        print_success "reports/output_manifest.json (manifest present)"
+    else
+        print_info "reports/output_manifest.json (will be created on first pipeline run)"
+    fi
 
     echo ""
     if [ -d ".git" ]; then
@@ -221,6 +250,22 @@ fi
 # =============================================================================
 print_header "Step 1: Creating Directory Structure"
 
+# v1.2.8: Canonical directory structure.
+#
+# PROTECTED (never touched by any cleanup script):
+#   data/raw/       — source input files, provided by user
+#   outputs/        — scientific step outputs (outputs/step_N/ per step)
+#   envs/           — conda YAML specs (overwritten on regen, never deleted)
+#   scripts/        — generated analysis scripts (overwritten, never deleted)
+#   slurm/scripts/  — generated sbatch files (overwritten, never deleted)
+#   reports/        — pipeline state + output_manifest.json
+#
+# CLEANABLE (safe to remove between runs):
+#   slurm/logs/     — SLURM job stdout/stderr (PARTIAL_CLEAN removes these)
+#   logs/           — agent + pipeline logs (PARTIAL_CLEAN removes these)
+#   logs/steps/     — per-step phase logs (PARTIAL_CLEAN removes these)
+#   temp/           — checkpoints and ephemeral files
+
 directories=(
     # Pipeline infrastructure (Python packages)
     "agents"
@@ -236,12 +281,19 @@ directories=(
     "scripts/example_reference_scripts"
     "conda_env"
 
-    # Data I/O — IGNORED
-    "data/inputs"
-    "data/outputs"
+    # Input data — PROTECTED, never cleaned
+    # v1.2.8: data/raw/ replaces data/inputs/ as the canonical input location.
+    # data/ is INPUT ONLY — the pipeline never writes outputs here.
+    "data/raw"
+
+    # Step scientific outputs — PROTECTED, never cleaned
+    # v1.2.8: outputs/ is the canonical location for all step outputs.
+    # Each step gets its own subdirectory: outputs/step_N/
+    "outputs"
 
     # Runtime artifacts — IGNORED
     "logs"
+    "logs/steps"
     "reports"
     "envs"
 
@@ -269,8 +321,11 @@ for pkg in agents tools workflows utils; do
     [ ! -f "$init" ] && touch "$init" && print_info "Created: $init"
 done
 
-# .gitkeep for tracked empty directories
-for dir in config prompts scripts slurm/scripts conda_env; do
+# .gitkeep for tracked empty directories that would otherwise be gitignored.
+# reports/ gets a .gitkeep so the directory is committed even though its
+# contents (logs, state JSON) are ignored — the manifest lives here and
+# the directory must exist before the first pipeline run.
+for dir in config prompts scripts slurm/scripts conda_env reports outputs; do
     gk="${dir}/.gitkeep"
     [ ! -f "$gk" ] && touch "$gk"
 done
@@ -299,8 +354,8 @@ copy_and_patch() {
 
     cp "$src" "$dst"
 
-    # Patch the PROMPT_FILE, PROJECT_DIR, AGI_ROOT, AGI_DATA_DIR placeholders
-    # to point at this project. Uses | delimiter to avoid / escaping issues.
+    # Patch PROMPT_FILE, PROJECT_DIR, AGI_ROOT placeholders to point at this
+    # project. Uses | delimiter to avoid / escaping issues.
     sed -i "s|PROMPT_FILE=\"\${PROMPT_FILE:-[^}]*}\"|PROMPT_FILE=\"\${PROMPT_FILE:-${PROJECT_DIR}/prompts/YOUR_PROMPT.md}\"|" "$dst" 2>/dev/null || true
     sed -i "s|PROJECT_DIR=\"\${PROJECT_DIR:-[^}]*}\"|PROJECT_DIR=\"\${PROJECT_DIR:-${PROJECT_DIR}}\"|" "$dst" 2>/dev/null || true
     sed -i "s|AGI_ROOT=\"\${AGI_ROOT:-[^}]*}\"|AGI_ROOT=\"\${AGI_ROOT:-${AGI_ROOT}}\"|" "$dst" 2>/dev/null || true
@@ -308,7 +363,27 @@ copy_and_patch() {
     print_success "Copied: $desc → $dst"
 }
 
+copy_straight() {
+    local src="$1"
+    local dst="$2"
+    local desc="$3"
+
+    if [ ! -f "$src" ]; then
+        print_warning "Source not found: $src"
+        return
+    fi
+
+    if [ -f "$dst" ] && [ "$FORCE" = false ]; then
+        print_success "Exists: $dst (use --force to overwrite)"
+        return
+    fi
+
+    cp "$src" "$dst"
+    print_success "Copied: $desc → $dst"
+}
+
 if [ -n "$AGI_ROOT" ]; then
+    # RUN scripts — patched with project-specific paths
     copy_and_patch \
         "$AGI_ROOT/setup/RUN_AGI_PIPELINE_GPU.sh" \
         "RUN_AGI_PIPELINE_GPU.sh" \
@@ -319,14 +394,32 @@ if [ -n "$AGI_ROOT" ]; then
         "RUN_AGI_PIPELINE_CPU.sh" \
         "CPU pipeline script"
 
-    # CLEAN_PROJECT.sh — straight copy, no patching needed
+    # v1.2.8: Copy all three project management scripts.
+    # FULL and PARTIAL clean replace the old monolithic CLEAN_PROJECT.sh.
+    # INJECT_HINTS is the human guidance injection tool.
+    # These are straight copies — no path patching needed (they use $(pwd)).
+    copy_straight \
+        "$AGI_ROOT/setup/FULL_CLEAN_PROJECT.sh" \
+        "FULL_CLEAN_PROJECT.sh" \
+        "Full clean script"
+
+    copy_straight \
+        "$AGI_ROOT/setup/PARTIAL_CLEAN_PROJECT.sh" \
+        "PARTIAL_CLEAN_PROJECT.sh" \
+        "Partial clean script"
+
+    copy_straight \
+        "$AGI_ROOT/setup/INJECT_HINTS.sh" \
+        "INJECT_HINTS.sh" \
+        "Human guidance injection tool"
+
+    # Backward-compat shim: if the old CLEAN_PROJECT.sh is still present in
+    # the AGI repo, copy it too so existing muscle memory still works.
     if [ -f "$AGI_ROOT/setup/CLEAN_PROJECT.sh" ]; then
-        if [ ! -f "CLEAN_PROJECT.sh" ] || [ "$FORCE" = true ]; then
-            cp "$AGI_ROOT/setup/CLEAN_PROJECT.sh" "CLEAN_PROJECT.sh"
-            print_success "Copied: CLEAN_PROJECT.sh"
-        else
-            print_success "Exists: CLEAN_PROJECT.sh"
-        fi
+        copy_straight \
+            "$AGI_ROOT/setup/CLEAN_PROJECT.sh" \
+            "CLEAN_PROJECT.sh" \
+            "Legacy clean script (use PARTIAL or FULL instead)"
     fi
 else
     print_warning "AGI_ROOT not detected — skipping script copy"
@@ -417,14 +510,30 @@ GITIGNORE=".gitignore"
 if should_create "$GITIGNORE"; then
     cat > "$GITIGNORE" << 'EOF'
 # =============================================================================
-# AGI Pipeline .gitignore
+# AGI Pipeline .gitignore — v1.2.8
 # Track: config, prompts, scripts, conda_env specs
-# Ignore: data, logs, reports, temp, runtime artifacts
+# Ignore: data, logs, outputs (large scientific files), temp, runtime state
+#
+# Protected directories (never cleaned by scripts, but gitignored because
+# they contain large binary files):
+#   outputs/     — step scientific outputs (h5ad, RDS, BAM, etc.)
+#   data/        — input source files
+#
+# reports/ is partially tracked: the directory itself is committed via
+# .gitkeep, but its contents (state JSON, manifest) are gitignored.
+# The exception is output_manifest.json which is explicitly unignored
+# so the manifest can optionally be committed for reproducibility.
 # =============================================================================
 
-# ── Data (large, sensitive) ──────────────────────────────────────────────────
+# ── Input data (large, sensitive) ─────────────────────────────────────────────
 data/
 !data/.gitkeep
+
+# ── Step scientific outputs (large binary files) ──────────────────────────────
+# v1.2.8: outputs/ is the canonical step output directory.
+# The directory itself is tracked via .gitkeep; contents are not.
+outputs/
+!outputs/.gitkeep
 
 # ── Logs ─────────────────────────────────────────────────────────────────────
 logs/
@@ -434,8 +543,11 @@ slurm/logs/
 slurm_logs/
 
 # ── Reports & runtime state ─────────────────────────────────────────────────
-reports/
+# The reports/ directory is tracked (via .gitkeep) but contents are not,
+# except output_manifest.json which can optionally be committed.
+reports/*
 !reports/.gitkeep
+!reports/output_manifest.json
 
 # ── Temp / checkpoints ──────────────────────────────────────────────────────
 temp/
@@ -466,7 +578,7 @@ venv/
 *.sqlite
 *.sqlite3
 
-# ── Conda env installs (but keep spec files) ────────────────────────────────
+# ── Conda env installs (but keep YAML specs) ─────────────────────────────────
 envs/*/
 
 # ── IDE / OS ─────────────────────────────────────────────────────────────────
@@ -504,7 +616,7 @@ models/
 *.gtf
 *.gff
 
-# ── Explicitly tracked (override ignores) ────────────────────────────────────
+# ── Explicitly tracked (override ignores above) ───────────────────────────────
 !.gitkeep
 !config/
 !config/**
@@ -539,7 +651,7 @@ if should_create "$README"; then
     cat > "$README" << 'READMEEOF'
 # PROJECT_NAME_PLACEHOLDER
 
-> AGI Multi-Agent Pipeline Project (v3.2)
+> AGI Multi-Agent Pipeline Project (v3.2 / v1.2.8)
 
 ## Quick Start
 
@@ -547,17 +659,20 @@ if should_create "$README"; then
 # 1. Activate the AGI environment
 conda activate AGI
 
-# 2. Write your master prompt
+# 2. Place your input data
+cp /path/to/your/data/* data/raw/
+
+# 3. Write your master prompt
 vi prompts/my_analysis.md
 
-# 3. Update RUN_AGI_PIPELINE_GPU.sh with your prompt path
+# 4. Update RUN_AGI_PIPELINE_GPU.sh with your prompt path
 #    (setup.sh fills in PROJECT_DIR and AGI_ROOT automatically)
 vi RUN_AGI_PIPELINE_GPU.sh
 
-# 4. Submit to the GPU queue
+# 5. Submit to the GPU queue
 sbatch RUN_AGI_PIPELINE_GPU.sh
 
-# 5. Monitor
+# 6. Monitor
 tail -f slurm_logs/agi_*.out
 squeue -u $USER
 ```
@@ -566,66 +681,86 @@ squeue -u $USER
 
 ```
 PROJECT/
-├── agents/                  # Agent __init__.py (pipeline infra)
-├── conda_env/               # Conda environment YAML specs (tracked)
-├── config/                  # Configuration files (tracked)
 ├── data/
-│   ├── inputs/              # Input data (NOT tracked)
-│   └── outputs/             # Output data (NOT tracked)
-├── envs/                    # Auto-generated step env specs (ignored)
-├── logs/                    # Agent + Ollama logs (ignored)
-├── prompts/                 # Master prompt .md files (tracked)
-├── reports/                 # Pipeline status reports (ignored)
-├── scripts/                 # User + generated scripts (tracked)
-│   └── example_reference_scripts/
+│   └── raw/                 # Input source files — NEVER cleaned or written to
+│
+├── outputs/                 # Step scientific outputs — NEVER cleaned
+│   ├── step_01/             # One subdirectory per pipeline step
+│   ├── step_02/
+│   └── ...
+│
+├── envs/                    # Conda YAML specs — NEVER deleted by cleanup
+├── scripts/                 # Generated analysis scripts — NEVER deleted by cleanup
+│
 ├── slurm/
-│   ├── logs/                # Subtask SLURM logs (ignored)
-│   └── scripts/             # Generated sbatch scripts (ignored)
-├── slurm_logs/              # Master job stdout/stderr (ignored)
+│   ├── scripts/             # Generated sbatch files — NEVER deleted by cleanup
+│   └── logs/                # SLURM job stdout/stderr — cleared by PARTIAL_CLEAN
+│
+├── logs/                    # Agent + pipeline logs — cleared by PARTIAL_CLEAN
+│   └── steps/               # Per-step phase logs — cleared by PARTIAL_CLEAN
+│
+├── reports/                 # Pipeline state — NEVER cleaned
+│   ├── master_prompt_state.json
+│   ├── output_manifest.json # Canonical output registry (v1.2.8)
+│   └── pipeline_report.md
+│
 ├── temp/
-│   └── checkpoints/         # Step checkpoint JSONs (ignored)
-├── tools/
-│   └── dynamic_tools/       # Agent-created tools (tracked)
-├── utils/                   # Utility __init__.py
-├── workflows/               # Workflow __init__.py
-├── project.yaml             # Project config (tracked)
-├── RUN_AGI_PIPELINE_GPU.sh  # GPU submission script (tracked)
-├── RUN_AGI_PIPELINE_CPU.sh  # CPU submission script (tracked)
-├── CLEAN_PROJECT.sh         # Cleanup script (tracked)
+│   └── checkpoints/         # Step checkpoint JSONs — cleared by PARTIAL_CLEAN
+│
+├── config/                  # Configuration files (tracked)
+├── conda_env/               # Conda environment YAML specs (tracked)
+├── prompts/                 # Master prompt .md files (tracked)
+├── slurm_logs/              # Master job stdout/stderr (ignored)
+├── project.yaml             # Project configuration (tracked)
+├── RUN_AGI_PIPELINE_GPU.sh  # Submit pipeline to GPU node
+├── RUN_AGI_PIPELINE_CPU.sh  # Submit to CPU-only cluster
+├── FULL_CLEAN_PROJECT.sh    # Full wipe for fresh start
+├── PARTIAL_CLEAN_PROJECT.sh # Log cleanup — preserves pipeline state
+├── INJECT_HINTS.sh          # Human guidance injection between runs
 └── README.md
 ```
 
-## Pipeline Scripts
+## Project Management Scripts
 
 | Script | Purpose |
 |--------|---------|
 | `RUN_AGI_PIPELINE_GPU.sh` | Submit master pipeline to GPU node (recommended) |
 | `RUN_AGI_PIPELINE_CPU.sh` | Submit to CPU-only cluster (zeus) |
-| `CLEAN_PROJECT.sh` | Remove stale logs, checkpoints, reports for fresh run |
-| `CLEAN_PROJECT.sh --dry-run` | Preview what would be cleaned |
+| `FULL_CLEAN_PROJECT.sh` | Complete wipe — removes all state, conda envs, cache. Use before a fresh start. |
+| `PARTIAL_CLEAN_PROJECT.sh` | Log cleanup only — preserves pipeline state, checkpoints, conda envs. Use between attempts. |
+| `INJECT_HINTS.sh` | Form-based human guidance injection for failed steps before restart. |
+
+All scripts support `--dry-run` to preview and `--yes` to skip confirmation.
+
+## Between-Run Workflow
+
+```bash
+# 1. Review what failed
+bash INJECT_HINTS.sh --dry-run
+
+# 2. Inject guidance for failed steps
+bash INJECT_HINTS.sh
+
+# 3. Clear logs, keep pipeline state
+bash PARTIAL_CLEAN_PROJECT.sh --yes
+
+# 4. Resubmit
+sbatch RUN_AGI_PIPELINE_GPU.sh
+```
+
+Use `FULL_CLEAN_PROJECT.sh` only when you want to restart completely from scratch.
 
 ## Configuration
 
 Edit `project.yaml` to customize model, SLURM defaults, and timeouts.
 Edit the RUN scripts to change cluster targets or resource requests.
 
-## Cleanup Between Runs
-
-```bash
-bash CLEAN_PROJECT.sh          # Interactive — shows what will be removed
-bash CLEAN_PROJECT.sh --yes    # Skip confirmation
-bash CLEAN_PROJECT.sh --dry-run  # Preview only
-```
-
-This removes logs, checkpoints, reports, generated prompts, and env specs.
-It preserves your master prompts, scripts, data, and configuration.
-
 ## Notes
 
-- Data files are NOT tracked (too large / sensitive)
-- Logs and reports are NOT tracked (regenerated each run)
-- Prompts, scripts, and config ARE tracked for reproducibility
-- Conda env specs in `conda_env/` ARE tracked
+- `data/raw/` and `outputs/` are NEVER touched by any cleanup script
+- `reports/output_manifest.json` tracks all output paths and protects them
+- Conda env YAML specs in `envs/` survive all cleanup operations
+- Generated scripts in `scripts/` survive all cleanup operations
 READMEEOF
 
     # Replace placeholder with actual project name
@@ -649,10 +784,13 @@ if [ "$SKIP_GIT" = false ]; then
         git init
         git branch -M main 2>/dev/null || true
         git add .
-        git commit -m "Initial commit: ${PROJECT_NAME} — AGI Pipeline v3.2 project
+        git commit -m "Initial commit: ${PROJECT_NAME} — AGI Pipeline v3.2 / v1.2.8 project
 
-Directory structure with dual-cluster SLURM support (ARC).
-Includes RUN scripts, cleanup script, and project config."
+v1.2.8 canonical directory structure:
+  - data/raw/   protected input source directory
+  - outputs/    protected step scientific output directory
+  - reports/    protected pipeline state + output manifest
+Includes RUN scripts, FULL/PARTIAL clean, INJECT_HINTS, and project config."
         print_success "Git initialized (branch: main)"
         echo ""
         echo "    To add a remote:"
@@ -675,19 +813,23 @@ if [ -n "$AGI_ROOT" ]; then
     echo -e "  AGI Root:    ${CYAN}${AGI_ROOT}${NC}"
 fi
 echo ""
-echo -e "  ${GREEN}TRACKED${NC} (committed to git):"
+echo -e "  ${GREEN}PROTECTED${NC} (never touched by cleanup scripts):"
+echo "    data/raw/         outputs/          envs/"
+echo "    scripts/          slurm/scripts/    reports/"
+echo ""
+echo -e "  ${YELLOW}CLEANABLE${NC} (PARTIAL_CLEAN removes these between runs):"
+echo "    slurm/logs/       logs/             logs/steps/"
+echo "    temp/checkpoints/"
+echo ""
+echo -e "  ${CYAN}TRACKED${NC} (committed to git):"
 echo "    config/           prompts/          scripts/"
 echo "    conda_env/        slurm/scripts/    project.yaml"
-echo "    RUN_*.sh          CLEAN_PROJECT.sh  README.md"
-echo ""
-echo -e "  ${YELLOW}IGNORED${NC} (gitignored):"
-echo "    data/             logs/             reports/"
-echo "    temp/             slurm_logs/       slurm/logs/"
-echo "    envs/step_*.yml"
+echo "    RUN_*.sh          *_CLEAN_*.sh      INJECT_HINTS.sh"
 echo ""
 echo "  Next steps:"
 echo ""
-echo "    1. Add your input data to ${CYAN}data/inputs/${NC}"
+echo "    1. Place your input data:"
+echo -e "       ${YELLOW}cp /path/to/data/* data/raw/${NC}"
 echo ""
 echo "    2. Write your master prompt:"
 echo -e "       ${YELLOW}vi prompts/my_analysis.md${NC}"

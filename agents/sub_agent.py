@@ -1,5 +1,5 @@
 """
-Script-First Sub-Agent v1.2.7 — 4-Phase Lifecycle with Diagnostic Agent
+Script-First Sub-Agent v1.2.8 — 4-Phase Lifecycle with Diagnostic Agent
 
 Features:
 - DUAL CLUSTER ROUTING: AGI_CLUSTER (CPU) + AGI_GPU_CLUSTER (GPU subtasks)
@@ -76,7 +76,13 @@ from utils.llm_invoke import invoke_resilient, LLMInvocationError
 from utils.model_config import resolve_model, resolve_base_url
 
 logger = logging.getLogger(__name__)
-
+# v1.2.8: Manifest manager for output tracking and cleanup protection
+try:
+    from utils.manifest import ManifestManager
+    _MANIFEST_AVAILABLE = True
+except ImportError:
+    _MANIFEST_AVAILABLE = False
+    logger.warning("ManifestManager not available — output manifest will not be written")
 
 # =============================================================================
 # CLUSTER CONFIGURATION (v3.2 — GPU Routing Support)
@@ -512,6 +518,9 @@ class ScriptFirstSubAgentV3:
 
         # Per-step phase logger (v1.2.5) — initialized in execute()
         self.step_logger: Optional[StepLogger] = None
+
+        # v1.2.8: Output manifest manager — initialized lazily on first write
+        self._manifest: Optional['ManifestManager'] = None
 
     # =========================================================================
     # MAIN ENTRY POINT
@@ -1577,6 +1586,11 @@ ADD_PIP: package_name==version"""
                             report = self._generate_completion_report(
                                 subtask, prod_logs, outputs, routed_cluster
                             )
+
+                            # v1.2.8: Write manifest entry before cleanup
+                            # so the protected paths are recorded even if
+                            # cleanup raises an exception.
+                            self._write_manifest_entry(subtask, outputs)
 
                             # Cleanup
                             if self.cleanup_env_on_success:
@@ -2929,6 +2943,65 @@ print(f"[MODE] DRY_RUN={{DRY_RUN}}, PROJECT_ROOT={{PROJECT_ROOT}}")
             f"{self.checkpoint.diagnostic_invocations if self.checkpoint else 0}\n"
             f"Outputs: {', '.join(outputs.get('found_files', []))}\n"
         )
+
+    def _write_manifest_entry(
+        self, subtask: Dict, outputs: Dict[str, Any]
+    ) -> None:
+        """Write a manifest entry for a successfully completed step.
+
+        v1.2.8: Called at the end of Phase 4 after production run success,
+        before environment cleanup. Records all output paths, artifact paths,
+        and env_state so cleanup scripts can protect them correctly.
+
+        The manifest is written even if ManifestManager import failed at
+        module load — the try/except ensures this never crashes the pipeline.
+        """
+        if not _MANIFEST_AVAILABLE:
+            return
+
+        try:
+            if self._manifest is None:
+                self._manifest = ManifestManager(self.project_root)
+
+            task_id = subtask.get('id', 'unknown')
+
+            # Build output entries from verified found files
+            found_files = outputs.get('found_files', [])
+            output_entries = [
+                {'path': f, 'description': f"Output from {task_id}"}
+                for f in found_files
+            ]
+
+            # Also add any output_files from the subtask definition that
+            # exist on disk but weren't in found_files (edge case safety net)
+            found_set = set(found_files)
+            for rel_path in subtask.get('output_files', []):
+                abs_path = str(self.project_root / rel_path)
+                if abs_path not in found_set and Path(abs_path).exists():
+                    output_entries.append({
+                        'path': abs_path,
+                        'description': f"Output from {task_id} (subtask spec)",
+                    })
+
+            self._manifest.write_step_entry(
+                step_id=task_id,
+                outputs=output_entries,
+                env_yaml=self.checkpoint.env_yaml_path if self.checkpoint else None,
+                script=self.checkpoint.script_path if self.checkpoint else None,
+                sbatch=self.checkpoint.sbatch_path if self.checkpoint else None,
+                env_name=self.checkpoint.env_name if self.checkpoint else None,
+                env_state='agent_created',  # default; overridden by INJECT_HINTS if human-modified
+                status='completed',
+            )
+            self.step_logger.log(
+                f"✓ Manifest entry written: {len(output_entries)} output(s) recorded"
+            )
+
+        except Exception as e:
+            # Manifest write must never crash the pipeline
+            logger.warning(f"[{subtask.get('id', '?')}] Manifest write failed: {e}")
+            if self.step_logger:
+                self.step_logger.log(f"⚠ Manifest write failed (non-fatal): {e}")
 
 
 # Aliases for backward compatibility
