@@ -1,5 +1,5 @@
 """
-Script-First Sub-Agent v1.2.8 — 4-Phase Lifecycle with Diagnostic Agent
+Script-First Sub-Agent v1.2.9 — 5-Phase Lifecycle with Diagnostic and Validation Agents
 
 Features:
 - DUAL CLUSTER ROUTING: AGI_CLUSTER (CPU) + AGI_GPU_CLUSTER (GPU subtasks)
@@ -37,6 +37,9 @@ v1.2.0 Changes:
       - Structured FixPrescription application
       - DiagnosticMemory for cross-task solution reuse
       - ReflexionMemory for per-task loop prevention
+
+    Phase 5: Validation Agent Loop
+      - TBD
 
   Removed methods:
     - _generate_all_artifacts() → replaced by per-phase generation
@@ -261,6 +264,11 @@ class TaskStatus(Enum):
     WAITING_JOB = "waiting_job"
     DIAGNOSING = "diagnosing"
     RUNNING_PROD = "running_prod"
+    # Phase 5 (v1.2.9)
+    GENERATING_VALIDATION = "generating_validation"
+    WAITING_VALIDATION_JOB = "waiting_validation_job"
+    VALIDATION_PASSED = "validation_passed"
+    VALIDATION_FAILED = "validation_failed"
     # Terminal
     COMPLETED = "completed"
     FAILED = "failed"
@@ -288,6 +296,12 @@ class TaskCheckpoint:
     script_validated: bool = False
     phase: int = 0
     diagnostic_invocations: int = 0
+    # v1.2.9: Phase 5 validation fields
+    validation_script_path: Optional[str] = None
+    validation_sbatch_path: Optional[str] = None
+    validation_job_id: Optional[str] = None
+    validation_passed: bool = False
+    validation_attempts: int = 0
 
     def to_dict(self) -> Dict:
         return asdict(self)
@@ -306,6 +320,17 @@ class TaskCheckpoint:
                     data[key] = 0
                 else:
                     data[key] = None
+        # v1.2.9: Phase 5 validation fields
+        for key in [
+            'validation_script_path', 'validation_sbatch_path',
+            'validation_job_id',
+        ]:
+            if key not in data:
+                data[key] = None
+        if 'validation_passed' not in data:
+            data['validation_passed'] = False
+        if 'validation_attempts' not in data:
+            data['validation_attempts'] = 0
         return cls(**data)
 
     @classmethod
@@ -318,7 +343,10 @@ class TaskCheckpoint:
             last_error=None, env_created=False, dry_run_succeeded=False,
             created_at=now, updated_at=now, routed_cluster=None,
             language=None, outline_validated=False, script_validated=False,
-            phase=0, diagnostic_invocations=0
+            phase=0, diagnostic_invocations=0,
+            validation_script_path=None, validation_sbatch_path=None,
+            validation_job_id=None, validation_passed=False,
+            validation_attempts=0,
         )
 
 # =============================================================================
@@ -465,6 +493,7 @@ class ScriptFirstSubAgentV3:
     MAX_IMPLEMENTATION_ATTEMPTS = 3
     MAX_ENV_REPAIR_ITERATIONS = 15
     MAX_PHASE4_ITERATIONS = 15
+    MAX_VALIDATION_ATTEMPTS = 3
 
     def __init__(
         self,
@@ -479,6 +508,8 @@ class ScriptFirstSubAgentV3:
         project_root: str = None,
         cleanup_env_on_success: bool = True,
         diagnostic_memory=None,
+        validation_agent=None,
+        memory_client=None,
     ):
         self.agent_id = agent_id
         self.sandbox = sandbox
@@ -488,6 +519,7 @@ class ScriptFirstSubAgentV3:
         self.slurm_config = slurm_config or {}
         self.cleanup_env_on_success = cleanup_env_on_success
         self.diagnostic_memory = diagnostic_memory
+        self.memory_client = memory_client
 
         # Resolve model (no hardcoded names)
         resolved_model = resolve_model(ollama_model)
@@ -521,6 +553,9 @@ class ScriptFirstSubAgentV3:
 
         # v1.2.8: Output manifest manager — initialized lazily on first write
         self._manifest: Optional['ManifestManager'] = None
+
+        # v1.2.9: ValidationAgent — injected by workflow or lazily initialized
+        self._validation_agent = validation_agent
 
     # =========================================================================
     # MAIN ENTRY POINT
@@ -646,18 +681,29 @@ class ScriptFirstSubAgentV3:
                 # =============================================================
                 # PHASE 4: Execution + Diagnostic Loop
                 # =============================================================
-                self.step_logger.log("► Entering Phase 4: Execution")
-                result = self._phase_4_execute_and_monitor(
-                    subtask, routed_cluster, routed_slurm
-                )
-                if result.get('success'):
+                if self.checkpoint.phase < 4:
+                    self.step_logger.log("► Entering Phase 4: Execution")
+                    result = self._phase_4_execute_and_monitor(
+                        subtask, routed_cluster, routed_slurm
+                    )
+                    if not result.get('success'):
+                        self.step_logger.log(
+                            f"✗ Phase 4 complete: FAILED  "
+                            f"{result.get('error', '')[:200]}"
+                        )
+                        return result
                     self.step_logger.log("✓ Phase 4 complete: SUCCESS")
                 else:
-                    self.step_logger.log(
-                        f"✗ Phase 4 complete: FAILED  "
-                        f"{result.get('error', '')[:200]}"
-                    )
-                return result
+                    # Resuming after Phase 4 — build minimal result for Phase 5
+                    result = {'success': True, 'task_id': task_id}
+
+                # =============================================================
+                # PHASE 5: Output Validation (v1.2.9)
+                # =============================================================
+                self.step_logger.log("► Entering Phase 5: Validation")
+                return self._phase_5_validate(
+                    subtask, routed_cluster, routed_slurm, result
+                )
 
             except Exception as e:
                 logger.error(f"[{task_id}] Unhandled exception: {e}")
@@ -1592,20 +1638,10 @@ ADD_PIP: package_name==version"""
                             # cleanup raises an exception.
                             self._write_manifest_entry(subtask, outputs)
 
-                            # Cleanup
-                            if self.cleanup_env_on_success:
-                                print(f"  → Cleaning up environment...")
-                                cleanup = self._cleanup_conda_environment()
-                                if cleanup['success']:
-                                    print(
-                                        f"  ✓ Environment removed "
-                                        f"(YAML preserved)"
-                                    )
-
-                            self._update_checkpoint(
-                                status=TaskStatus.COMPLETED.value
-                            )
-                            self._delete_checkpoint(task_id)
+                            # v1.2.9: Env cleanup and final completion moved
+                            # to Phase 5 (validation pass). Set phase=4 so
+                            # execute() proceeds to Phase 5 on resume.
+                            self._update_checkpoint(phase=4)
 
                             return self._success_result(
                                 task_id=task_id,
@@ -1614,6 +1650,7 @@ ADD_PIP: package_name==version"""
                                 iterations=self.checkpoint.iteration,
                                 routed_cluster=routed_cluster,
                                 report=report,
+                                phase4_job_id=prod_submit['job_id'],
                             )
 
                 else:
@@ -1670,6 +1707,326 @@ ADD_PIP: package_name==version"""
                 f"{self.checkpoint.iteration} iterations"
             ),
             checkpoint_preserved=True,
+        )
+
+    # =========================================================================
+    # PHASE 5: OUTPUT VALIDATION (v1.2.9)
+    # =========================================================================
+
+    def _phase_5_validate(
+        self,
+        subtask: Dict,
+        routed_cluster: str,
+        routed_slurm: Dict,
+        phase4_result: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Run Phase 5 validation lifecycle with retry loop.
+
+        v1.2.9: Generates a validation script, submits it as a lightweight
+        SLURM job, parses the structured JSON report, and either completes
+        the step or synthesizes correction guidance and retries from Phase 1.
+
+        Graceful degradation: if ValidationAgent is unavailable or the step
+        has no output_files, completes the step as v1.2.8 would.
+        """
+        task_id = subtask.get('id', 'task')
+        sl = self.step_logger
+
+        # ── Graceful degradation ─────────────────────────────────────────
+        val_agent = self._get_validation_agent()
+        if val_agent is None:
+            sl.log("Phase 5 skipped — ValidationAgent not available")
+            self._finalize_step_completion(task_id, routed_cluster)
+            return phase4_result
+
+        output_files = subtask.get('output_files', [])
+        if not output_files:
+            sl.log("Phase 5 skipped — no output_files to validate")
+            self._finalize_step_completion(task_id, routed_cluster)
+            return phase4_result
+
+        print(f"\n[{task_id}] Phase 5: Output Validation")
+
+        # ── Validation retry loop ────────────────────────────────────────
+        for attempt in range(self.MAX_VALIDATION_ATTEMPTS):
+            self.checkpoint.validation_attempts = attempt + 1
+            self._update_checkpoint(
+                validation_attempts=attempt + 1,
+                status=TaskStatus.GENERATING_VALIDATION.value,
+            )
+            sl.log(f"Phase 5 attempt {attempt + 1}/{self.MAX_VALIDATION_ATTEMPTS}")
+
+            # ── 5a: Generate validation script ───────────────────────────
+            gen_result = val_agent.generate_validation_script(
+                subtask=subtask,
+                analysis_script_path=self.checkpoint.script_path,
+                checkpoint=self.checkpoint,
+            )
+            if not gen_result.get('success'):
+                sl.log(f"✗ 5a failed: {gen_result.get('error', '')}")
+                sl.log("Phase 5 skipped — validation script generation failed")
+                self._finalize_step_completion(task_id, routed_cluster)
+                return phase4_result
+
+            self._update_checkpoint(
+                validation_script_path=gen_result['script_path']
+            )
+            sl.log(f"✓ 5a: {gen_result['script_path']}")
+
+            # ── 5b: Generate sbatch + submit ─────────────────────────────
+            phase4_job_id = phase4_result.get('phase4_job_id', '')
+            self._update_checkpoint(
+                status=TaskStatus.WAITING_VALIDATION_JOB.value
+            )
+
+            sbatch_result = val_agent.generate_validation_sbatch(
+                subtask=subtask,
+                checkpoint=self.checkpoint,
+                phase4_job_id=phase4_job_id,
+                slurm_config=routed_slurm,
+            )
+            if not sbatch_result.get('success'):
+                sl.log(f"✗ 5b failed: {sbatch_result.get('error', '')}")
+                sl.log("Phase 5 skipped — validation sbatch failure")
+                self._finalize_step_completion(task_id, routed_cluster)
+                return phase4_result
+
+            val_job_id = sbatch_result['job_id']
+            self._update_checkpoint(
+                validation_sbatch_path=sbatch_result.get('sbatch_path'),
+                validation_job_id=val_job_id,
+            )
+            sl.log(f"✓ 5b: Validation job {val_job_id}")
+
+            # ── 5c: Poll validation job ──────────────────────────────────
+            print(f"  → Waiting for validation job {val_job_id}...")
+            poll_result = self._poll_validation_job(val_job_id)
+            val_report = None
+            raw_tail = ""
+
+            if not poll_result.get('success'):
+                sl.log(f"✗ 5c: Validation job SLURM failure: "
+                       f"{poll_result.get('state', '?')}")
+                raw_tail = f"SLURM state: {poll_result.get('state', 'UNKNOWN')}"
+            else:
+                log_path = val_agent.find_validation_log(task_id, val_job_id)
+                if log_path:
+                    parse_result = val_agent.parse_validation_output(log_path)
+                else:
+                    parse_result = {
+                        'parsed': False, 'raw_tail': '',
+                        'error': 'Validation log not found',
+                    }
+
+                if parse_result.get('parsed'):
+                    val_report = parse_result['report']
+                else:
+                    raw_tail = parse_result.get('raw_tail', '')
+                    sl.log(f"⚠ Cannot parse report: "
+                           f"{parse_result.get('error', '')}")
+
+            # ── Evaluate result ──────────────────────────────────────────
+            if val_report and val_report.passed:
+                print(f"  ✓ Validation PASSED: {val_report.summary}")
+                sl.log(f"✓ PASSED: {val_report.summary}")
+                self._update_checkpoint(
+                    validation_passed=True,
+                    status=TaskStatus.VALIDATION_PASSED.value,
+                )
+                val_agent.store_validation_success(task_id, val_report)
+                self._finalize_step_completion(task_id, routed_cluster)
+                return phase4_result
+
+            # ── FAILED ───────────────────────────────────────────────────
+            self._update_checkpoint(
+                status=TaskStatus.VALIDATION_FAILED.value
+            )
+            summary = val_report.summary if val_report else raw_tail
+            print(f"  ✗ Validation FAILED (attempt {attempt + 1}): "
+                  f"{summary[:150]}")
+            sl.log(f"✗ FAILED: {summary}")
+
+            # Last attempt — don't synthesize, just fail
+            if attempt + 1 >= self.MAX_VALIDATION_ATTEMPTS:
+                break
+
+            # ── Synthesize correction + retry from Phase 1 ───────────────
+            sl.log("Synthesizing correction guidance...")
+            correction = val_agent.synthesize_correction(
+                subtask=subtask,
+                validation_report=val_report,
+                raw_log_tail=raw_tail if not val_report else "",
+            )
+
+            # Dual-inject hints (same pattern as INJECT_HINTS.sh)
+            hints = correction.get('hints', [])
+            subtask['code_hints'] = subtask.get('code_hints', []) + hints
+
+            guidance = correction.get('guidance_block', '')
+            if guidance:
+                plan = subtask.get('expanded_plan',
+                                   subtask.get('description', ''))
+                if '[VALIDATION FAILURE' in plan:
+                    plan = plan[:plan.index('[VALIDATION FAILURE')]
+                subtask['expanded_plan'] = plan.rstrip() + guidance
+
+            sl.log(f"Injected {len(hints)} correction hints, "
+                   f"resetting to Phase 1")
+
+            self._reset_checkpoint_to_phase1()
+
+            # ── Re-run Phases 1–4 ────────────────────────────────────────
+            sl.log("► Re-running Phases 1–4 with corrected guidance...")
+
+            p1 = self._phase_1_generate_script(subtask)
+            if not p1['success']:
+                sl.log(f"✗ Phase 1 retry failed: {p1.get('error', '')}")
+                continue
+            self._update_checkpoint(phase=1)
+
+            p2 = self._phase_2_create_environment(subtask)
+            if not p2['success']:
+                sl.log(f"✗ Phase 2 retry failed: {p2.get('error', '')}")
+                continue
+            self._update_checkpoint(phase=2)
+
+            p3 = self._phase_3_generate_sbatch(subtask, routed_slurm)
+            if not p3['success']:
+                sl.log(f"✗ Phase 3 retry failed: {p3.get('error', '')}")
+                continue
+            self._update_checkpoint(phase=3)
+
+            p4 = self._phase_4_execute_and_monitor(
+                subtask, routed_cluster, routed_slurm
+            )
+            if not p4['success']:
+                sl.log(f"✗ Phase 4 retry failed: {p4.get('error', '')}")
+                continue
+
+            phase4_result = p4
+            sl.log("✓ Phases 1–4 re-completed, retrying validation...")
+
+        # ── Exhausted all validation attempts ────────────────────────────
+        sl.log(f"✗ Validation failed after "
+               f"{self.MAX_VALIDATION_ATTEMPTS} attempts")
+        self._update_checkpoint(status=TaskStatus.FAILED.value)
+        return self._failure_result(
+            task_id,
+            f"Validation failed after {self.MAX_VALIDATION_ATTEMPTS} attempts",
+        )
+
+    def _get_validation_agent(self):
+        """Lazily initialize and return the ValidationAgent.
+
+        Returns None if unavailable (graceful degradation — Phase 5 skipped).
+        """
+        if self._validation_agent is not None:
+            return self._validation_agent
+
+        try:
+            from agents.validation_agent import ValidationAgent
+            self._validation_agent = ValidationAgent(
+                agent_id=f"{self.agent_id}_validator",
+                project_root=str(self.project_root),
+                ollama_model=None,
+                ollama_base_url=self.ollama_base_url,
+                memory_client=self.memory_client,
+            )
+            return self._validation_agent
+        except ImportError:
+            logger.info(
+                "ValidationAgent not available — Phase 5 will be skipped"
+            )
+            return None
+        except Exception as e:
+            logger.warning(f"ValidationAgent init failed: {e}")
+            return None
+
+    def _finalize_step_completion(
+        self, task_id: str, routed_cluster: str
+    ):
+        """Env cleanup + mark completed. Shared by Phase 4 skip and Phase 5 pass.
+
+        v1.2.9: Extracted from the Phase 4 production success block so both
+        the 'no validation' path and the 'validation passed' path use
+        identical cleanup logic.
+        """
+        if self.cleanup_env_on_success:
+            print(f"  → Cleaning up environment...")
+            cleanup = self._cleanup_conda_environment()
+            if cleanup.get('success'):
+                print(f"  ✓ Environment removed (YAML preserved)")
+
+        self._update_checkpoint(status=TaskStatus.COMPLETED.value)
+        self._delete_checkpoint(task_id)
+
+    def _poll_validation_job(self, job_id: str) -> Dict[str, Any]:
+        """Poll SLURM until validation job completes.
+
+        Same logic as _wait_for_job() but accepts an explicit job_id
+        instead of reading from checkpoint. Validation jobs have a
+        30-minute wall time so this will not run indefinitely.
+        """
+        poll_interval = self.slurm_config.get('poll_interval', 30)
+
+        while True:
+            try:
+                result = subprocess.run(
+                    ['squeue', '-j', job_id, '-h', '-o', '%T'],
+                    capture_output=True, text=True, timeout=30,
+                )
+                state = result.stdout.strip()
+
+                if not state:
+                    sacct = subprocess.run(
+                        ['sacct', '-j', job_id, '-n', '-o',
+                         'State', '-X'],
+                        capture_output=True, text=True, timeout=30,
+                    )
+                    final_state = (
+                        sacct.stdout.strip().split('\n')[0].strip()
+                    )
+                    return {
+                        'success': final_state in ('COMPLETED',),
+                        'state': final_state,
+                        'job_id': job_id,
+                    }
+
+                if state in ('FAILED', 'CANCELLED', 'TIMEOUT',
+                             'NODE_FAIL', 'PREEMPTED', 'OUT_OF_MEMORY'):
+                    return {
+                        'success': False,
+                        'state': state,
+                        'job_id': job_id,
+                    }
+
+            except Exception:
+                pass
+
+            time.sleep(poll_interval)
+
+    def _reset_checkpoint_to_phase1(self):
+        """Reset checkpoint for Phase 1 restart after validation failure.
+
+        Preserves: task_id, env_name, env_yaml_path, validation_attempts,
+                   created_at.
+        Clears: script, sbatch, job state, all phase markers.
+        """
+        self._update_checkpoint(
+            phase=0,
+            script_path=None,
+            sbatch_path=None,
+            current_job_id=None,
+            last_error=None,
+            outline_validated=False,
+            script_validated=False,
+            dry_run_succeeded=False,
+            env_created=False,
+            validation_script_path=None,
+            validation_sbatch_path=None,
+            validation_job_id=None,
+            validation_passed=False,
+            status=TaskStatus.NOT_STARTED.value,
         )
 
     # =========================================================================
