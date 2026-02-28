@@ -1,6 +1,8 @@
 """
 ReflexionMemory: Mem0 wrapper for AGI pipeline loop prevention.
 
+Version: v1.2.9
+
 This module provides the core memory interface for the Reflexion Engine,
 enabling the pipeline to:
 1. Track failed approaches to avoid repeating them
@@ -60,6 +62,11 @@ class FailureType(Enum):
     - DEPENDENCY_ISSUE -> PM (task ordering)
     - DATA_ISSUE -> Analyst
     - UNKNOWN -> Run diagnostics first
+    
+    v1.2.9 additions:
+    - VALIDATION_FAILURE -> ValidationAgent (Phase 5 output check failed)
+    - VALIDATION_SUCCESS -> ValidationAgent (Phase 5 output check passed;
+      stored as a solution record so the Librarian can reference it in v1.3.0)
     """
     CODE_BUG = "code_bug"
     MISSING_PACKAGE = "missing_package"
@@ -76,6 +83,23 @@ class FailureType(Enum):
     SLURM_ERROR = "slurm_error"
     CONDA_ERROR = "conda_error"
     UNKNOWN = "unknown"
+
+    # v1.2.9: Validation Agent (Phase 5) memory tags.
+    # These use the same MemoryClient/MCP server infrastructure as Phase 4
+    # diagnostic memories. The "val_" prefix on task_id (applied by the
+    # caller, not enforced here) keeps validation memories distinguishable
+    # from diagnostic memories in similarity searches.
+    #
+    # VALIDATION_FAILURE is stored via store_failure() when Phase 5 detects
+    # bad outputs. The approach_tried field records what correction was
+    # suggested, so check_if_tried() can prevent the same fix from being
+    # attempted twice.
+    #
+    # VALIDATION_SUCCESS is stored via store_solution() when Phase 5 passes.
+    # The solution field records a summary of what checks passed, which the
+    # Librarian Agent (v1.3.0) will use as validation reference data.
+    VALIDATION_FAILURE = "validation_failure"
+    VALIDATION_SUCCESS = "validation_success"
 
 
 @dataclass
