@@ -1,5 +1,5 @@
 """
-LangGraph Workflow v1.2.7 - Script-First Architecture with Diagnostic Agent
+LangGraph Workflow v1.2.9 - Script-First Architecture with Diagnostic + Validation Agents
 
 Orchestrates multi-agent system with:
 - Token-based context limits (configurable, default 25K) instead of iteration counts
@@ -9,6 +9,16 @@ Orchestrates multi-agent system with:
 - Living document master prompt management
 - **Reflexion Memory for loop prevention**
 - **Diagnostic Agent with cross-task solution memory** (v1.2.0)
+- **Validation Agent with output verification** (v1.2.9)
+
+v1.2.9 Updates:
+- memory_client (reflexion MemoryClient) now passed through to every
+  ScriptFirstSubAgent instance via the new memory_client= parameter.
+  The sub-agent forwards it to the ValidationAgent for Phase 5 loop
+  prevention using "val_" task_id prefix.
+- No new workflow nodes or state fields — Phase 5 runs entirely within
+  the sub-agent's execute() method after Phase 4 success.
+- Version bump in log messages and docstrings.
 
 v1.2.2 Updates:
 - FIX F: submit_parallel_jobs now uses ThreadPoolExecutor for true concurrent
@@ -226,8 +236,8 @@ class WorkflowState(TypedDict):
 
 class MultiAgentWorkflow:
     """
-    LangGraph workflow v1.2.2 with script-first architecture, reflexion memory,
-    and diagnostic agent integration.
+    LangGraph workflow v1.2.9 with script-first architecture, reflexion memory,
+    diagnostic agent, and validation agent integration.
 
     Key features:
     - Token-based context limits (configurable via environment)
@@ -335,7 +345,7 @@ class MultiAgentWorkflow:
 
         # Log configuration
         logger.info(
-            f"MultiAgentWorkflow v1.2.2 initialized: "
+            f"MultiAgentWorkflow v1.2.9 initialized: "
             f"model={self.ollama_model}, "
             f"tokens={self.MAX_CONTEXT_TOKENS}/{self.MAX_TOOL_OUTPUT_TOKENS}/{self.MIN_TOKENS_TO_CONTINUE}, "
             f"slurm={self.use_slurm}, "
@@ -343,6 +353,7 @@ class MultiAgentWorkflow:
             f"max_parallel_agents={self.max_parallel_agents}, "
             f"reflexion={self.use_reflexion_memory}, "
             f"diagnostic_memory={self.diagnostic_memory is not None}, "
+            f"memory_client={self.memory_client is not None}, "
             f"cleanup_env={self.cleanup_env_on_success}, "
             f"cluster={os.environ.get('AGI_CLUSTER', 'default')}"
         )
@@ -699,6 +710,7 @@ class MultiAgentWorkflow:
         - Ollama handles concurrent requests via OLLAMA_NUM_PARALLEL
         - Checkpoint files are per-task (no conflicts)
         - DiagnosticMemory is append-only (safe for concurrent reads/writes)
+        - MemoryClient (v1.2.9) is thread-safe (same Mem0 backend as reflexion)
         """
         batch = state['parallel_batch']
         env_name = state['env_name']
@@ -736,6 +748,7 @@ class MultiAgentWorkflow:
                     self.master.master_document.mark_running(task_id)
 
                 # Create agent (each thread gets its own instance)
+                # v1.2.9: memory_client passed for Phase 5 validation loop prevention
                 agent = ScriptFirstSubAgent(
                     agent_id=f"agent_{task_id}",
                     sandbox=self.sandbox,
@@ -748,6 +761,7 @@ class MultiAgentWorkflow:
                     project_root=str(self.project_dir),
                     cleanup_env_on_success=self.cleanup_env_on_success,
                     diagnostic_memory=self.diagnostic_memory,
+                    memory_client=self.memory_client,
                 )
 
                 result = agent.execute(subtask, env_name=env_name)

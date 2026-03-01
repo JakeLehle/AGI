@@ -38,8 +38,34 @@ v1.2.0 Changes:
       - DiagnosticMemory for cross-task solution reuse
       - ReflexionMemory for per-task loop prevention
 
-    Phase 5: Validation Agent Loop
-      - TBD
+    Phase 5: Output Validation (v1.2.9)
+      - Runs AFTER Phase 4 production success — validates that outputs
+        are scientifically sound, not just that the script exited 0
+      - ValidationAgent generates a Python validation script via LLM
+        using file-type-specific check hints (FILE_TYPE_DISPATCH)
+      - Validation runs as a lightweight SLURM job (2 CPUs, 16G, 30 min)
+        with --dependency=afterok:<phase4_job_id>
+      - Structured JSON report parsed from stdout (fixed footer contract)
+      - On PASS: store success in memory, cleanup env, mark COMPLETED
+      - On FAIL: synthesize correction hints via LLM, dual-inject into
+        subtask (code_hints + expanded_plan), reset to Phase 1, retry
+      - Max 3 validation attempts (each triggers full Phases 1-4 rerun)
+      - Memory integration via MemoryClient with "val_" task_id prefix
+        prevents identical correction loops across retry attempts
+      - Graceful degradation: if ValidationAgent unavailable or no
+        output_files defined, step completes as it would in v1.2.8
+
+  v1.2.9 Changes:
+    - Phase 5 validation lifecycle after Phase 4 production success
+    - ValidationAgent (agents/validation_agent.py) with 4 public methods:
+        generate_validation_script(), generate_validation_sbatch(),
+        parse_validation_output(), synthesize_correction()
+    - Environment cleanup relocated from Phase 4 to _finalize_step_completion()
+      (shared by Phase 5 pass and no-validation skip paths)
+    - TaskCheckpoint extended with 5 validation fields
+    - TaskStatus extended with 4 Phase 5 states
+    - Constructor accepts validation_agent and memory_client parameters
+    - FailureType enum extended with VALIDATION_FAILURE, VALIDATION_SUCCESS
 
   Removed methods:
     - _generate_all_artifacts() → replaced by per-phase generation
@@ -473,12 +499,16 @@ class StepLogger:
 
 class ScriptFirstSubAgentV3:
     """
-    Sub-Agent v1.2.0 — 4-phase lifecycle with diagnostic agent integration.
+    Sub-Agent v1.2.9 — 5-phase lifecycle with diagnostic + validation agents.
 
     Phase 1: Script Generation (validated two-pass)
     Phase 2: Environment Creation (script-informed, LLM-reviewed)
     Phase 3: Sbatch Generation (language-aware, submission-tested)
     Phase 4: Execution + Diagnostic Agent Loop
+    Phase 5: Output Validation (ValidationAgent, max 3 correction retries)
+
+    Phase 5 is additive — if ValidationAgent is unavailable or the step
+    has no output_files, the step completes identically to v1.2.8.
 
     All LLM calls use invoke_resilient() with exponential backoff retry.
     No artificial timeouts — the 3-day SLURM wall time is the only limit.
@@ -565,11 +595,11 @@ class ScriptFirstSubAgentV3:
         self, subtask: Dict, env_name: str = None
     ) -> Dict[str, Any]:
         """
-        Execute a subtask through the 4-phase lifecycle.
+        Execute a subtask through the 5-phase lifecycle.
 
-        v1.2.0: Phases are sequential with independent error handling.
+        v1.2.9: Phase 5 (output validation) runs after Phase 4 success.
+        Phases are sequential with independent error handling.
         Each phase can be resumed from checkpoint.
-
         Args:
             subtask: Dict with id, description, packages, input_files,
                      output_files, code_hints, requires_gpu, etc.
@@ -927,18 +957,25 @@ INVALID: [specific issues]"""
             self._update_checkpoint(
                 status=TaskStatus.GENERATING_SCRIPT.value
             )
-    
+
+            # v1.2.9: Pass step_id for output path steering
+            step_id = subtask.get('id', 'task')
+            safe_step_id = re.sub(r'[^\w\-]', '_', step_id)[:30]
+
             if language == 'python':
                 prompt = self._build_python_script_prompt(
-                    desc, outline, packages, inputs, outputs, hints=hints
+                    desc, outline, packages, inputs, outputs, hints=hints,
+                    step_id=safe_step_id,
                 )
             elif language == 'r':
                 prompt = self._build_r_script_prompt(
-                    desc, outline, packages, inputs, outputs, hints=hints
+                    desc, outline, packages, inputs, outputs, hints=hints,
+                    step_id=safe_step_id,
                 )
             else:
                 prompt = self._build_generic_script_prompt(
-                    desc, outline, packages, inputs, outputs, language, hints=hints
+                    desc, outline, packages, inputs, outputs, language, hints=hints,
+                    step_id=safe_step_id,
                 )
     
             try:
@@ -2910,20 +2947,34 @@ ADD_PIP: package_name==version"""
         return 'python'
 
     def _build_python_script_prompt(
-        self, desc, outline, packages, inputs, outputs, hints=None
+        self, desc, outline, packages, inputs, outputs, hints=None,
+        step_id=None
     ) -> str:
         hints_block = ""
         if hints:
             hints_block = "\nIMPORTANT IMPLEMENTATION GUIDANCE (follow exactly):\n"
             hints_block += "\n".join(f"  - {h}" for h in hints)
             hints_block += "\n"
+
+        # v1.2.9: Output path steering — all outputs go under outputs/{step_id}/
+        output_dir_id = step_id or "step"
+        output_rule = f"""
+OUTPUT DIRECTORY RULE (MANDATORY):
+  All output files MUST be written under outputs/{output_dir_id}/.
+  Create this directory at the top of main() before any processing.
+  Example: OUTPUT_DIR = PROJECT_ROOT / "outputs" / "{output_dir_id}"
+           OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+  Every save/write call must use OUTPUT_DIR / "filename" as the path.
+  Do NOT write outputs to the project root or any other directory.
+"""
+
         return f"""Generate a complete Python script based on this validated outline.
 
 TASK: {desc}
 PACKAGES: {', '.join(packages)}
 INPUTS: {', '.join(inputs) if inputs else 'None'}
 OUTPUTS: {', '.join(outputs) if outputs else 'None'}
-{hints_block}
+{hints_block}{output_rule}
 OUTLINE:
 {outline}
 
@@ -2937,9 +2988,14 @@ DRY_RUN = os.environ.get('AGI_DRY_RUN', 'true').lower() == 'true'
 PROJECT_ROOT = Path(os.environ.get('PROJECT_DIR', '.')).resolve()
 os.chdir(PROJECT_ROOT)
 
+OUTPUT_DIR = PROJECT_ROOT / "outputs" / "{output_dir_id}"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
 print(f"[MODE] DRY_RUN={{DRY_RUN}}, PROJECT_ROOT={{PROJECT_ROOT}}")
+print(f"[OUTPUT_DIR] {{OUTPUT_DIR}}")
 
 def main():
+    # ALL output files go under OUTPUT_DIR
     # Implement every step from the outline
     # Wrap saves with: if not DRY_RUN: save() else: print("[DRY-RUN] Would save...")
     print("SUCCESS: Task completed")
@@ -2951,13 +3007,18 @@ if __name__ == "__main__":
 Generate ONLY the complete Python code."""
 
     def _build_r_script_prompt(
-        self, desc, outline, packages, inputs, outputs, hints=None
+        self, desc, outline, packages, inputs, outputs, hints=None,
+        step_id=None
     ) -> str:
         hints_block = ""
         if hints:
             hints_block = "\nIMPORTANT IMPLEMENTATION GUIDANCE (follow exactly):\n"
             hints_block += "\n".join(f"  - {h}" for h in hints)
             hints_block += "\n"
+
+        # v1.2.9: Output path steering
+        output_dir_id = step_id or "step"
+
         return f"""Generate a complete R script based on this validated outline.
 
 TASK: {desc}
@@ -2971,19 +3032,28 @@ OUTLINE:
 REQUIRED STRUCTURE:
 - Load all required libraries at the top
 - Set PROJECT_ROOT from environment variable
+- Create output directory: OUTPUT_DIR <- file.path(PROJECT_ROOT, "outputs", "{output_dir_id}")
+  dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
+- ALL output files MUST be written under OUTPUT_DIR (use file.path(OUTPUT_DIR, "filename"))
+- Do NOT write outputs to the project root or any other directory
 - Implement every step from the outline
 - Print "SUCCESS: Task completed" on completion
 
 Generate ONLY the R code."""
 
     def _build_generic_script_prompt(
-        self, desc, outline, packages, inputs, outputs, language, hints=None
+        self, desc, outline, packages, inputs, outputs, language, hints=None,
+        step_id=None
     ) -> str:
         hints_block = ""
         if hints:
             hints_block = "\nIMPORTANT IMPLEMENTATION GUIDANCE (follow exactly):\n"
             hints_block += "\n".join(f"  - {h}" for h in hints)
             hints_block += "\n"
+
+        # v1.2.9: Output path steering
+        output_dir_id = step_id or "step"
+
         return f"""Generate a complete {language} script based on this outline.
 
 TASK: {desc}
@@ -2991,6 +3061,9 @@ TASK: {desc}
 OUTLINE: {outline}
 
 Requirements:
+- Create output directory: outputs/{output_dir_id}/ (mkdir -p or equivalent)
+- ALL output files MUST be written under outputs/{output_dir_id}/
+- Do NOT write outputs to the project root or any other directory
 - Implement every step from the outline
 - Print "SUCCESS: Task completed" on completion
 
@@ -3026,8 +3099,10 @@ Generate ONLY the {language} code."""
         return content
 
     def _prepend_python_header(self, script: str, subtask: Dict) -> str:
+        step_id = subtask.get('id', 'unknown')
+        safe_id = re.sub(r'[^\w\-]', '_', step_id)[:30]
         header = f'''#!/usr/bin/env python3
-"""Task: {subtask.get('id', 'unknown')}"""
+"""Task: {step_id}"""
 import os
 from pathlib import Path
 
@@ -3035,7 +3110,12 @@ DRY_RUN = os.environ.get('AGI_DRY_RUN', 'true').lower() == 'true'
 PROJECT_ROOT = Path(os.environ.get('PROJECT_DIR', '.')).resolve()
 os.chdir(PROJECT_ROOT)
 
+# v1.2.9: All outputs under outputs/{{step_id}}/
+OUTPUT_DIR = PROJECT_ROOT / "outputs" / "{safe_id}"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
 print(f"[MODE] DRY_RUN={{DRY_RUN}}, PROJECT_ROOT={{PROJECT_ROOT}}")
+print(f"[OUTPUT_DIR] {{OUTPUT_DIR}}")
 
 '''
         return header + re.sub(r'^#!/usr/bin/env python3?\n?', '', script)

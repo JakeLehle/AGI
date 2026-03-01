@@ -28,6 +28,15 @@ Investigation protocol by error type:
   runtime_logic    → read traceback, isolate failing function
   network_error    → check connectivity, suggest retry or mirror
 
+Boundary with ValidationAgent (v1.2.9):
+  The DiagnosticAgent handles Phase 4 failures — errors that prevent the
+  analysis script from completing (import errors, runtime crashes, SLURM
+  config issues, etc.). The ValidationAgent handles Phase 5 failures —
+  the script ran successfully but its outputs are incorrect, incomplete,
+  or malformed. Phase 5 failures do NOT invoke DiagnosticAgent; they are
+  handled by ValidationAgent.synthesize_correction() which produces
+  targeted code_hints for the next Phase 1 script regeneration attempt.
+
 All LLM calls use invoke_resilient() with exponential backoff retry.
 No artificial timeouts — the 3-day SLURM wall time is the only limit.
 """
