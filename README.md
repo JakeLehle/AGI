@@ -4,24 +4,30 @@
 
 The AGI pipeline decomposes complex research prompts into executable scripts, submits them as SLURM jobs, monitors completion, and handles failures through a multi-layer diagnostic and retry system — all driven by a local LLM running on a GPU node.
 
-## Architecture (v1.2.4)
+## Architecture (v1.2.9)
 
 ```
 ┌────────────────────────────────────────────────────────────┐
 │  GPU Node (master pipeline)                                │
 │  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  │
 │  │ Ollama Server │◄──│ Master Agent │───►│  Sub-Agents  │  │
-│  │ (qwen3-coder)│    │ Decompose    │    │ Phase 1-4    │  │
+│  │ (qwen3-coder)│    │ Decompose    │    │ Phase 1-5    │  │
 │  └──────────────┘    │ Validate     │    │ (threaded)   │  │
 │                      │ Track State  │    └──────┬───────┘  │
 │                      └──────────────┘           │          │
 │                              ▲                  │ sbatch   │
 │                    ┌─────────┴────────┐         │          │
 │                    │ Diagnostic Agent │◄────────|          │
-│                    │ Error classify   │  (on failure)      │
+│                    │ Error classify   │ (Phase 4 failure)  │
 │                    │ Fix prescribe    │         |          │
 │                    │ Solution memory  │         |          │
 │                    └──────────────────┘         |          │
+│                    ┌─────────────────┐          |          │
+│                    │ Validation Agent│◄─────────|          │
+│                    │ Output checks   │ (Phase 4 success)   │
+│                    │ Correction loop │         |          │
+│                    │ Reflexion memory│         |          │
+│                    └─────────────────┘         |          │
 └─────────────────────────────────────────────────┬──────────┘
                                                   │
                           ┌───────────────────────┼──────────────────┐
@@ -30,20 +36,23 @@ The AGI pipeline decomposes complex research prompts into executable scripts, su
                     │ compute1  │          │  gpu1v100   │    │ compute2  │
                     │ CPU tasks │          │  GPU tasks  │    │ Long jobs │
                     └───────────┘          └─────────────┘    └───────────┘
+
 ```
+The master pipeline runs on a GPU node for fast LLM inference. Independent subtasks run concurrently in a thread pool (default 4 threads), each managing its own full 5-phase lifecycle. When a SLURM job fails, the Diagnostic Agent investigates, prescribes a fix, and the sub-agent applies it before retrying — without human intervention for known error patterns. When a job succeeds, the Validation Agent verifies that outputs are scientifically sound before marking the step complete.
 
-The master pipeline runs on a GPU node for fast LLM inference. Independent subtasks run concurrently in a thread pool (default 4 threads), each managing its own full 4-phase lifecycle. When a SLURM job fails, the Diagnostic Agent investigates, prescribes a fix, and the sub-agent applies it before retrying — without human intervention for known error patterns.
+## Sub-Agent 5-Phase Lifecycle
 
-## Sub-Agent 4-Phase Lifecycle
-
-Each subtask goes through four independent phases with its own checkpoint, allowing resumption from any phase after a crash or restart:
+Each subtask goes through five independent phases with its own checkpoint, allowing resumption from any phase after a crash or restart:
 
 | Phase | What happens | Checkpoint key |
 |-------|-------------|----------------|
-| **Phase 1** — Script Generation | Two-pass outline → validation → full script → validation | `script_validated` |
+| **Phase 1** — Script Generation | Two-pass outline → validation → full script → validation. Outputs steered to `outputs/{step_id}/` | `script_validated` |
 | **Phase 2** — Environment Creation | LLM dependency analysis → conda YAML → env build + repair loop | `env_created` |
 | **Phase 3** — Sbatch Generation | Language dispatch, GPU routing, input file argument injection | `sbatch_path` |
 | **Phase 4** — Execution + Diagnostics | Submit → monitor → classify error → diagnose → fix → retry | `current_job_id` |
+| **Phase 5** — Output Validation | Validation script → lightweight SLURM job → JSON report parse → pass/fail. On fail: synthesize correction, retry from Phase 1 (max 3 attempts) | `validation_passed` |
+
+Phase 5 degrades gracefully — if the ValidationAgent is unavailable or the step defines no `output_files`, the step completes as it would in v1.2.8.
 
 ## Prerequisites
 
@@ -477,6 +486,7 @@ Between runs, use `PARTIAL_CLEAN_PROJECT.sh` to remove SLURM logs (which accumul
 
 ## Version History
 
+- **v1.2.9** — Phase 5 Output Validation. `ValidationAgent` generates file-type-aware validation scripts, submits them as lightweight SLURM jobs with `--dependency=afterok`, parses structured JSON reports, and synthesizes correction guidance on failure (max 3 retries, each re-running Phases 1–4). Phase 1 output path steering writes all outputs under `outputs/{step_id}/`. `MemoryClient` with `val_` prefix prevents duplicate correction loops. `ManifestManager` records validation status per output. Env cleanup relocated from Phase 4 to shared `_finalize_step_completion()`. `FailureType` enum extended with `VALIDATION_FAILURE` and `VALIDATION_SUCCESS`.
 - **v1.2.4** — `code_hints` field now wired through to script generation prompts (`_build_python_script_prompt`, `_build_r_script_prompt`, `_build_generic_script_prompt`). `INJECT_HINTS.sh` form-based human guidance injection tool. `FULL_CLEAN_PROJECT.sh` (includes conda env removal + cache purge). `PARTIAL_CLEAN_PROJECT.sh` (preserves state, removes logs). Replaces `CLEAN_PROJECT.sh`.
 - **v1.2.3** — Fixed 5-layer failure chain that caused steps to ghost-stall at "running" status. Added `runtime_argument_error` classification, diagnostic agent handler and `add_argument` fix type, sbatch input file argument injection (Phase 3), and master document sync in parallel execution path.
 - **v1.2.2** — True parallel task execution via `ThreadPoolExecutor`. Progress-first routing prevents premature pipeline exit. `blocked` status for tasks with failed dependencies. `OLLAMA_NUM_PARALLEL` support for concurrent LLM requests.
