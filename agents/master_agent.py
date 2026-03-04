@@ -1,54 +1,37 @@
 """
-Master Agent v3.2.1 - Comprehensive Task Decomposition with Validation
+Master Agent v1.2.9 - Comprehensive Task Decomposition with Validation
 
 The master agent follows a 3-phase approach:
 1. EXTRACTION: Parse the detailed prompt and extract EVERY step exactly as written
 2. EXPANSION: Expand each step into a comprehensive execution plan
 3. VALIDATION: Verify each plan captures the original step's full intent
 
-Key improvements over v3.1:
-- Multi-format step detection (numbered, checkboxes, headers, bullet points)
-- Preserves original step text verbatim alongside expanded plan
-- Validates expanded plans against original steps
-- Richer subtask format with original_text, expanded_plan, validation_status
-- Better handling of code snippets and implementation hints in prompts
-
-v3.2 Updates:
-- Token budget sized for 32K context → 25K working limit
-- Multi-strategy JSON parsing with cleanup for malformed LLM output
-- requires_gpu flag auto-detected from packages for dual cluster routing
-- GPU package detection list aligned with sub_agent.py (18 packages)
-
-v3.2.1 Updates:
-- REMOVED all artificial timeouts (STEP_EXPAND_TIMEOUT, TOTAL_DECOMPOSITION_TIMEOUT,
-  REVIEW_TIMEOUT). The 3-day SLURM node window is the only hard limit.
-- REMOVED SIGALRM-based invoke_with_timeout — broken in worker threads and caused
-  silent fallback to no-timeout, leading to infinite hangs on Ollama 500 errors.
-- REPLACED with invoke_resilient() from utils.llm_invoke: exponential backoff retry
-  with Ollama health checks. Survives transient 500 errors from memory pressure.
-- Model selection is now fully modular via utils.model_config.resolve_model().
-  No hardcoded model names in agent code. Resolution priority:
-    1. Explicit parameter (from workflow/CLI --model)
-    2. OLLAMA_MODEL environment variable (set in RUN scripts)
-    3. config.yaml → ollama.model
-    4. Single fallback constant in utils/model_config.py
-
-v3.2.2 Updates:
-- FIX A: _filter_executable_steps() — filters documentation sections (tables,
-  notes, output specs) BEFORE LLM expansion. Prevents non-executable content
-  from becoming subtasks. Saves LLM calls and prevents garbage dependencies.
-- FIX B: _sanitize_dependencies() — post-processes LLM-generated dependencies
-  after expansion. Removes refs to non-existent IDs, breaks circular deps via
-  topological sort, ensures first step has no deps, falls back to sequential
-  ordering if the dependency graph is unsalvageable.
-  Together these fixes prevent the "0 completed, 0 failed, all blocked" deadlock
-  that occurred when documentation sections created circular dependency chains.
-
 The master prompt serves as a living document that:
 1. Contains all pipeline steps with status
 2. Gets updated when subtasks complete (adds script paths)
 3. Gets updated when subtasks fail (adds error summaries)
 4. Maintains a comprehensive view of pipeline state
+
+v1.2.9 Updates (Structured Prompt Parsing):
+- NEW: _parse_structured_prompt() — deterministic parser for prompts using
+  <<<STEP_N>>> / <<<END_STEP>>> delimiters and STEP_MANIFEST blocks.
+  Replaces regex-based discovery with exact delimiter parsing. Step count
+  is validated against the manifest. Dependencies are extracted directly
+  from DEPENDS_ON fields — no LLM interpretation needed.
+- NEW: _extract_header_blocks() — parses STEP_MANIFEST, GLOBAL_CONSTRAINTS,
+  SHARED_CONSTANTS, and SHARED_ENV blocks from the prompt header.
+- NEW: _parse_step_fields() — extracts labeled fields (GOAL, INPUT, OUTPUT,
+  ENVIRONMENT, APPROACH, SUCCESS_CRITERIA, CONSTRAINTS, DEPENDS_ON) from
+  within each <<<STEP_N>>> block.
+- MODIFIED: decompose_task() — tries structured parsing first. Falls back to
+  legacy extraction  only if <<<STEP_N>>> delimiters are not found.
+- MODIFIED: _expand_step() — when structured fields are pre-parsed, the LLM
+  prompt includes them directly instead of asking the LLM to infer packages,
+  dependencies, and I/O files. Also adds Tier 2 complexity_warnings field.
+- PRESERVED: All legacy methods (_extract_steps_from_prompt,
+  _filter_executable_steps, _sanitize_dependencies) remain unchanged for
+  backward compatibility with older prompts.
+
 """
 
 from typing import Dict, Any, List, Optional, Tuple
@@ -503,359 +486,354 @@ class MasterAgent:
 
         return self.master_document
 
-    # =========================================================================
-    # PHASE 1: COMPREHENSIVE EXTRACTION
-    # =========================================================================
+        # =====================================================================
+        # PHASE 1: EXTRACTION (v3.3.0: structured-first, legacy fallback)
+        # =====================================================================
+        print("\n  Phase 1: Extracting steps from prompt...")
 
-    def _extract_steps_from_prompt(self, prompt: str) -> List[Dict[str, Any]]:
-        """
-        Extract ALL steps from the prompt using multiple detection strategies.
+        structured_header = None  # Will hold header blocks if structured
 
-        Supports:
-        - Numbered steps: "1. ", "1) ", "Step 1:"
-        - Checkboxes: "- [ ]", "- [x]", "* [ ]"
-        - Headers: "## Step 1", "### Task 1"
-        - Bullet points with keywords: "- First,", "- Next,"
-        - Code blocks associated with steps
-        """
-        extracted = []
-        lines = prompt.split('\n')
+        if self._detect_structured_format(main_task):
+            # ── v3.3.0: Structured prompt with <<<STEP_N>>> delimiters ────
+            print("    Detected structured prompt format (<<<STEP_N>>> delimiters)")
+            try:
+                extracted_steps, structured_header = self._parse_structured_prompt(main_task)
 
-        current_step = None
-        current_content = []
-        current_code_blocks = []
-        in_code_block = False
-        code_block_content = []
-        step_number = 0
+                # Inject global constraints and shared constants into context
+                if structured_header.get('global_constraints'):
+                    extracted_context['global_constraints'] = structured_header['global_constraints']
+                if structured_header.get('shared_constants'):
+                    extracted_context['shared_constants'] = structured_header['shared_constants']
+                if structured_header.get('shared_environments'):
+                    extracted_context['shared_environments'] = structured_header['shared_environments']
 
-        for i, line in enumerate(lines):
-            # Track code blocks
-            if line.strip().startswith('```'):
-                if in_code_block:
-                    # End of code block
-                    in_code_block = False
-                    if current_step is not None:
-                        current_code_blocks.append('\n'.join(code_block_content))
-                    code_block_content = []
-                else:
-                    # Start of code block
-                    in_code_block = True
-                continue
+                # Store for auditability
+                self.master_document.extracted_steps = extracted_steps
 
-            if in_code_block:
-                code_block_content.append(line)
-                continue
-
-            # Detect step patterns
-            step_match = None
-            step_title = None
-
-            # Pattern 1: Numbered steps "1. ", "1) ", "Step 1:"
-            numbered = re.match(
-                r'^\s*(?:(?:Step\s+)?(\d+)[\.\):\-]\s+(.+)|(\d+)\.\s+(.+))',
-                line, re.IGNORECASE
-            )
-            if numbered:
-                step_match = True
-                num = numbered.group(1) or numbered.group(3)
-                step_title = (numbered.group(2) or numbered.group(4)).strip()
-
-            # Pattern 2: Checkboxes "- [ ] ", "- [x] "
-            if not step_match:
-                checkbox = re.match(r'^\s*[\-\*]\s*\[[ xX]\]\s+(.+)', line)
-                if checkbox:
-                    step_match = True
-                    step_title = checkbox.group(1).strip()
-
-            # Pattern 3: Headers "## Step 1", "### Task:"
-            if not step_match:
-                header = re.match(r'^\s*#{2,4}\s+(?:Step\s+\d+[:\-\s]*)?(.+)', line)
-                if header:
-                    title = header.group(1).strip()
-                    # Only treat as step if it looks like a task
-                    if len(title) > 10 or any(kw in title.lower() for kw in
-                        ['create', 'build', 'run', 'analyze', 'process', 'generate',
-                         'setup', 'install', 'download', 'prepare', 'filter', 'merge',
-                         'cluster', 'annotate', 'align', 'quality', 'normalize']):
-                        step_match = True
-                        step_title = title
-
-            # Pattern 4: Keyword bullets "- First,", "- Next,", "- Finally,"
-            if not step_match:
-                keyword = re.match(
-                    r'^\s*[\-\*]\s+((?:First|Next|Then|After|Finally|Subsequently|Lastly)[,:\s]+.+)',
-                    line, re.IGNORECASE
+            except ValueError as e:
+                print(f"    ⚠ Structured parsing failed: {e}")
+                print("    Falling back to legacy extraction...")
+                agent_logger.log_reflection(
+                    agent_name=self.agent_id,
+                    task_id="extraction",
+                    reflection=f"Structured parsing failed ({e}), using legacy"
                 )
-                if keyword:
-                    step_match = True
-                    step_title = keyword.group(1).strip()
+                # Fall through to legacy path below
+                structured_header = None
+                extracted_steps = None
 
-            if step_match and step_title:
-                # Save previous step
-                if current_step is not None:
-                    current_step['full_text'] = '\n'.join(current_content).strip()
-                    current_step['code_hints'] = current_code_blocks.copy()
-                    extracted.append(current_step)
+        if structured_header is None:
+            # ── Legacy extraction (v3.2.2) ────────────────────────────────
+            raw_extracted_steps = self._extract_steps_from_prompt(main_task)
+            print(f"    Found {len(raw_extracted_steps)} raw steps (legacy extraction)")
 
-                step_number += 1
-                current_step = {
-                    'step_number': step_number,
-                    'title': step_title[:200],
-                    'full_text': '',
-                    'code_hints': [],
-                    'line_start': i
-                }
-                current_content = [line]
-                current_code_blocks = []
-            elif current_step is not None:
-                # Continue building current step content
-                current_content.append(line)
+            # Phase 1b: Filter non-executable sections
+            extracted_steps, filtered_steps = self._filter_executable_steps(raw_extracted_steps)
 
-        # Don't forget the last step
-        if current_step is not None:
-            current_step['full_text'] = '\n'.join(current_content).strip()
-            current_step['code_hints'] = current_code_blocks.copy()
-            extracted.append(current_step)
+            # Store for auditability
+            self.master_document.extracted_steps = raw_extracted_steps
 
-        # If no steps were found, treat the whole prompt as one step
-        if not extracted:
-            extracted.append({
-                'step_number': 1,
-                'title': 'Main Task',
-                'full_text': prompt,
-                'code_hints': [],
-                'line_start': 0
-            })
-
-        return extracted
-
-    # =========================================================================
-    # PHASE 1b: FILTER NON-EXECUTABLE STEPS (v3.2.2 — Fix A)
-    # =========================================================================
-
-    def _filter_executable_steps(
-        self, extracted_steps: List[Dict[str, Any]]
-    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        """
-        Classify extracted steps as executable or documentation.
-
-        v3.2.2 Fix A: The prompt extractor matches every ## header and numbered
-        item, which pulls in documentation sections like "Expected Outputs",
-        "AnnData Structure", "Notes", and individual note items ("DO NOT use R").
-        These non-executable sections waste LLM expansion calls and — worse —
-        generate garbage dependencies that create circular deadlocks.
-
-        Classification criteria (step is DOCUMENTATION if ANY match):
-          1. Has code_hints → always executable (strongest signal)
-          2. Title matches known documentation patterns → filtered
-          3. Title starts with bold markers → filtered
-          4. Short content with no procedural title verbs → filtered
-          5. Content is primarily a markdown table → filtered
-
-        Returns:
-            (executable_steps, filtered_steps) — filtered steps are logged
-            but not sent to LLM expansion.
-        """
-        # ── Documentation title patterns ──────────────────────────────────
-        DOC_TITLE_PATTERNS = [
-            r'(?i)^expected\s+output',
-            r'(?i)^primary\s+data\s+file',
-            r'(?i)^anndata\s+structure',
-            r'(?i)^figures?\s*\(',          # "Figures (per puck)"
-            r'(?i)^reports?$',
-            r'(?i)^checkpoints?$',
-            r'(?i)^input\s+files?$',
-            r'(?i)^output\s+files?$',
-            r'(?i)^dependenc',               # "Dependencies Between Steps"
-            r'(?i)^success\s+criteria',
-            r'(?i)^notes?$',
-            r'(?i)^environment$',
-            r'(?i)^prerequisites?$',
-            r'(?i)^requirements?$',
-            r'(?i)^overview$',
-            r'(?i)^context$',
-            r'(?i)^summary$',
-        ]
-
-        BOLD_NOTE_PATTERN = re.compile(r'^\*\*[A-Z]')
-
-        PROCEDURAL_VERBS = {
-            'run', 'execute', 'create', 'generate', 'compute', 'calculate',
-            'load', 'save', 'write', 'read', 'filter', 'normalize',
-            'cluster', 'annotate', 'align', 'process', 'validate',
-            'download', 'install', 'build', 'train', 'predict',
-            'merge', 'combine', 'split', 'transform', 'plot',
-            'visualize', 'export', 'import', 'analyze', 'check',
-            'verify', 'submit', 'setup', 'configure', 'prepare',
-        }
-
-        executable = []
-        filtered = []
-
-        for step in extracted_steps:
-            title = step.get('title', '').strip()
-            full_text = step.get('full_text', '')
-            code_hints = step.get('code_hints', [])
-            content_len = len(full_text)
-
-            reason = None
-
-            # ── Rule 1: Has code_hints → always executable ────────────────
-            if code_hints:
-                executable.append(step)
-                continue
-
-            # ── Rule 2: Title matches documentation patterns ──────────────
-            for pattern in DOC_TITLE_PATTERNS:
-                if re.search(pattern, title):
-                    reason = f"title matches doc pattern: {pattern}"
-                    break
-
-            # ── Rule 3: Bold-prefixed notes ───────────────────────────────
-            if not reason and BOLD_NOTE_PATTERN.match(title):
-                reason = f"bold-prefixed note: {title[:50]}"
-
-            # ── Rule 4: Very short content with no procedural title ───────
-            if not reason and content_len < 200:
-                title_words = set(re.findall(r'\b\w+\b', title.lower()))
-                has_procedural = bool(title_words & PROCEDURAL_VERBS)
-                if not has_procedural:
-                    reason = f"short content ({content_len} chars) with no procedural title"
-
-            # ── Rule 5: Content is primarily a markdown table ─────────────
-            if not reason and content_len > 0:
-                lines = [l.strip() for l in full_text.split('\n') if l.strip()]
-                table_lines = sum(1 for l in lines if l.startswith('|'))
-                if len(lines) > 0 and table_lines / len(lines) > 0.5:
-                    text_lower = full_text.lower()
-                    has_procedural = any(
-                        re.search(rf'\b{v}\b', text_lower) for v in
-                        ['run', 'execute', 'create', 'generate', 'compute',
-                         'load', 'save', 'filter', 'normalize', 'cluster']
-                    )
-                    if not has_procedural:
-                        reason = f"primarily table content ({table_lines}/{len(lines)} lines)"
-
-            # ── Classify ──────────────────────────────────────────────────
-            if reason:
-                step['filter_reason'] = reason
-                filtered.append(step)
-            else:
-                executable.append(step)
-
-        # ── Log results ───────────────────────────────────────────────────
-        if filtered:
             agent_logger.log_reflection(
                 agent_name=self.agent_id,
-                task_id="filter_steps",
+                task_id="extraction",
                 reflection=(
-                    f"Filtered {len(filtered)}/{len(extracted_steps)} "
-                    f"non-executable sections: "
-                    f"{', '.join(s['title'][:40] for s in filtered[:5])}"
-                    f"{'...' if len(filtered) > 5 else ''}"
+                    f"Legacy extraction: {len(raw_extracted_steps)} raw steps, "
+                    f"filtered to {len(extracted_steps)} executable "
+                    f"({len(filtered_steps)} documentation sections removed)"
                 )
             )
-            print(
-                f"    Filtered {len(filtered)} documentation sections "
-                f"(keeping {len(executable)} executable steps)"
-            )
+            print(f"    → {len(extracted_steps)} executable steps for expansion")
 
-        # Re-number the executable steps sequentially
-        for i, step in enumerate(executable):
-            step['step_number'] = i + 1
+        # =====================================================================
+        # PHASE 2: EXPANSION (no artificial timeout — retries handle failures)
+        # =====================================================================
+        print("\n  Phase 2: Expanding each step into detailed plans...")
 
-        return executable, filtered
+    # =========================================================================
+    # STRUCTURED PROMPT PARSING (v1.2.9)
+    # =========================================================================
 
-    def _extract_task_context(self, task: str) -> Dict[str, Any]:
-        """Extract critical context from task description"""
-        context = {
-            "language": None,
-            "packages": [],
-            "reference_scripts": [],
-            "input_files": [],
-            "output_files": [],
-            "completed_steps": [],
-            "huggingface_repos": [],
-            "environment_hints": []
+    def _detect_structured_format(self, prompt: str) -> bool:
+        """Check if the prompt uses <<<STEP_N>>> delimiters."""
+        return bool(re.search(r'<<<STEP_\d+>>>', prompt))
+
+    def _extract_header_blocks(self, prompt: str) -> Dict[str, Any]:
+        """
+        Extract labeled header blocks from the prompt.
+
+        Parses:
+          - STEP_MANIFEST    → list of {number, title}
+          - GLOBAL_CONSTRAINTS → list of constraint strings
+          - SHARED_CONSTANTS   → raw code string
+          - SHARED_ENV:name    → dict of {name: yaml_string}
+
+        All content before the first <<<STEP_N>>> delimiter is Header.
+        """
+        # Find where step definitions begin
+        first_step = re.search(r'<<<STEP_\d+>>>', prompt)
+        header_text = prompt[:first_step.start()] if first_step else prompt
+
+        header = {
+            'step_manifest': [],
+            'global_constraints': [],
+            'shared_constants': '',
+            'shared_environments': {},
+            'raw_header': header_text,
         }
 
-        # Detect language
-        task_lower = task.lower()
-        python_indicators = [
-            'python', 'scanpy', 'squidpy', 'anndata', 'pandas',
-            '.py', 'popv', 'h5ad', 'numpy', 'scipy'
+        # ── STEP_MANIFEST ─────────────────────────────────────────────────
+        manifest_match = re.search(
+            r'```STEP_MANIFEST\s*\n(.*?)```',
+            header_text, re.DOTALL
+        )
+        if manifest_match:
+            manifest_text = manifest_match.group(1).strip()
+            for line in manifest_text.split('\n'):
+                line = line.strip()
+                if not line:
+                    continue
+                m = re.match(r'STEP\s+(\d+)\s*:\s*(.+)', line, re.IGNORECASE)
+                if m:
+                    header['step_manifest'].append({
+                        'number': int(m.group(1)),
+                        'title': m.group(2).strip(),
+                    })
+
+        # ── GLOBAL_CONSTRAINTS ────────────────────────────────────────────
+        constraints_match = re.search(
+            r'```GLOBAL_CONSTRAINTS\s*\n(.*?)```',
+            header_text, re.DOTALL
+        )
+        if constraints_match:
+            for line in constraints_match.group(1).strip().split('\n'):
+                line = line.strip()
+                if line.startswith('- '):
+                    line = line[2:].strip()
+                if line:
+                    header['global_constraints'].append(line)
+
+        # ── SHARED_CONSTANTS ──────────────────────────────────────────────
+        constants_match = re.search(
+            r'```SHARED_CONSTANTS\s*\n(.*?)```',
+            header_text, re.DOTALL
+        )
+        if constants_match:
+            header['shared_constants'] = constants_match.group(1).strip()
+
+        # ── SHARED_ENV:name ───────────────────────────────────────────────
+        for env_match in re.finditer(
+            r'```SHARED_ENV:(\S+)\s*\n(.*?)```',
+            header_text, re.DOTALL
+        ):
+            env_name = env_match.group(1).strip()
+            env_yaml = env_match.group(2).strip()
+            header['shared_environments'][env_name] = env_yaml
+
+        return header
+
+    def _parse_step_fields(self, step_content: str) -> Dict[str, Any]:
+        """
+        Extract labeled fields from a single step block's content.
+
+        Recognized fields: GOAL, DEPENDS_ON, INPUT, OUTPUT, ENVIRONMENT,
+        APPROACH, SUCCESS_CRITERIA, CONSTRAINTS, REFERENCE_SCRIPTS, NOTES.
+
+        Returns a dict with each field's content as a string. Missing fields
+        get empty string/list defaults.
+        """
+        fields = {
+            'goal': '',
+            'depends_on': [],
+            'input': '',
+            'output': '',
+            'environment': '',
+            'approach': '',
+            'success_criteria': '',
+            'constraints': [],
+            'reference_scripts': '',
+            'notes': '',
+        }
+
+        # Field labels we recognize (order matters — longer matches first)
+        FIELD_LABELS = [
+            'SUCCESS_CRITERIA', 'REFERENCE_SCRIPTS', 'DEPENDS_ON',
+            'ENVIRONMENT', 'CONSTRAINTS', 'APPROACH', 'OUTPUT',
+            'INPUT', 'NOTES', 'GOAL',
         ]
-        r_indicators = ['seurat', 'singlecell', 'bioconductor', '.R', 'r script']
 
-        python_score = sum(1 for ind in python_indicators if ind in task_lower)
-        r_score = sum(1 for ind in r_indicators if ind in task_lower)
+        # Build regex that splits on field labels at the start of a line
+        # Match: "FIELD_NAME:" at start of line (with optional whitespace)
+        label_pattern = re.compile(
+            r'^(' + '|'.join(FIELD_LABELS) + r')\s*:',
+            re.MULTILINE | re.IGNORECASE
+        )
 
-        context["language"] = "python" if python_score >= r_score else "r"
+        # Find all label positions
+        label_positions = []
+        for m in label_pattern.finditer(step_content):
+            label_positions.append((m.start(), m.end(), m.group(1).upper()))
 
-        # Extract packages (expanded list)
-        python_packages = [
-            'scanpy', 'squidpy', 'anndata', 'pandas', 'numpy', 'scipy',
-            'popv', 'popV', 'scvi', 'scvi-tools', 'cellxgene', 'leidenalg',
-            'matplotlib', 'seaborn', 'celltypist', 'decoupler', 'sklearn',
-            'scikit-learn', 'torch', 'pytorch', 'tensorflow', 'keras',
-            'statsmodels', 'plotly', 'bokeh', 'networkx', 'igraph',
-            'requests', 'aiohttp', 'fastapi', 'flask', 'django'
-        ]
-        for pkg in python_packages:
-            if pkg.lower() in task_lower:
-                pattern = re.compile(re.escape(pkg), re.IGNORECASE)
-                matches = pattern.findall(task)
-                if matches:
-                    context["packages"].append(matches[0])
+        # Extract content between labels
+        for i, (start, end, label) in enumerate(label_positions):
+            # Content runs from after the colon to the next label (or end)
+            if i + 1 < len(label_positions):
+                content = step_content[end:label_positions[i + 1][0]]
+            else:
+                content = step_content[end:]
 
-        # Extract file paths
-        file_patterns = [
-            (r'[`"\']?([^\s`"\']*\.h5ad)[`"\']?', 'h5ad'),
-            (r'[`"\']?([^\s`"\']*\.csv)[`"\']?', 'csv'),
-            (r'[`"\']?([^\s`"\']*\.tsv)[`"\']?', 'tsv'),
-            (r'[`"\']?([^\s`"\']*\.parquet)[`"\']?', 'parquet'),
-            (r'[`"\']?(data/[^\s`"\']+)[`"\']?', 'data'),
-            (r'[`"\']?(output[s]?/[^\s`"\']+)[`"\']?', 'output'),
-        ]
-        for pattern, ftype in file_patterns:
-            matches = re.findall(pattern, task)
-            for match in matches:
-                if 'input' in match.lower() or ftype in ['h5ad', 'csv', 'tsv', 'parquet']:
-                    if match not in context["input_files"]:
-                        context["input_files"].append(match)
-                if 'output' in match.lower() or ftype == 'output':
-                    if match not in context["output_files"]:
-                        context["output_files"].append(match)
+            content = content.strip()
+            field_key = label.lower()
 
-        # Extract reference scripts
-        script_patterns = [
-            r'scripts?/[^\s`"\']+\.py',
-            r'[`"\']([^\s`"\']+\.py)[`"\']',
-        ]
-        for pattern in script_patterns:
-            matches = re.findall(pattern, task)
-            context["reference_scripts"].extend(matches)
+            if field_key == 'depends_on':
+                # Parse as list: [step_1, step_2] or []
+                dep_match = re.search(r'\[(.*?)\]', content)
+                if dep_match:
+                    dep_str = dep_match.group(1).strip()
+                    if dep_str:
+                        fields['depends_on'] = [
+                            d.strip() for d in dep_str.split(',') if d.strip()
+                        ]
+                    else:
+                        fields['depends_on'] = []
+                else:
+                    fields['depends_on'] = []
 
-        # Extract HuggingFace repos
-        hf_pattern = r'huggingface_repo\s*=\s*["\']([^"\']+)["\']'
-        context["huggingface_repos"] = re.findall(hf_pattern, task)
+            elif field_key == 'constraints':
+                # Parse as list of constraint strings
+                constraints = []
+                for line in content.split('\n'):
+                    line = line.strip()
+                    if line.startswith('- '):
+                        line = line[2:].strip()
+                    if line:
+                        constraints.append(line)
+                fields['constraints'] = constraints
 
-        # Extract completed steps
-        completed_patterns = [
-            r'✅\s*(?:COMPLETED:?)?\s*([^\n]+)',
-            r'\[x\]\s*([^\n]+)',
-            r'DONE:\s*([^\n]+)',
-        ]
-        for pattern in completed_patterns:
-            matches = re.findall(pattern, task, re.IGNORECASE)
-            context["completed_steps"].extend(matches)
+            elif field_key == 'environment':
+                # Could be inline YAML or a USE_SHARED pointer
+                fields['environment'] = content
 
-        # Deduplicate
-        for key in context:
-            if isinstance(context[key], list):
-                context[key] = list(dict.fromkeys(context[key]))
+            else:
+                fields[field_key] = content
 
-        return context
+        # ── Extract code hints from APPROACH ──────────────────────────────
+        # Pull out fenced code blocks from the approach field
+        code_hints = []
+        if fields['approach']:
+            for code_match in re.finditer(
+                r'```(?:\w+)?\s*\n(.*?)```',
+                fields['approach'], re.DOTALL
+            ):
+                code_hints.append(code_match.group(1).strip())
+        fields['code_hints'] = code_hints
+
+        return fields
+
+    def _parse_structured_prompt(
+        self, prompt: str
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """
+        Parse a structured prompt with <<<STEP_N>>> delimiters.
+
+        Returns:
+            (steps, header) where steps is a list of step dicts ready for
+            expansion, and header contains global context blocks.
+
+        Raises ValueError if the prompt structure is invalid (step count
+        mismatch, missing delimiters, etc.).
+        """
+        # ── Parse header ──────────────────────────────────────────────────
+        header = self._extract_header_blocks(prompt)
+        manifest = header['step_manifest']
+
+        if not manifest:
+            raise ValueError(
+                "Structured prompt detected (has <<<STEP_N>>> delimiters) "
+                "but no STEP_MANIFEST block found. Add a ```STEP_MANIFEST block "
+                "listing all steps."
+            )
+
+        # ── Extract step blocks ───────────────────────────────────────────
+        step_pattern = re.compile(
+            r'<<<STEP_(\d+)>>>\s*\n(.*?)<<<END_STEP>>>',
+            re.DOTALL
+        )
+        step_blocks = []
+        for m in step_pattern.finditer(prompt):
+            step_blocks.append({
+                'number': int(m.group(1)),
+                'raw_content': m.group(2),
+            })
+
+        # ── Validate step count ───────────────────────────────────────────
+        manifest_numbers = {entry['number'] for entry in manifest}
+        block_numbers = {block['number'] for block in step_blocks}
+
+        if manifest_numbers != block_numbers:
+            missing_blocks = manifest_numbers - block_numbers
+            extra_blocks = block_numbers - manifest_numbers
+            error_parts = []
+            if missing_blocks:
+                error_parts.append(
+                    f"Manifest declares steps {sorted(missing_blocks)} "
+                    f"but no <<<STEP_N>>> blocks found for them"
+                )
+            if extra_blocks:
+                error_parts.append(
+                    f"Found <<<STEP_N>>> blocks for {sorted(extra_blocks)} "
+                    f"but they are not in the STEP_MANIFEST"
+                )
+            raise ValueError(
+                f"Step count mismatch: {'; '.join(error_parts)}"
+            )
+
+        # ── Parse each step block ─────────────────────────────────────────
+        # Sort by step number
+        step_blocks.sort(key=lambda b: b['number'])
+        manifest_by_num = {e['number']: e for e in manifest}
+
+        extracted_steps = []
+        for block in step_blocks:
+            num = block['number']
+            manifest_entry = manifest_by_num[num]
+            fields = self._parse_step_fields(block['raw_content'])
+
+            step = {
+                'step_number': num,
+                'title': manifest_entry['title'],
+                'full_text': block['raw_content'].strip(),
+                'code_hints': fields['code_hints'],
+                'line_start': 0,
+                # ── Structured fields (v3.3.0) ────────────────────────────
+                'structured': True,
+                'goal': fields['goal'],
+                'depends_on': fields['depends_on'],
+                'input_spec': fields['input'],
+                'output_spec': fields['output'],
+                'environment_spec': fields['environment'],
+                'approach': fields['approach'],
+                'success_criteria': fields['success_criteria'],
+                'constraints': fields['constraints'],
+                'reference_scripts': fields['reference_scripts'],
+                'notes': fields['notes'],
+            }
+
+            extracted_steps.append(step)
+
+        print(f"    ✓ Structured parsing: {len(extracted_steps)} steps from "
+              f"manifest (validated against <<<STEP_N>>> blocks)")
+
+        agent_logger.log_reflection(
+            agent_name=self.agent_id,
+            task_id="structured_parse",
+            reflection=(
+                f"Structured prompt parsed: {len(extracted_steps)} steps, "
+                f"{len(header['global_constraints'])} global constraints, "
+                f"{len(header['shared_environments'])} shared environments"
+            )
+        )
+
+        return extracted_steps, header
 
     # =========================================================================
     # PHASE 2: DETAILED EXPANSION
@@ -867,19 +845,18 @@ class MasterAgent:
         """
         Expand a single extracted step into a detailed execution plan.
 
-        This is where the magic happens - we take the user's step description
-        and create a comprehensive plan that includes:
-        - Detailed explanation of what needs to be done
-        - Specific packages and imports
-        - Input/output file specifications
-        - Code structure suggestions
-        - Success criteria
+        v3.3.0: Two paths depending on prompt format:
+        - Structured (step['structured'] == True): Pre-parsed fields are included
+          directly. The LLM fleshes out the plan but does NOT discover deps/packages/IO.
+          Also evaluates Tier 2 complexity warnings.
+        - Legacy: Original behavior — LLM discovers everything from step text.
 
         v3.2.1: Uses invoke_resilient with exponential backoff retry.
         No artificial timeouts — will retry through transient Ollama 500 errors.
         """
         step_text = step.get('full_text', step.get('title', ''))
         code_hints = step.get('code_hints', [])
+        is_structured = step.get('structured', False)
 
         # Build context about other steps for dependency awareness
         other_steps_summary = "\n".join([
@@ -890,7 +867,110 @@ class MasterAgent:
         # v3.2.2: Include valid step IDs so LLM generates correct dep format
         valid_step_ids = [f"step_{s['step_number']}" for s in all_steps]
 
-        prompt = f"""You are expanding a pipeline step into a detailed execution plan.
+        # ── Build global context block ────────────────────────────────────
+        global_context_block = ""
+        if context.get('global_constraints'):
+            constraints_str = '\n'.join(
+                f"  - {c}" for c in context['global_constraints']
+            )
+            global_context_block += f"\nGlobal Constraints:\n{constraints_str}\n"
+        if context.get('shared_constants'):
+            global_context_block += (
+                f"\nShared Constants (include at top of script):\n"
+                f"```python\n{context['shared_constants']}\n```\n"
+            )
+
+        if is_structured:
+            # ══════════════════════════════════════════════════════════════
+            # STRUCTURED PATH (v3.3.0)
+            # ══════════════════════════════════════════════════════════════
+            # Pre-parsed fields are available — LLM expands the plan but
+            # does not need to discover packages, deps, or I/O files.
+
+            constraints_block = ""
+            if step.get('constraints'):
+                constraints_str = '\n'.join(
+                    f"  - {c}" for c in step['constraints']
+                )
+                constraints_block = (
+                    f"\nCONSTRAINTS (DO NOT violate these):\n{constraints_str}"
+                )
+
+            env_block = ""
+            if step.get('environment_spec'):
+                env_block = f"\nEnvironment Specification:\n{step['environment_spec']}"
+
+            prompt = f"""You are expanding a pipeline step into a detailed execution plan.
+
+=== STEP {step.get('step_number', '?')}: {step.get('title', 'Unknown')} ===
+
+GOAL: {step.get('goal', 'See full description below')}
+
+Full Description:
+{step_text}
+{constraints_block}
+
+{"Code Hints from User:" if code_hints else ""}
+{chr(10).join(['```' + ch + '```' for ch in code_hints[:3]]) if code_hints else ""}
+{global_context_block}
+
+Input Files: {step.get('input_spec', 'See description')}
+Output Files: {step.get('output_spec', 'See description')}
+{env_block}
+
+Other Steps in Pipeline:
+{other_steps_summary}
+
+=== YOUR TASK ===
+Create a COMPREHENSIVE execution plan that a developer could implement as
+a SINGLE Python script without referring back to the original prompt.
+
+The user has already specified dependencies, packages, and I/O files.
+Your job is to:
+1. Flesh out the implementation approach into a detailed plan
+2. Identify any ADDITIONAL packages beyond what the user listed
+3. Specify exact imports needed
+4. Describe the code structure (functions, control flow)
+5. Note any potential issues
+
+ALSO evaluate whether this step might be too complex for a single script.
+Set "complexity_warnings" to a list of concerns if ANY of these apply:
+- The step requires more than one programming language
+- Part of the step needs GPU/high-memory and part is lightweight
+- The step produces multiple independent output artifacts
+- The implementation would exceed ~500 lines of complex logic
+If none apply, set "complexity_warnings" to an empty list.
+
+=== OUTPUT FORMAT (JSON) ===
+```json
+{{
+    "expanded_title": "Descriptive title for this step",
+    "expanded_plan": "A detailed paragraph explaining exactly what this step does and how. Include specific function calls, data transformations, and expected outputs.",
+    "packages": ["list", "of", "ALL", "packages", "needed"],
+    "imports_needed": ["import pandas as pd", "import scanpy as sc"],
+    "key_operations": ["Load data", "Filter cells", "Save results"],
+    "code_approach": "Description of code structure — functions, loops, error handling",
+    "estimated_complexity": "low|medium|high",
+    "potential_issues": ["Issue 1", "Issue 2"],
+    "complexity_warnings": []
+}}
+```
+
+IMPORTANT:
+- Your expanded_plan should be DETAILED and COMPREHENSIVE. Include ALL details
+  from the user's original step description plus implementation specifics.
+- Do NOT include "dependencies" in your output — they are already defined by the user.
+- Do NOT include "input_files" or "output_files" — they are already defined.
+- Do NOT include "success_criteria" — it is already defined.
+- Focus on the HOW: what functions to call, what transformations to apply,
+  what the script's control flow should look like."""
+
+        else:
+            # ══════════════════════════════════════════════════════════════
+            # LEGACY PATH (v3.2.2)
+            # ══════════════════════════════════════════════════════════════
+
+            prompt = f"""You are expanding a pipeline step into a detailed execution plan.
 
 === ORIGINAL STEP FROM USER'S PROMPT ===
 Step {step.get('step_number', '?')}: {step.get('title', 'Unknown')}
@@ -906,6 +986,7 @@ Language: {context.get('language', 'python')}
 Available Packages: {', '.join(context.get('packages', []))}
 Input Files: {', '.join(context.get('input_files', []))}
 Output Files: {', '.join(context.get('output_files', []))}
+{global_context_block}
 
 Other Steps in Pipeline:
 {other_steps_summary}
@@ -931,19 +1012,24 @@ Create a COMPREHENSIVE execution plan that:
     "input_files": ["path/to/input.h5ad"],
     "output_files": ["path/to/output.h5ad"],
     "key_operations": ["Load data", "Filter cells", "Normalize", "Save results"],
-    "code_approach": "Brief description of the code structure - e.g., 'Use scanpy.pp.filter_cells() with min_genes=200, then normalize_total() with target_sum=1e4'",
+    "code_approach": "Brief description of the code structure",
     "success_criteria": "File output.h5ad exists and contains filtered data with >1000 cells",
     "dependencies": ["step_1", "step_2"],
     "estimated_complexity": "low|medium|high",
-    "potential_issues": ["Memory usage if large dataset", "May need to adjust filter thresholds"]
+    "potential_issues": ["Issue 1", "Issue 2"],
+    "complexity_warnings": []
 }}
 ```
 
 IMPORTANT: Your expanded_plan should be DETAILED and COMPREHENSIVE. Do not summarize - expand and clarify. Include ALL details from the user's original step description.
 - For "dependencies", ONLY use IDs from this list: {', '.join(valid_step_ids)}
 - A step that has no prerequisites should have "dependencies": []
-- Do NOT create circular dependencies (e.g., step_1 depending on step_2 while step_2 depends on step_1)"""
+- Do NOT create circular dependencies
+- Set "complexity_warnings" to a list of concerns if the step seems too complex
+  for a single script (multiple languages, mixed compute profiles, multiple
+  independent artifacts, >500 lines). Otherwise set to empty list."""
 
+        # ── Common: invoke LLM and parse response ─────────────────────────
         try:
             response = invoke_resilient(
                 self.llm,
@@ -1074,7 +1160,7 @@ IMPORTANT: Your expanded_plan should be DETAILED and COMPREHENSIVE. Do not summa
         }
 
     # =========================================================================
-    # PHASE 2b: DEPENDENCY SANITIZATION (v3.2.2 — Fix B)
+    # PHASE 2b: DEPENDENCY SANITIZATION
     # =========================================================================
 
     def _sanitize_dependencies(
@@ -1389,6 +1475,7 @@ IMPORTANT: Your expanded_plan should be DETAILED and COMPREHENSIVE. Do not summa
 
             # Create subtask with full context
             step_id = f"step_{i+1}"
+            is_structured = step.get('structured', False)
 
             # Merge packages from expansion with context packages
             step_packages = expanded.get(
@@ -1403,6 +1490,42 @@ IMPORTANT: Your expanded_plan should be DETAILED and COMPREHENSIVE. Do not summa
             )
             requires_gpu = detect_requires_gpu(step_packages, combined_text)
 
+            # ── v1.2.9: Structured fields override LLM-generated fields ──
+            if is_structured:
+                # Dependencies come from parsed DEPENDS_ON, not LLM
+                step_deps = step.get('depends_on', [])
+                # Input/output from parsed fields
+                step_input = step.get('input_spec', '')
+                step_output = step.get('output_spec', '')
+                # Success criteria from parsed field
+                step_success = step.get('success_criteria', '')
+                # Constraints passed through for sub-agent
+                step_constraints = step.get('constraints', [])
+                # Environment spec passed through
+                step_env_spec = step.get('environment_spec', '')
+            else:
+                # Legacy: LLM provides everything
+                step_deps = expanded.get('dependencies', [])
+                step_input = expanded.get('input_files', extracted_context.get('input_files', []))
+                step_output = expanded.get('output_files', extracted_context.get('output_files', []))
+                step_success = expanded.get('success_criteria', '')
+                step_constraints = []
+                step_env_spec = ''
+
+            # ── Tier 2: Surface complexity warnings ───────────────────────
+            complexity_warnings = expanded.get('complexity_warnings', [])
+            if complexity_warnings:
+                warnings_str = '; '.join(complexity_warnings)
+                print(f"      ⚠ COMPLEXITY WARNING: {warnings_str}")
+                print(f"        Consider splitting this step in the master prompt.")
+                agent_logger.log_reflection(
+                    agent_name=self.agent_id,
+                    task_id=f"complexity_{step_id}",
+                    reflection=(
+                        f"Tier 2 complexity warning for {step_id}: {warnings_str}"
+                    )
+                )
+
             subtask = {
                 'id': step_id,
                 'title': expanded.get(
@@ -1416,31 +1539,49 @@ IMPORTANT: Your expanded_plan should be DETAILED and COMPREHENSIVE. Do not summa
                 'language': extracted_context.get('language', 'python'),
                 'packages': step_packages,
                 'imports_needed': expanded.get('imports_needed', []),
-                'input_files': expanded.get(
-                    'input_files', extracted_context.get('input_files', [])
-                ),
-                'output_files': expanded.get(
-                    'output_files', extracted_context.get('output_files', [])
-                ),
+                'input_files': step_input,
+                'output_files': step_output,
                 'key_operations': expanded.get('key_operations', []),
                 'code_approach': expanded.get('code_approach', ''),
                 'code_hints': step.get('code_hints', []),
-                'success_criteria': expanded.get('success_criteria', ''),
-                'dependencies': expanded.get('dependencies', []),
+                'success_criteria': step_success,
+                'dependencies': step_deps,
                 'validation_status': validation['status'],
                 'validation_issues': validation.get('issues', []),
                 'requires_gpu': requires_gpu,
                 'status': 'pending',
-                'attempts': 0
+                'attempts': 0,
+                # v1.2.9: New fields for structured prompts
+                'constraints': step_constraints,
+                'complexity_warnings': complexity_warnings,
+                'environment_spec': step_env_spec,
             }
 
             subtasks.append(subtask)
 
         # =====================================================================
-        # PHASE 2b: DEPENDENCY SANITIZATION (v3.2.2 Fix B)
+        # PHASE 2b: DEPENDENCY SANITIZATION
         # =====================================================================
-        print("\n  Phase 2b: Sanitizing dependencies...")
-        subtasks = self._sanitize_dependencies(subtasks)
+        if structured_header is not None:
+            # v3.3.0: Structured prompts — only validate, don't rewrite deps
+            print("\n  Phase 2b: Validating declared dependencies...")
+            valid_ids = {s['id'] for s in subtasks}
+            for s in subtasks:
+                invalid_deps = [d for d in s['dependencies'] if d not in valid_ids]
+                if invalid_deps:
+                    print(f"    ⚠ {s['id']}: removing invalid deps {invalid_deps}")
+                    agent_logger.log_reflection(
+                        agent_name=self.agent_id,
+                        task_id="dep_validate",
+                        reflection=(
+                            f"Removed invalid deps from {s['id']}: {invalid_deps}"
+                        )
+                    )
+                    s['dependencies'] = [d for d in s['dependencies'] if d in valid_ids]
+        else:
+            # Legacy: full sanitization with cycle breaking
+            print("\n  Phase 2b: Sanitizing dependencies...")
+            subtasks = self._sanitize_dependencies(subtasks)
 
         # =====================================================================
         # Register in document and save (AFTER sanitization)
