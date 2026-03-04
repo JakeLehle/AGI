@@ -486,68 +486,345 @@ class MasterAgent:
 
         return self.master_document
 
-        # =====================================================================
-        # PHASE 1: EXTRACTION (v3.3.0: structured-first, legacy fallback)
-        # =====================================================================
-        print("\n  Phase 1: Extracting steps from prompt...")
+    # =========================================================================
+    # PHASE 1: LEGACY EXTRACTION (preserved for backward compatibility)
+    # =========================================================================
 
-        structured_header = None  # Will hold header blocks if structured
+    def _extract_steps_from_prompt(self, prompt: str) -> List[Dict[str, Any]]:
+        """
+        Extract ALL steps from the prompt using multiple detection strategies.
 
-        if self._detect_structured_format(main_task):
-            # ── v3.3.0: Structured prompt with <<<STEP_N>>> delimiters ────
-            print("    Detected structured prompt format (<<<STEP_N>>> delimiters)")
-            try:
-                extracted_steps, structured_header = self._parse_structured_prompt(main_task)
+        Legacy method preserved for prompts that do not use <<<STEP_N>>>
+        delimiters. For new prompts, use the structured format instead.
 
-                # Inject global constraints and shared constants into context
-                if structured_header.get('global_constraints'):
-                    extracted_context['global_constraints'] = structured_header['global_constraints']
-                if structured_header.get('shared_constants'):
-                    extracted_context['shared_constants'] = structured_header['shared_constants']
-                if structured_header.get('shared_environments'):
-                    extracted_context['shared_environments'] = structured_header['shared_environments']
+        Supports:
+        - Numbered steps: "1. ", "1) ", "Step 1:"
+        - Checkboxes: "- [ ]", "- [x]", "* [ ]"
+        - Headers: "## Step 1", "### Task 1"
+        - Bullet points with keywords: "- First,", "- Next,"
+        - Code blocks associated with steps
+        """
+        extracted = []
+        lines = prompt.split('\n')
 
-                # Store for auditability
-                self.master_document.extracted_steps = extracted_steps
+        current_step = None
+        current_content = []
+        current_code_blocks = []
+        in_code_block = False
+        code_block_content = []
+        step_number = 0
 
-            except ValueError as e:
-                print(f"    ⚠ Structured parsing failed: {e}")
-                print("    Falling back to legacy extraction...")
-                agent_logger.log_reflection(
-                    agent_name=self.agent_id,
-                    task_id="extraction",
-                    reflection=f"Structured parsing failed ({e}), using legacy"
+        for i, line in enumerate(lines):
+            # Track code blocks
+            if line.strip().startswith('```'):
+                if in_code_block:
+                    # End of code block
+                    in_code_block = False
+                    if current_step is not None:
+                        current_code_blocks.append('\n'.join(code_block_content))
+                    code_block_content = []
+                else:
+                    # Start of code block
+                    in_code_block = True
+                continue
+
+            if in_code_block:
+                code_block_content.append(line)
+                continue
+
+            # Detect step patterns
+            step_match = None
+            step_title = None
+
+            # Pattern 1: Numbered steps "1. ", "1) ", "Step 1:"
+            numbered = re.match(
+                r'^\s*(?:(?:Step\s+)?(\d+)[\.\):\-]\s+(.+)|(\d+)\.\s+(.+))',
+                line, re.IGNORECASE
+            )
+            if numbered:
+                step_match = True
+                num = numbered.group(1) or numbered.group(3)
+                step_title = (numbered.group(2) or numbered.group(4)).strip()
+
+            # Pattern 2: Checkboxes "- [ ] ", "- [x] "
+            if not step_match:
+                checkbox = re.match(r'^\s*[\-\*]\s*\[[ xX]\]\s+(.+)', line)
+                if checkbox:
+                    step_match = True
+                    step_title = checkbox.group(1).strip()
+
+            # Pattern 3: Headers "## Step 1", "### Task:"
+            if not step_match:
+                header = re.match(r'^\s*#{2,4}\s+(?:Step\s+\d+[:\-\s]*)?(.+)', line)
+                if header:
+                    title = header.group(1).strip()
+                    # Only treat as step if it looks like a task
+                    if len(title) > 10 or any(kw in title.lower() for kw in
+                        ['create', 'build', 'run', 'analyze', 'process', 'generate',
+                         'setup', 'install', 'download', 'prepare', 'filter', 'merge',
+                         'cluster', 'annotate', 'align', 'quality', 'normalize']):
+                        step_match = True
+                        step_title = title
+
+            # Pattern 4: Keyword bullets "- First,", "- Next,", "- Finally,"
+            if not step_match:
+                keyword = re.match(
+                    r'^\s*[\-\*]\s+((?:First|Next|Then|After|Finally|Subsequently|Lastly)[,:\s]+.+)',
+                    line, re.IGNORECASE
                 )
-                # Fall through to legacy path below
-                structured_header = None
-                extracted_steps = None
+                if keyword:
+                    step_match = True
+                    step_title = keyword.group(1).strip()
 
-        if structured_header is None:
-            # ── Legacy extraction (v3.2.2) ────────────────────────────────
-            raw_extracted_steps = self._extract_steps_from_prompt(main_task)
-            print(f"    Found {len(raw_extracted_steps)} raw steps (legacy extraction)")
+            if step_match and step_title:
+                # Save previous step
+                if current_step is not None:
+                    current_step['full_text'] = '\n'.join(current_content).strip()
+                    current_step['code_hints'] = current_code_blocks.copy()
+                    extracted.append(current_step)
 
-            # Phase 1b: Filter non-executable sections
-            extracted_steps, filtered_steps = self._filter_executable_steps(raw_extracted_steps)
+                step_number += 1
+                current_step = {
+                    'step_number': step_number,
+                    'title': step_title[:200],
+                    'full_text': '',
+                    'code_hints': [],
+                    'line_start': i
+                }
+                current_content = [line]
+                current_code_blocks = []
+            elif current_step is not None:
+                # Continue building current step content
+                current_content.append(line)
 
-            # Store for auditability
-            self.master_document.extracted_steps = raw_extracted_steps
+        # Don't forget the last step
+        if current_step is not None:
+            current_step['full_text'] = '\n'.join(current_content).strip()
+            current_step['code_hints'] = current_code_blocks.copy()
+            extracted.append(current_step)
 
+        # If no steps were found, treat the whole prompt as one step
+        if not extracted:
+            extracted.append({
+                'step_number': 1,
+                'title': 'Main Task',
+                'full_text': prompt,
+                'code_hints': [],
+                'line_start': 0
+            })
+
+        return extracted
+
+    # =========================================================================
+    # PHASE 1b: FILTER NON-EXECUTABLE STEPS (legacy)
+    # =========================================================================
+
+    def _filter_executable_steps(
+        self, extracted_steps: List[Dict[str, Any]]
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """
+        Classify extracted steps as executable or documentation.
+
+        Legacy filter preserved for prompts that do not use <<<STEP_N>>>
+        delimiters. For new prompts, the structured parser handles this
+        by only extracting content within step delimiters.
+
+        Classification criteria (step is DOCUMENTATION if ANY match):
+          1. Has code_hints → always executable (strongest signal)
+          2. Title matches known documentation patterns → filtered
+          3. Title starts with bold markers → filtered
+          4. Short content with no procedural title verbs → filtered
+          5. Content is primarily a markdown table → filtered
+        """
+        # ── Documentation title patterns ──────────────────────────────────
+        DOC_TITLE_PATTERNS = [
+            r'(?i)^expected\s+output',
+            r'(?i)^primary\s+data\s+file',
+            r'(?i)^anndata\s+structure',
+            r'(?i)^figures?\s*\(',
+            r'(?i)^reports?$',
+            r'(?i)^checkpoints?$',
+            r'(?i)^input\s+files?$',
+            r'(?i)^output\s+files?$',
+            r'(?i)^dependenc',
+            r'(?i)^success\s+criteria',
+            r'(?i)^notes?$',
+            r'(?i)^environment$',
+            r'(?i)^prerequisites?$',
+            r'(?i)^requirements?$',
+            r'(?i)^overview$',
+            r'(?i)^context$',
+            r'(?i)^summary$',
+        ]
+
+        BOLD_NOTE_PATTERN = re.compile(r'^\*\*[A-Z]')
+
+        PROCEDURAL_VERBS = {
+            'run', 'execute', 'create', 'generate', 'compute', 'calculate',
+            'load', 'save', 'write', 'read', 'filter', 'normalize',
+            'cluster', 'annotate', 'align', 'process', 'validate',
+            'download', 'install', 'build', 'train', 'predict',
+            'merge', 'combine', 'split', 'transform', 'plot',
+            'visualize', 'export', 'import', 'analyze', 'check',
+            'verify', 'submit', 'setup', 'configure', 'prepare',
+        }
+
+        executable = []
+        filtered = []
+
+        for step in extracted_steps:
+            title = step.get('title', '').strip()
+            full_text = step.get('full_text', '')
+            code_hints = step.get('code_hints', [])
+            content_len = len(full_text)
+
+            reason = None
+
+            # ── Rule 1: Has code_hints → always executable ────────────────
+            if code_hints:
+                executable.append(step)
+                continue
+
+            # ── Rule 2: Title matches documentation patterns ──────────────
+            for pattern in DOC_TITLE_PATTERNS:
+                if re.search(pattern, title):
+                    reason = f"title matches doc pattern: {pattern}"
+                    break
+
+            # ── Rule 3: Bold-prefixed notes ───────────────────────────────
+            if not reason and BOLD_NOTE_PATTERN.match(title):
+                reason = f"bold-prefixed note: {title[:50]}"
+
+            # ── Rule 4: Very short content with no procedural title ───────
+            if not reason and content_len < 200:
+                title_words = set(re.findall(r'\b\w+\b', title.lower()))
+                has_procedural = bool(title_words & PROCEDURAL_VERBS)
+                if not has_procedural:
+                    reason = f"short content ({content_len} chars) with no procedural title"
+
+            # ── Rule 5: Content is primarily a markdown table ─────────────
+            if not reason and content_len > 0:
+                lines = [l.strip() for l in full_text.split('\n') if l.strip()]
+                table_lines = sum(1 for l in lines if l.startswith('|'))
+                if len(lines) > 0 and table_lines / len(lines) > 0.5:
+                    text_lower = full_text.lower()
+                    has_procedural = any(
+                        re.search(rf'\b{v}\b', text_lower) for v in
+                        ['run', 'execute', 'create', 'generate', 'compute',
+                         'load', 'save', 'filter', 'normalize', 'cluster']
+                    )
+                    if not has_procedural:
+                        reason = f"primarily table content ({table_lines}/{len(lines)} lines)"
+
+            # ── Classify ──────────────────────────────────────────────────
+            if reason:
+                step['filter_reason'] = reason
+                filtered.append(step)
+            else:
+                executable.append(step)
+
+        # ── Log results ───────────────────────────────────────────────────
+        if filtered:
             agent_logger.log_reflection(
                 agent_name=self.agent_id,
-                task_id="extraction",
+                task_id="filter_steps",
                 reflection=(
-                    f"Legacy extraction: {len(raw_extracted_steps)} raw steps, "
-                    f"filtered to {len(extracted_steps)} executable "
-                    f"({len(filtered_steps)} documentation sections removed)"
+                    f"Filtered {len(filtered)}/{len(extracted_steps)} "
+                    f"non-executable sections: "
+                    f"{', '.join(s['title'][:40] for s in filtered[:5])}"
+                    f"{'...' if len(filtered) > 5 else ''}"
                 )
             )
-            print(f"    → {len(extracted_steps)} executable steps for expansion")
+            print(
+                f"    Filtered {len(filtered)} documentation sections "
+                f"(keeping {len(executable)} executable steps)"
+            )
 
-        # =====================================================================
-        # PHASE 2: EXPANSION (no artificial timeout — retries handle failures)
-        # =====================================================================
-        print("\n  Phase 2: Expanding each step into detailed plans...")
+        # Re-number the executable steps sequentially
+        for i, step in enumerate(executable):
+            step['step_number'] = i + 1
+
+        return executable, filtered
+
+    def _extract_task_context(self, task: str) -> Dict[str, Any]:
+        """Extract critical context from task description."""
+        context = {
+            "language": None,
+            "packages": [],
+            "reference_scripts": [],
+            "input_files": [],
+            "output_files": [],
+            "completed_steps": [],
+            "huggingface_repos": [],
+        }
+
+        # Detect language
+        if 'python' in task.lower() or 'import ' in task or '.py' in task:
+            context["language"] = "python"
+        elif 'library(' in task or '.R' in task:
+            context["language"] = "r"
+        elif 'bash' in task.lower() or '#!/bin' in task:
+            context["language"] = "bash"
+
+        # Extract packages
+        package_patterns = [
+            r'(?:import|from)\s+(\w+)',
+            r'library\((\w+)\)',
+            r'pip install\s+([\w\-]+)',
+            r'conda install\s+([\w\-]+)',
+        ]
+        for pattern in package_patterns:
+            matches = re.findall(pattern, task)
+            context["packages"].extend(matches)
+
+        # Extract file paths
+        file_patterns = [
+            (r'[`"\']?([^\s`"\']*\.h5ad)[`"\']?', 'h5ad'),
+            (r'[`"\']?([^\s`"\']*\.csv)[`"\']?', 'csv'),
+            (r'[`"\']?([^\s`"\']*\.tsv)[`"\']?', 'tsv'),
+            (r'[`"\']?([^\s`"\']*\.parquet)[`"\']?', 'parquet'),
+            (r'[`"\']?(data/[^\s`"\']+)[`"\']?', 'data'),
+            (r'[`"\']?(output[s]?/[^\s`"\']+)[`"\']?', 'output'),
+        ]
+        for pattern, ftype in file_patterns:
+            matches = re.findall(pattern, task)
+            for match in matches:
+                if 'input' in match.lower() or ftype in ['h5ad', 'csv', 'tsv', 'parquet']:
+                    if match not in context["input_files"]:
+                        context["input_files"].append(match)
+                if 'output' in match.lower() or ftype == 'output':
+                    if match not in context["output_files"]:
+                        context["output_files"].append(match)
+
+        # Extract reference scripts
+        script_patterns = [
+            r'scripts?/[^\s`"\']+\.py',
+            r'[`"\']([^\s`"\']+\.py)[`"\']',
+        ]
+        for pattern in script_patterns:
+            matches = re.findall(pattern, task)
+            context["reference_scripts"].extend(matches)
+
+        # Extract HuggingFace repos
+        hf_pattern = r'huggingface_repo\s*=\s*["\']([^"\']+)["\']'
+        context["huggingface_repos"] = re.findall(hf_pattern, task)
+
+        # Extract completed steps
+        completed_patterns = [
+            r'✅\s*(?:COMPLETED:?)?\s*([^\n]+)',
+            r'\[x\]\s*([^\n]+)',
+            r'DONE:\s*([^\n]+)',
+        ]
+        for pattern in completed_patterns:
+            matches = re.findall(pattern, task, re.IGNORECASE)
+            context["completed_steps"].extend(matches)
+
+        # Deduplicate
+        for key in context:
+            if isinstance(context[key], list):
+                context[key] = list(dict.fromkeys(context[key]))
+
+        return context
 
     # =========================================================================
     # STRUCTURED PROMPT PARSING (v1.2.9)
@@ -1414,30 +1691,62 @@ IMPORTANT: Your expanded_plan should be DETAILED and COMPREHENSIVE. Do not summa
         )
 
         # =====================================================================
-        # PHASE 1: EXTRACTION
+        # PHASE 1: EXTRACTION (v1.2.9: structured-first, legacy fallback)
         # =====================================================================
         print("\n  Phase 1: Extracting steps from prompt...")
-        raw_extracted_steps = self._extract_steps_from_prompt(main_task)
-        print(f"    Found {len(raw_extracted_steps)} raw steps")
 
-        # =====================================================================
-        # PHASE 1b: FILTER NON-EXECUTABLE SECTIONS (v3.2.2 Fix A)
-        # =====================================================================
-        extracted_steps, filtered_steps = self._filter_executable_steps(raw_extracted_steps)
+        structured_header = None  # Will hold header blocks if structured
 
-        # Store both in master document for auditability
-        self.master_document.extracted_steps = raw_extracted_steps
+        if self._detect_structured_format(main_task):
+            # ── v1.2.9: Structured prompt with <<<STEP_N>>> delimiters ────
+            print("    Detected structured prompt format (<<<STEP_N>>> delimiters)")
+            try:
+                extracted_steps, structured_header = self._parse_structured_prompt(main_task)
 
-        agent_logger.log_reflection(
-            agent_name=self.agent_id,
-            task_id="extraction",
-            reflection=(
-                f"Extracted {len(raw_extracted_steps)} raw steps, "
-                f"filtered to {len(extracted_steps)} executable "
-                f"({len(filtered_steps)} documentation sections removed)"
+                # Inject global constraints and shared constants into context
+                if structured_header.get('global_constraints'):
+                    extracted_context['global_constraints'] = structured_header['global_constraints']
+                if structured_header.get('shared_constants'):
+                    extracted_context['shared_constants'] = structured_header['shared_constants']
+                if structured_header.get('shared_environments'):
+                    extracted_context['shared_environments'] = structured_header['shared_environments']
+
+                # Store for auditability
+                self.master_document.extracted_steps = extracted_steps
+
+            except ValueError as e:
+                print(f"    ⚠ Structured parsing failed: {e}")
+                print("    Falling back to legacy extraction...")
+                agent_logger.log_reflection(
+                    agent_name=self.agent_id,
+                    task_id="extraction",
+                    reflection=f"Structured parsing failed ({e}), using legacy"
+                )
+                # Fall through to legacy path below
+                structured_header = None
+                extracted_steps = None
+
+        if structured_header is None:
+            # ── Legacy extraction ─────────────────────────────────────────
+            raw_extracted_steps = self._extract_steps_from_prompt(main_task)
+            print(f"    Found {len(raw_extracted_steps)} raw steps (legacy extraction)")
+
+            # Phase 1b: Filter non-executable sections
+            extracted_steps, filtered_steps = self._filter_executable_steps(raw_extracted_steps)
+
+            # Store for auditability
+            self.master_document.extracted_steps = raw_extracted_steps
+
+            agent_logger.log_reflection(
+                agent_name=self.agent_id,
+                task_id="extraction",
+                reflection=(
+                    f"Legacy extraction: {len(raw_extracted_steps)} raw steps, "
+                    f"filtered to {len(extracted_steps)} executable "
+                    f"({len(filtered_steps)} documentation sections removed)"
+                )
             )
-        )
-        print(f"    → {len(extracted_steps)} executable steps for expansion")
+            print(f"    → {len(extracted_steps)} executable steps for expansion")
 
         # =====================================================================
         # PHASE 2: EXPANSION (no artificial timeout — retries handle failures)
